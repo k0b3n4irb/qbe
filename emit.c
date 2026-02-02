@@ -8,6 +8,49 @@ enum {
 
 static int datasec_counter = 0;
 
+/*
+ * Initialized data handling for SNES (w65816):
+ *
+ * Problem: Initialized static variables like "static u8 x = 5;" need to
+ * live in RAM (writable), but their initial values must come from ROM.
+ *
+ * Solution:
+ * 1. Variable storage goes in RAMSECTION (RAM)
+ * 2. Initial values go in a ROM section with format:
+ *    [ram_addr:2][size:2][data:N]
+ * 3. crt0 copies init data from ROM to RAM at startup
+ *
+ * We buffer data items and emit both sections at DEnd when we know the size.
+ */
+
+/* Buffer for accumulating initialized data */
+#define MAX_INIT_ITEMS 1024
+static struct {
+	int type;       /* DB, DH, DW, DL, or -1 for string, -2 for ref, -3 for zero-fill */
+	int64_t num;    /* numeric value or size for zero-fill */
+	char *str;      /* string value (if type == -1) */
+	struct {        /* reference (if type == -2) */
+		char *name;
+		int64_t off;
+	} ref;
+	int reftype;    /* original type for references (DB, DH, etc.) */
+} init_items[MAX_INIT_ITEMS];
+static int init_count;
+static int64_t init_total_size;
+
+/* Current data definition info */
+static char *cur_data_name;
+static Lnk *cur_data_lnk;
+static int has_nonzero_data;
+
+/* Size of each data type in bytes */
+static int dtype_size[] = {
+	[DB] = 1,
+	[DH] = 2,
+	[DW] = 4,
+	[DL] = 8
+};
+
 /* Emit a string with proper handling of null terminators for WLA-DX.
  * WLA-DX doesn't support \000 escape sequences, so we convert them to:
  * "Hello\000World" -> "Hello", 0, "World"
@@ -64,6 +107,30 @@ emit_wladx_string(char *str, FILE *f)
 	fputc('\n', f);
 }
 
+/* Calculate string length including null terminators */
+static int64_t
+string_length(char *str)
+{
+	char *p = str;
+	int64_t len = 0;
+
+	if (*p == '"')
+		p++;
+
+	while (*p) {
+		if (p[0] == '\\' && p[1] == '0' && p[2] == '0' && p[3] == '0') {
+			len++;  /* null byte */
+			p += 4;
+		} else if (*p == '"' && p[1] == '\0') {
+			break;
+		} else {
+			len++;
+			p++;
+		}
+	}
+	return len;
+}
+
 void
 emitlnk(char *n, Lnk *l, int s, FILE *f)
 {
@@ -103,76 +170,149 @@ emitfnlnk(char *n, Lnk *l, FILE *f)
 	emitlnk(n, l, SecText, f);
 }
 
-void
-emitdat(Dat *d, FILE *f)
+/* Emit buffered init data items to file */
+static void
+emit_init_data(FILE *f)
 {
-	/* Use WLA-DX compatible directives for w65816 target */
 	static char *dtoa[] = {
 		[DB] = "\t.db",
 		[DH] = "\t.dw",
-		[DW] = "\t.dl",  /* WLA-DX uses .dl for 32-bit (long) */
-		[DL] = "\t.dl"   /* 8-byte emitted as two 4-byte .dl */
+		[DW] = "\t.dl",
+		[DL] = "\t.dl"
 	};
-	static int64_t zero;
 	char *p;
+	int i;
 
-	switch (d->type) {
-	case DStart:
-		zero = 0;
-		break;
-	case DEnd:
-		if (d->lnk->common) {
-			if (zero == -1)
-				die("invalid common data definition");
-			p = d->name[0] == '"' ? "" : T.assym;
-			fprintf(f, ".comm %s%s,%"PRId64,
-				p, d->name, zero);
-			if (d->lnk->align)
-				fprintf(f, ",%d", d->lnk->align);
-			fputc('\n', f);
-		}
-		else if (zero != -1) {
-			emitlnk(d->name, d->lnk, SecBss, f);
-			/* RAMSECTION uses 'dsb' without dot and without fill value */
-			fprintf(f, "\tdsb %"PRId64"\n", zero);
-			fputs(".ENDS\n", f);
-		} else {
-			/* Data section was emitted, close it */
-			fputs(".ENDS\n", f);
-		}
-		break;
-	case DZ:
-		if (zero != -1)
-			zero += d->u.num;
-		else
-			fprintf(f, "\t.dsb %"PRId64", 0\n", d->u.num);  /* WLA-DX syntax */
-		break;
-	default:
-		if (zero != -1) {
-			emitlnk(d->name, d->lnk, SecData, f);
-			if (zero > 0)
-				fprintf(f, "\t.dsb %"PRId64", 0\n", zero);  /* WLA-DX syntax */
-			zero = -1;
-		}
-		if (d->isstr) {
-			if (d->type != DB)
-				err("strings only supported for 'b' currently");
-			emit_wladx_string(d->u.str, f);  /* WLA-DX with null handling */
-		}
-		else if (d->isref) {
-			char *refname = d->u.ref.name;
-			/* Strip .L prefix from references for WLA-DX */
+	for (i = 0; i < init_count; i++) {
+		if (init_items[i].type == -1) {
+			/* String */
+			emit_wladx_string(init_items[i].str, f);
+		} else if (init_items[i].type == -2) {
+			/* Reference */
+			char *refname = init_items[i].ref.name;
 			if (refname[0] == '.' && refname[1] == 'L')
 				refname = refname + 2;
 			p = refname[0] == '"' ? "" : T.assym;
 			fprintf(f, "%s %s%s%+"PRId64"\n",
-				dtoa[d->type], p, refname,
-				d->u.ref.off);
+				dtoa[init_items[i].reftype], p, refname,
+				init_items[i].ref.off);
+		} else if (init_items[i].type == -3) {
+			/* Zero-fill */
+			fprintf(f, "\t.dsb %"PRId64", 0\n", init_items[i].num);
+		} else {
+			/* Numeric value */
+			fprintf(f, "%s %"PRId64"\n",
+				dtoa[init_items[i].type], init_items[i].num);
+		}
+	}
+}
+
+void
+emitdat(Dat *d, FILE *f)
+{
+	char *p;
+	char *name;
+	int sec_id;
+
+	switch (d->type) {
+	case DStart:
+		/* Reset state for new data definition */
+		init_count = 0;
+		init_total_size = 0;
+		cur_data_name = d->name;
+		cur_data_lnk = d->lnk;
+		has_nonzero_data = 0;
+		break;
+
+	case DEnd:
+		if (d->lnk->common) {
+			/* Common data - not supported for now */
+			if (has_nonzero_data)
+				die("initialized common data not supported");
+			p = d->name[0] == '"' ? "" : T.assym;
+			fprintf(f, ".comm %s%s,%"PRId64,
+				p, d->name, init_total_size);
+			if (d->lnk->align)
+				fprintf(f, ",%d", d->lnk->align);
+			fputc('\n', f);
+		}
+		else if (!has_nonzero_data) {
+			/* Pure BSS - only zeros, emit RAMSECTION */
+			sec_id = ++datasec_counter;
+			fprintf(f, ".RAMSECTION \".bss.%d\" BANK 0 SLOT 1\n", sec_id);
+			p = cur_data_name[0] == '"' ? "" : T.assym;
+			name = cur_data_name;
+			if (name[0] == '.' && name[1] == 'L')
+				name = name + 2;
+			fprintf(f, "%s%s:\n", p, name);
+			fprintf(f, "\tdsb %"PRId64"\n", init_total_size);
+			fputs(".ENDS\n", f);
 		}
 		else {
-			fprintf(f, "%s %"PRId64"\n",
-				dtoa[d->type], d->u.num);
+			/* Initialized data - emit RAM section + ROM init record */
+			sec_id = ++datasec_counter;
+			p = cur_data_name[0] == '"' ? "" : T.assym;
+			name = cur_data_name;
+			if (name[0] == '.' && name[1] == 'L')
+				name = name + 2;
+
+			/* 1. Emit RAMSECTION for the variable */
+			fprintf(f, ".RAMSECTION \".data.%d\" BANK 0 SLOT 1\n", sec_id);
+			fprintf(f, "%s%s:\n", p, name);
+			fprintf(f, "\tdsb %"PRId64"\n", init_total_size);
+			fputs(".ENDS\n\n", f);
+
+			/* 2. Emit ROM section with init data */
+			/* Format: [target_addr:2][size:2][data:N] */
+			/* Use APPENDTO to add to the existing .data_init section */
+			fprintf(f, ".SECTION \".data_init.%d\" SEMIFREE APPENDTO \".data_init\"\n", sec_id);
+			fprintf(f, "\t.dw %s%s\n", p, name);  /* RAM target address */
+			fprintf(f, "\t.dw %"PRId64"\n", init_total_size);  /* Size */
+			emit_init_data(f);  /* Actual data bytes */
+			fputs(".ENDS\n", f);
 		}
+		break;
+
+	case DZ:
+		/* Zero-fill - accumulate size */
+		if (has_nonzero_data) {
+			/* Already have non-zero data, buffer this zero-fill */
+			if (init_count >= MAX_INIT_ITEMS)
+				die("too many data items");
+			init_items[init_count].type = -3;
+			init_items[init_count].num = d->u.num;
+			init_count++;
+		}
+		init_total_size += d->u.num;
+		break;
+
+	default:
+		/* DB, DH, DW, DL - actual data */
+		has_nonzero_data = 1;
+
+		if (init_count >= MAX_INIT_ITEMS)
+			die("too many data items");
+
+		if (d->isstr) {
+			if (d->type != DB)
+				err("strings only supported for 'b' currently");
+			init_items[init_count].type = -1;
+			init_items[init_count].str = d->u.str;
+			init_total_size += string_length(d->u.str);
+		}
+		else if (d->isref) {
+			init_items[init_count].type = -2;
+			init_items[init_count].ref.name = d->u.ref.name;
+			init_items[init_count].ref.off = d->u.ref.off;
+			init_items[init_count].reftype = d->type;
+			init_total_size += dtype_size[d->type];
+		}
+		else {
+			init_items[init_count].type = d->type;
+			init_items[init_count].num = d->u.num;
+			init_total_size += dtype_size[d->type];
+		}
+		init_count++;
 		break;
 	}
 }
