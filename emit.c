@@ -301,8 +301,13 @@ emitdat(Dat *d, FILE *f)
 			init_total_size += string_length(d->u.str);
 		}
 		else if (d->isref) {
+			/* Must copy the string - tokval.str is a static buffer
+			 * that gets overwritten by subsequent tokens */
+			size_t len = strlen(d->u.ref.name) + 1;
+			char *name_copy = emalloc(len);
+			memcpy(name_copy, d->u.ref.name, len);
 			init_items[init_count].type = -2;
-			init_items[init_count].ref.name = d->u.ref.name;
+			init_items[init_count].ref.name = name_copy;
 			init_items[init_count].ref.off = d->u.ref.off;
 			init_items[init_count].reftype = d->type;
 			init_total_size += dtype_size[d->type];
