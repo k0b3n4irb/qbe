@@ -368,6 +368,56 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "\tlsr a\n");
                 fprintf(outf, "\tlsr a\n");
                 fprintf(outf, "\tlsr a\n");  /* /8 = *32 */
+            } else if (val == 3) {
+                /* x*3 = x*2 + x */
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.l tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tclc\n");
+                fprintf(outf, "\tadc.l tcc__r9\n");
+            } else if (val == 5) {
+                /* x*5 = x*4 + x */
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.l tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tclc\n");
+                fprintf(outf, "\tadc.l tcc__r9\n");
+            } else if (val == 6) {
+                /* x*6 = (x*2 + x) * 2 = x*3*2 */
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.l tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tclc\n");
+                fprintf(outf, "\tadc.l tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+            } else if (val == 7) {
+                /* x*7 = x*8 - x */
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.l tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tsec\n");
+                fprintf(outf, "\tsbc.l tcc__r9\n");
+            } else if (val == 9) {
+                /* x*9 = x*8 + x */
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.l tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tclc\n");
+                fprintf(outf, "\tadc.l tcc__r9\n");
+            } else if (val == 10) {
+                /* x*10 = (x*4 + x) * 2 = x*5*2 */
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.l tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tclc\n");
+                fprintf(outf, "\tadc.l tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
             } else {
                 /* General case: use stack for multiplier, call __mul */
                 emitload(r1, fn);
@@ -516,6 +566,18 @@ emitins(Ins *i, Fn *fn)
             c = &fn->con[r1.val];
             for (int j = 0; j < c->bits.i && j < 16; j++)
                 fprintf(outf, "\tasl a\n");
+        } else {
+            /* Variable-count shift: save A, load count into X, loop */
+            fprintf(outf, "\tpha\n");
+            emitload(r1, fn);
+            fprintf(outf, "\ttax\n");
+            fprintf(outf, "\tpla\n");
+            fprintf(outf, "\tcpx #0\n");
+            fprintf(outf, "\tbeq +\n");
+            fprintf(outf, "-\tasl a\n");
+            fprintf(outf, "\tdex\n");
+            fprintf(outf, "\tbne -\n");
+            fprintf(outf, "+\n");
         }
         emitstore(i->to, fn);
         break;
@@ -529,6 +591,17 @@ emitins(Ins *i, Fn *fn)
             c = &fn->con[r1.val];
             for (int j = 0; j < c->bits.i && j < 16; j++)
                 fprintf(outf, "\tlsr a\n");
+        } else {
+            fprintf(outf, "\tpha\n");
+            emitload(r1, fn);
+            fprintf(outf, "\ttax\n");
+            fprintf(outf, "\tpla\n");
+            fprintf(outf, "\tcpx #0\n");
+            fprintf(outf, "\tbeq +\n");
+            fprintf(outf, "-\tlsr a\n");
+            fprintf(outf, "\tdex\n");
+            fprintf(outf, "\tbne -\n");
+            fprintf(outf, "+\n");
         }
         emitstore(i->to, fn);
         break;
@@ -539,6 +612,17 @@ emitins(Ins *i, Fn *fn)
             c = &fn->con[r1.val];
             for (int j = 0; j < c->bits.i && j < 16; j++)
                 fprintf(outf, "\tlsr a\n");
+        } else {
+            fprintf(outf, "\tpha\n");
+            emitload(r1, fn);
+            fprintf(outf, "\ttax\n");
+            fprintf(outf, "\tpla\n");
+            fprintf(outf, "\tcpx #0\n");
+            fprintf(outf, "\tbeq +\n");
+            fprintf(outf, "-\tlsr a\n");
+            fprintf(outf, "\tdex\n");
+            fprintf(outf, "\tbne -\n");
+            fprintf(outf, "+\n");
         }
         emitstore(i->to, fn);
         break;
@@ -930,8 +1014,31 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Ocall:
-        c = &fn->con[r0.val];
-        fprintf(outf, "\tjsl %s\n", stripsym(str(c->sym.id)));
+        if (rtype(r0) == RCon) {
+            c = &fn->con[r0.val];
+            if (c->type == CAddr) {
+                fprintf(outf, "\tjsl %s\n", stripsym(str(c->sym.id)));
+            } else {
+                /* Numeric constant as call target (unusual) */
+                fprintf(outf, "\tjsl $%06lX\n", (unsigned long)c->bits.i);
+            }
+        } else {
+            /* Indirect call: function pointer in temp/slot.
+             * Load the 16-bit address, store to DP scratch (tcc__r9),
+             * set bank byte to current bank ($00), then jml [tcc__r9].
+             * Push return address for RTL to work correctly.
+             */
+            emitload_adj(r0, fn, argbytes);
+            fprintf(outf, "\tsta.b tcc__r9\n");
+            fprintf(outf, "\tsep #$20\n");
+            fprintf(outf, "\tlda #$00\n");
+            fprintf(outf, "\tsta.b tcc__r9+2\n");
+            fprintf(outf, "\trep #$20\n");
+            fprintf(outf, "\tphk\n");
+            fprintf(outf, "\tpea ++-1\n");
+            fprintf(outf, "\tjml [tcc__r9]\n");
+            fprintf(outf, "++\n");
+        }
         {
             int cleanup = argbytes;
             argbytes = 0;
@@ -1135,10 +1242,12 @@ w65816_emitfn(Fn *fn, FILE *f)
         if (isret(b->jmp.type)) {
             emitjmp(b, fn);
             if (framesize > 2) {
+                fprintf(outf, "\ttax\n");   /* save return value */
                 fprintf(outf, "\ttsa\n");
                 fprintf(outf, "\tclc\n");
                 fprintf(outf, "\tadc.w #%d\n", framesize);
                 fprintf(outf, "\ttas\n");
+                fprintf(outf, "\ttxa\n");   /* restore return value */
             }
             fprintf(outf, "\tplp\n");
             fprintf(outf, "\trtl\n");

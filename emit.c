@@ -24,7 +24,7 @@ static int datasec_counter = 0;
  */
 
 /* Buffer for accumulating initialized data */
-#define MAX_INIT_ITEMS 1024
+#define MAX_INIT_ITEMS 16384
 static struct {
 	int type;       /* DB, DH, DW, DL, or -1 for string, -2 for ref, -3 for zero-fill */
 	int64_t num;    /* numeric value or size for zero-fill */
@@ -248,8 +248,22 @@ emitdat(Dat *d, FILE *f)
 			fprintf(f, "\tdsb %"PRId64"\n", init_total_size);
 			fputs(".ENDS\n", f);
 		}
+		else if (cur_data_lnk && cur_data_lnk->sec
+		         && (strcmp(cur_data_lnk->sec, ".rodata") == 0
+		             || strcmp(cur_data_lnk->sec, "\".rodata\"") == 0)) {
+			/* Const data (section ".rodata") - keep in ROM */
+			sec_id = ++datasec_counter;
+			p = cur_data_name[0] == '"' ? "" : T.assym;
+			name = cur_data_name;
+			if (name[0] == '.' && name[1] == 'L')
+				name = name + 2;
+			fprintf(f, ".SECTION \".rodata.%d\" SUPERFREE\n", sec_id);
+			fprintf(f, "%s%s:\n", p, name);
+			emit_init_data(f);
+			fputs(".ENDS\n", f);
+		}
 		else {
-			/* Initialized data - emit RAM section + ROM init record */
+			/* Mutable initialized data - emit RAM section + ROM init record */
 			sec_id = ++datasec_counter;
 			p = cur_data_name[0] == '"' ? "" : T.assym;
 			name = cur_data_name;
