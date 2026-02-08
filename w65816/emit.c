@@ -38,6 +38,227 @@ static void acache_set(Ref r) { acache_valid = 1; acache_ref = r; }
 static void acache_invalidate(void) { acache_valid = 0; }
 static int acache_has(Ref r) { return acache_valid && req(acache_ref, r); }
 
+/* 8/16-bit A-mode tracking: avoid redundant sep #$20 / rep #$20 */
+static int amode_8bit;  /* 0 = 16-bit (default), 1 = 8-bit */
+
+static void emit_sep20(void) {
+    if (!amode_8bit) {
+        fprintf(outf, "\tsep #$20\n");
+        amode_8bit = 1;
+    }
+    /* 8-bit mode changes A semantics — invalidate cache */
+    acache_invalidate();
+}
+
+static void emit_rep20(void) {
+    if (amode_8bit) {
+        fprintf(outf, "\trep #$20\n");
+        amode_8bit = 0;
+    }
+}
+
+/* Leaf function optimization: parameter alias propagation + dead return store */
+#define MAX_ALIAS_TEMPS 256
+static int temp_alias[MAX_ALIAS_TEMPS];    /* 0 = no alias, negative = param slot */
+static int alloc_param[MAX_ALIAS_TEMPS];   /* 0 = no param, negative = param slot for alloc */
+static int leaf_opt;                        /* 1 = leaf optimizations active */
+
+/* Dead return store elimination */
+static int temp_use_count[MAX_ALIAS_TEMPS];
+static int temp_is_retval[MAX_ALIAS_TEMPS];
+static int skip_dead_retstore_temp;  /* temp index to skip store, or -1 */
+
+/* Pre-pass: count how many times each temp is used as an operand */
+static void
+count_temp_uses(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    Phi *p;
+    int a, n, idx;
+
+    memset(temp_use_count, 0, sizeof(temp_use_count));
+    memset(temp_is_retval, 0, sizeof(temp_is_retval));
+    for (b = fn->start; b; b = b->link) {
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            for (a = 0; a < 2; a++) {
+                if (rtype(i->arg[a]) == RTmp && i->arg[a].val >= Tmp0) {
+                    idx = i->arg[a].val - Tmp0;
+                    if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+                        temp_use_count[idx]++;
+                }
+            }
+        }
+        if (isret(b->jmp.type) && rtype(b->jmp.arg) == RTmp && b->jmp.arg.val >= Tmp0) {
+            idx = b->jmp.arg.val - Tmp0;
+            if (idx >= 0 && idx < MAX_ALIAS_TEMPS) {
+                temp_use_count[idx]++;
+                temp_is_retval[idx] = 1;
+            }
+        }
+        for (p = b->phi; p; p = p->link)
+            for (n = 0; n < p->narg; n++)
+                if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
+                    idx = p->arg[n].val - Tmp0;
+                    if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+                        temp_use_count[idx]++;
+                }
+    }
+}
+
+/* Pre-scan: build alias table from param loads, storew into allocs, and copy chains */
+static void
+build_alias_table(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    Ref r0, r1;
+    int idx, src_idx, dst_idx;
+    int alloc_store_count[MAX_ALIAS_TEMPS];  /* how many stores target each alloc */
+
+    memset(temp_alias, 0, sizeof(temp_alias));
+    memset(alloc_param, 0, sizeof(alloc_param));
+    if (!leaf_opt)
+        return;
+
+    /* First: count stores to each alloc slot.
+     * Only allocs with EXACTLY 1 store are pure param shadows.
+     * If a param is modified (e.g., count-- in a loop), the alloc
+     * receives 2+ stores and must NOT be optimized away. */
+    memset(alloc_store_count, 0, sizeof(alloc_store_count));
+    for (b = fn->start; b; b = b->link)
+        for (i = b->ins; i < &b->ins[b->nins]; i++)
+            if (i->op == Ostorew || i->op == Ostoreh || i->op == Ostoreb
+                || i->op == Ostorel) {
+                r1 = i->arg[1];
+                if (rtype(r1) == RTmp && r1.val >= Tmp0) {
+                    dst_idx = r1.val - Tmp0;
+                    if (dst_idx >= 0 && dst_idx < MAX_ALIAS_TEMPS
+                        && w65816_alloc_size[dst_idx] > 0)
+                        alloc_store_count[dst_idx]++;
+                }
+            }
+
+    for (b = fn->start; b; b = b->link) {
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            r0 = i->arg[0];
+            r1 = i->arg[1];
+
+            /* Oloadsw from negative slot (param) → alias result temp */
+            if ((i->op == Oloadsw || i->op == Oloaduw || i->op == Oload)
+                && rtype(r0) == RSlot && rsval(r0) < 0
+                && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
+                idx = i->to.val - Tmp0;
+                if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+                    temp_alias[idx] = rsval(r0);
+            }
+            /* storew <val>, <alloc_temp> — if val is param-aliased AND
+             * alloc receives exactly 1 store, mark as param shadow */
+            else if ((i->op == Ostorew || i->op == Ostoreh)
+                && rtype(r0) == RTmp && r0.val >= Tmp0
+                && rtype(r1) == RTmp && r1.val >= Tmp0) {
+                src_idx = r0.val - Tmp0;
+                dst_idx = r1.val - Tmp0;
+                if (src_idx >= 0 && src_idx < MAX_ALIAS_TEMPS && temp_alias[src_idx] != 0
+                    && dst_idx >= 0 && dst_idx < MAX_ALIAS_TEMPS
+                    && w65816_alloc_size[dst_idx] > 0
+                    && alloc_store_count[dst_idx] == 1) {
+                    alloc_param[dst_idx] = temp_alias[src_idx];
+                }
+            }
+            /* loadw <alloc_temp> — if alloc holds param, alias result */
+            else if ((i->op == Oloadsw || i->op == Oloaduw || i->op == Oload)
+                && rtype(r0) == RTmp && r0.val >= Tmp0
+                && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
+                src_idx = r0.val - Tmp0;
+                if (src_idx >= 0 && src_idx < MAX_ALIAS_TEMPS
+                    && alloc_param[src_idx] != 0) {
+                    idx = i->to.val - Tmp0;
+                    if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+                        temp_alias[idx] = alloc_param[src_idx];
+                }
+            }
+            /* Ocopy: propagate alias through copy chains */
+            else if (i->op == Ocopy
+                && rtype(r0) == RTmp && r0.val >= Tmp0
+                && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
+                src_idx = r0.val - Tmp0;
+                dst_idx = i->to.val - Tmp0;
+                if (src_idx >= 0 && src_idx < MAX_ALIAS_TEMPS && temp_alias[src_idx] != 0
+                    && dst_idx >= 0 && dst_idx < MAX_ALIAS_TEMPS)
+                    temp_alias[dst_idx] = temp_alias[src_idx];
+            }
+            /* Oextuh/Oextub/etc: propagate alias through extensions */
+            else if ((i->op == Oextuh || i->op == Oextub || i->op == Oextsh
+                      || i->op == Oextsb || i->op == Oextuw || i->op == Oextsw)
+                && rtype(r0) == RTmp && r0.val >= Tmp0
+                && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
+                src_idx = r0.val - Tmp0;
+                dst_idx = i->to.val - Tmp0;
+                if (src_idx >= 0 && src_idx < MAX_ALIAS_TEMPS && temp_alias[src_idx] != 0
+                    && dst_idx >= 0 && dst_idx < MAX_ALIAS_TEMPS)
+                    temp_alias[dst_idx] = temp_alias[src_idx];
+            }
+        }
+    }
+}
+
+/* Check if a leaf function can be frameless (no real stack slots needed) */
+static int
+can_be_frameless(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    int a, idx;
+
+    if (!fn->leaf || fn->dynalloc) return 0;
+
+    /* Check alloc slots: allow param-shadow allocs (fully optimized away),
+     * but reject allocs used for other purposes */
+    if (w65816_alloc_slots > 0) {
+        for (b = fn->start; b; b = b->link)
+            for (i = b->ins; i < &b->ins[b->nins]; i++)
+                for (a = 0; a < 2; a++) {
+                    Ref r = i->arg[a];
+                    if (rtype(r) == RTmp && r.val >= Tmp0) {
+                        idx = r.val - Tmp0;
+                        if (idx >= 0 && idx < MAX_ALLOC_TEMPS
+                            && w65816_alloc_size[idx] > 0
+                            && alloc_param[idx] == 0)
+                            return 0;  /* non-param alloc used as operand */
+                    }
+                }
+    }
+
+    /* Check that all non-aliased, non-dead-retval temps are absent */
+    for (b = fn->start; b; b = b->link) {
+        int is_ret_block = isret(b->jmp.type);
+        Ins *last = (b->nins > 0) ? &b->ins[b->nins - 1] : NULL;
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (rtype(i->to) != RTmp || i->to.val < Tmp0) continue;
+            idx = i->to.val - Tmp0;
+            if (idx < 0 || idx >= MAX_ALIAS_TEMPS) continue;
+
+            /* Skip alloc instructions — handled above */
+            if (i->op == Oalloc4 || i->op == Oalloc8 || i->op == Oalloc16) continue;
+
+            /* Skip storew/storeh into param-shadow alloc slots */
+            if ((i->op == Ostorew || i->op == Ostoreh) && !rtype(i->to)) continue;
+
+            /* Skip aliased temps (param copies / copy chains) */
+            if (temp_alias[idx] != 0) continue;
+
+            /* Skip dead return stores */
+            if (is_ret_block && i == last && req(i->to, b->jmp.arg)
+                && temp_use_count[idx] == 1 && temp_is_retval[idx]) continue;
+
+            /* This temp needs a real stack slot → can't go frameless */
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* Alloc slot offset tracking - computed from w65816_alloc_size */
 static int allocslot[MAX_ALLOC_TEMPS];  /* stack offset for each alloc temp */
 
@@ -180,12 +401,19 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
             /* Virtual register - direct page */
             fprintf(outf, "\tlda.b $%02X\n", regaddr(r.val));
         } else if (r.val >= Tmp0) {
-            /* Spilled temp */
-            slot = fn->tmp[r.val].slot;
-            if (slot >= 0)
-                fprintf(outf, "\tlda %d,s\n", (slot + 1) * 2 + sp_adjust);
-            else
-                fprintf(outf, "\t; unallocated temp %d\n", r.val);
+            /* Check for leaf-opt alias to param slot */
+            int idx = r.val - Tmp0;
+            if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
+                int neg_slot = temp_alias[idx];
+                fprintf(outf, "\tlda %d,s\n", framesize + 3 + (-neg_slot) + sp_adjust);
+            } else {
+                /* Spilled temp */
+                slot = fn->tmp[r.val].slot;
+                if (slot >= 0)
+                    fprintf(outf, "\tlda %d,s\n", (slot + 1) * 2 + sp_adjust);
+                else
+                    fprintf(outf, "\t; unallocated temp %d\n", r.val);
+            }
         } else {
             fprintf(outf, "\t; unknown temp %d\n", r.val);
         }
@@ -253,6 +481,24 @@ emitstore(Ref r, Fn *fn)
     if (req(r, R))
         return;
 
+    /* Leaf opt: skip store to aliased temp (A already has the value) */
+    if (leaf_opt && rtype(r) == RTmp && r.val >= Tmp0) {
+        int idx = r.val - Tmp0;
+        if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
+            acache_set(r);
+            return;
+        }
+    }
+
+    /* Dead return store elimination: skip store when temp is only used as retval */
+    if (skip_dead_retstore_temp >= 0 && rtype(r) == RTmp && r.val >= Tmp0) {
+        int idx = r.val - Tmp0;
+        if (idx == skip_dead_retstore_temp) {
+            acache_set(r);
+            return;
+        }
+    }
+
     switch (rtype(r)) {
     case RTmp:
         if (r.val >= R0 && r.val <= R7) {
@@ -296,9 +542,16 @@ emitop2(char *op, Ref r, Fn *fn)
         if (r.val >= R0 && r.val <= R7) {
             fprintf(outf, "\t%s.b $%02X\n", op, regaddr(r.val));
         } else if (r.val >= Tmp0) {
-            slot = fn->tmp[r.val].slot;
-            if (slot >= 0)
-                fprintf(outf, "\t%s %d,s\n", op, (slot + 1) * 2);
+            /* Check for leaf-opt alias to param slot */
+            int idx = r.val - Tmp0;
+            if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
+                int neg_slot = temp_alias[idx];
+                fprintf(outf, "\t%s %d,s\n", op, framesize + 3 + (-neg_slot));
+            } else {
+                slot = fn->tmp[r.val].slot;
+                if (slot >= 0)
+                    fprintf(outf, "\t%s %d,s\n", op, (slot + 1) * 2);
+            }
         }
         break;
     case RCon:
@@ -335,6 +588,22 @@ emitins(Ins *i, Fn *fn)
 
     r0 = i->arg[0];
     r1 = i->arg[1];
+
+    /* Ensure 16-bit A mode before each instruction.
+     * Byte operations (Ostoreb, Oloadsb, Oloadub) switch to 8-bit internally.
+     * This allows consecutive byte ops to stay in 8-bit mode (emit_rep20 is
+     * a no-op when already in 16-bit mode).
+     */
+    switch (i->op) {
+    case Ostoreb:
+    case Oloadsb:
+    case Oloadub:
+        /* These manage their own mode — don't force 16-bit */
+        break;
+    default:
+        emit_rep20();
+        break;
+    }
 
     switch (i->op) {
     case Oadd:
@@ -653,6 +922,17 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Ocopy:
+        /* Leaf opt: propagate alias through copy chains */
+        if (leaf_opt && rtype(r0) == RTmp && r0.val >= Tmp0) {
+            int src_idx = r0.val - Tmp0;
+            if (src_idx >= 0 && src_idx < MAX_ALIAS_TEMPS && temp_alias[src_idx] != 0) {
+                int dst_idx = (rtype(i->to) == RTmp && i->to.val >= Tmp0) ? i->to.val - Tmp0 : -1;
+                if (dst_idx >= 0 && dst_idx < MAX_ALIAS_TEMPS) {
+                    temp_alias[dst_idx] = temp_alias[src_idx];
+                    break;  /* skip copy entirely */
+                }
+            }
+        }
         if (!req(i->to, r0)) {
             emitload(r0, fn);
             emitstore(i->to, fn);
@@ -839,6 +1119,12 @@ emitins(Ins *i, Fn *fn)
 
     case Ostorew:
     case Ostoreh:
+        /* Leaf opt: skip storew into param-shadow alloc slot */
+        if (leaf_opt && rtype(r1) == RTmp && r1.val >= Tmp0) {
+            int aidx = r1.val - Tmp0;
+            if (aidx >= 0 && aidx < MAX_ALIAS_TEMPS && alloc_param[aidx] != 0)
+                break;  /* param already in caller frame, skip copy */
+        }
         emitload(r0, fn);
         {
             int aslot = getallocslot(r1, fn);
@@ -874,9 +1160,20 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Ostoreb:
-        /* Load value in 16-bit mode BEFORE switching to 8-bit */
-        emitload(r0, fn);
-        fprintf(outf, "\tsep #$20\n");  /* Switch to 8-bit for store */
+        /* Byte store with mode tracking.
+         * For constant values: switch to 8-bit first, use 8-bit immediate (2 bytes).
+         * For variable values: load in 16-bit, then switch to 8-bit for store.
+         */
+        if (rtype(r0) == RCon && fn->con[r0.val].type == CBits) {
+            /* Constant value: switch to 8-bit first, then 8-bit immediate */
+            int val = fn->con[r0.val].bits.i & 0xFF;
+            emit_sep20();
+            fprintf(outf, "\tlda #%d\n", val);  /* 8-bit immediate (2 bytes) */
+        } else {
+            /* Variable value: load in 16-bit mode, then switch */
+            emitload(r0, fn);
+            emit_sep20();
+        }
         {
             int aslot = getallocslot(r1, fn);
             if (aslot >= 0) {
@@ -901,22 +1198,44 @@ emitins(Ins *i, Fn *fn)
                 /* Address in temp - indirect store */
                 /* A already has the value, load addr to X, then store */
                 /* IMPORTANT: After pha, stack offsets change by 2 */
-                fprintf(outf, "\trep #$20\n");  /* Need 16-bit for address */
+                emit_rep20();               /* Need 16-bit for address */
                 fprintf(outf, "\tpha\n");       /* Save value */
                 emitload_adj(r1, fn, 2);        /* Adjust for pushed value */
                 fprintf(outf, "\ttax\n");
                 fprintf(outf, "\tpla\n");
-                fprintf(outf, "\tsep #$20\n");  /* Back to 8-bit for store */
+                emit_sep20();               /* Back to 8-bit for store */
                 fprintf(outf, "\tsta.l $0000,x\n");
             }
         }
-        fprintf(outf, "\trep #$20\n");
+        /* Don't emit_rep20() here — let next instruction decide.
+         * If next is another Ostoreb, we stay in 8-bit mode (saving 6 cycles).
+         * emitins() ensures 16-bit for all non-byte ops at entry.
+         */
         acache_invalidate();
         break;
 
     case Oloadsw:
     case Oloaduw:
     case Oload:
+        /* Leaf opt: alias param slot loads instead of copying */
+        if (leaf_opt && rtype(r0) == RSlot && rsval(r0) < 0) {
+            int idx = (rtype(i->to) == RTmp && i->to.val >= Tmp0) ? i->to.val - Tmp0 : -1;
+            if (idx >= 0 && idx < MAX_ALIAS_TEMPS) {
+                temp_alias[idx] = rsval(r0);
+                break;  /* skip the load+store entirely */
+            }
+        }
+        /* Leaf opt: loadw from param-shadow alloc → alias to param */
+        if (leaf_opt && rtype(r0) == RTmp && r0.val >= Tmp0) {
+            int aidx = r0.val - Tmp0;
+            if (aidx >= 0 && aidx < MAX_ALIAS_TEMPS && alloc_param[aidx] != 0) {
+                int didx = (rtype(i->to) == RTmp && i->to.val >= Tmp0) ? i->to.val - Tmp0 : -1;
+                if (didx >= 0 && didx < MAX_ALIAS_TEMPS) {
+                    temp_alias[didx] = alloc_param[aidx];
+                    break;  /* skip the load+store — will read from caller frame */
+                }
+            }
+        }
         {
             int aslot = getallocslot(r0, fn);
             if (aslot >= 0) {
@@ -950,25 +1269,25 @@ emitins(Ins *i, Fn *fn)
         /* Load byte from memory, zero/sign extend to 16-bit */
         if (isvreg(r0)) {
             /* Pointer in virtual register - use indirect */
-            fprintf(outf, "\tsep #$20\n");
+            emit_sep20();
             fprintf(outf, "\tlda ($%02X)\n", regaddr(r0.val));
-            fprintf(outf, "\trep #$20\n");
+            emit_rep20();
         } else if (rtype(r0) == RCon && fn->con[r0.val].type == CAddr) {
             /* Direct load from global/extern symbol */
             Con *c = &fn->con[r0.val];
-            fprintf(outf, "\tsep #$20\n");
+            emit_sep20();
             fprintf(outf, "\tlda.l %s", stripsym(str(c->sym.id)));
             if (c->bits.i)
                 fprintf(outf, "+%d", (int)c->bits.i);
             fprintf(outf, "\n");
-            fprintf(outf, "\trep #$20\n");
+            emit_rep20();
         } else {
             /* Pointer in stack slot - load addr, then indirect through X */
             emitload(r0, fn);  /* Load pointer value to A */
             fprintf(outf, "\ttax\n");  /* Transfer to X */
-            fprintf(outf, "\tsep #$20\n");
+            emit_sep20();
             fprintf(outf, "\tlda.l $0000,x\n");  /* Load byte from memory */
-            fprintf(outf, "\trep #$20\n");
+            emit_rep20();
         }
         fprintf(outf, "\tand.w #$00FF\n");  /* Zero extend */
         if (i->op == Oloadsb) {
@@ -1001,27 +1320,68 @@ emitins(Ins *i, Fn *fn)
 
     case Oextsh:
         /* Sign extend half (already 16-bit, no-op for 65816) */
+        /* Leaf opt: propagate alias through nop extension */
+        if (leaf_opt && rtype(r0) == RTmp && r0.val >= Tmp0
+            && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
+            int si = r0.val - Tmp0;
+            int di = i->to.val - Tmp0;
+            if (si >= 0 && si < MAX_ALIAS_TEMPS && temp_alias[si] != 0
+                && di >= 0 && di < MAX_ALIAS_TEMPS) {
+                temp_alias[di] = temp_alias[si];
+                break;
+            }
+        }
         emitload(r0, fn);
         emitstore(i->to, fn);
         break;
 
     case Oextuh:
         /* Zero extend half (already 16-bit, no-op for 65816) */
+        /* Leaf opt: propagate alias through nop extension */
+        if (leaf_opt && rtype(r0) == RTmp && r0.val >= Tmp0
+            && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
+            int si = r0.val - Tmp0;
+            int di = i->to.val - Tmp0;
+            if (si >= 0 && si < MAX_ALIAS_TEMPS && temp_alias[si] != 0
+                && di >= 0 && di < MAX_ALIAS_TEMPS) {
+                temp_alias[di] = temp_alias[si];
+                break;
+            }
+        }
         emitload(r0, fn);
         emitstore(i->to, fn);
         break;
 
     case Oextsw:
-        /* Sign extend word to long - for 16-bit 65816, just copy the value.
-         * If code actually uses the upper 16 bits of a signed long,
-         * this would need proper sign extension to 32 bits. */
+        /* Sign extend word to long - for 16-bit 65816, just copy the value. */
+        /* Leaf opt: propagate alias through nop extension */
+        if (leaf_opt && rtype(r0) == RTmp && r0.val >= Tmp0
+            && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
+            int si = r0.val - Tmp0;
+            int di = i->to.val - Tmp0;
+            if (si >= 0 && si < MAX_ALIAS_TEMPS && temp_alias[si] != 0
+                && di >= 0 && di < MAX_ALIAS_TEMPS) {
+                temp_alias[di] = temp_alias[si];
+                break;
+            }
+        }
         emitload(r0, fn);
         emitstore(i->to, fn);
         break;
 
     case Oextuw:
-        /* Zero extend word to long - for 16-bit 65816, just copy the value.
-         * Upper 16 bits are implicitly zero in our 16-bit register model. */
+        /* Zero extend word to long - for 16-bit 65816, just copy the value. */
+        /* Leaf opt: propagate alias through nop extension */
+        if (leaf_opt && rtype(r0) == RTmp && r0.val >= Tmp0
+            && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
+            int si = r0.val - Tmp0;
+            int di = i->to.val - Tmp0;
+            if (si >= 0 && si < MAX_ALIAS_TEMPS && temp_alias[si] != 0
+                && di >= 0 && di < MAX_ALIAS_TEMPS) {
+                temp_alias[di] = temp_alias[si];
+                break;
+            }
+        }
         emitload(r0, fn);
         emitstore(i->to, fn);
         break;
@@ -1059,10 +1419,10 @@ emitins(Ins *i, Fn *fn)
              */
             emitload_adj(r0, fn, argbytes);
             fprintf(outf, "\tsta.b tcc__r9\n");
-            fprintf(outf, "\tsep #$20\n");
+            emit_sep20();
             fprintf(outf, "\tlda #$00\n");
             fprintf(outf, "\tsta.b tcc__r9+2\n");
-            fprintf(outf, "\trep #$20\n");
+            emit_rep20();
             fprintf(outf, "\tphk\n");
             fprintf(outf, "\tpea ++-1\n");
             fprintf(outf, "\tjml [tcc__r9]\n");
@@ -1098,6 +1458,8 @@ emitins(Ins *i, Fn *fn)
     case Oalloc4:
     case Oalloc8:
     case Oalloc16:
+        if (framesize == 0)
+            break;  /* frameless — allocs are dead, skip */
         /* alloc returns a pointer to stack space.
          * The slot was already assigned in the pre-pass.
          * We just emit a no-op here since loads/stores through
@@ -1158,14 +1520,22 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
                     emitload(p->arg[n], fn);
                     fprintf(outf, "\tsta %d,s\n", (dstslot + 1) * 2);
                 } else if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
-                    /* Temp: check if we need to copy */
-                    int srcslot = fn->tmp[p->arg[n].val].slot;
-                    if (srcslot >= 0 && srcslot != dstslot) {
-                        /* Different slots - need to copy */
-                        fprintf(outf, "\tlda %d,s\n", (srcslot + 1) * 2);
+                    int idx = p->arg[n].val - Tmp0;
+                    if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
+                        /* Aliased to param slot — load from caller frame */
+                        int neg_slot = temp_alias[idx];
+                        fprintf(outf, "\tlda %d,s\n", framesize + 3 + (-neg_slot));
                         fprintf(outf, "\tsta %d,s\n", (dstslot + 1) * 2);
+                    } else {
+                        /* Temp: check if we need to copy */
+                        int srcslot = fn->tmp[p->arg[n].val].slot;
+                        if (srcslot >= 0 && srcslot != dstslot) {
+                            /* Different slots - need to copy */
+                            fprintf(outf, "\tlda %d,s\n", (srcslot + 1) * 2);
+                            fprintf(outf, "\tsta %d,s\n", (dstslot + 1) * 2);
+                        }
+                        /* If same slot, no copy needed (coalesced) */
                     }
-                    /* If same slot, no copy needed (coalesced) */
                 }
                 break;
             }
@@ -1283,9 +1653,22 @@ w65816_emitfn(Fn *fn, FILE *f)
     framesize = (fn->slot + 1) * 2;
     argbytes = 0;  /* Reset argument tracking for this function */
 
+    /* Leaf function optimization pre-passes */
+    leaf_opt = (fn->leaf && !fn->dynalloc);
+    skip_dead_retstore_temp = -1;
+    count_temp_uses(fn);
+    build_alias_table(fn);
+
+    /* Frame elimination: if all temps are aliased or dead-retval, go frameless */
+    if (leaf_opt && can_be_frameless(fn))
+        framesize = 0;
+
+    /* Reset alias table for emission pass (will be rebuilt during emission) */
+    memset(temp_alias, 0, sizeof(temp_alias));
+
     /* Debug: show slot assignments */
-    fprintf(outf, "\n; Function: %s (framesize=%d, slots=%d, alloc_slots=%d)\n",
-            fn->name, framesize, fn->slot, w65816_alloc_slots);
+    fprintf(outf, "\n; Function: %s (framesize=%d, slots=%d, alloc_slots=%d, fn_leaf=%d, leaf_opt=%d)\n",
+            fn->name, framesize, fn->slot, w65816_alloc_slots, fn->leaf, leaf_opt);
     for (int t = Tmp0; t < fn->ntmp; t++) {
         int aslot = (t - Tmp0 >= 0 && t - Tmp0 < MAX_ALLOC_TEMPS) ? allocslot[t - Tmp0] : -1;
         fprintf(outf, "; temp %d: slot=%d, alloc=%d\n", t, fn->tmp[t].slot, aslot);
@@ -1304,26 +1687,48 @@ w65816_emitfn(Fn *fn, FILE *f)
     }
 
     acache_invalidate();
+    amode_8bit = 0;  /* Start in 16-bit mode (after rep #$30 in prologue) */
     for (b = fn->start; b; b = b->link) {
+        /* Ensure 16-bit mode at block entry — incoming edges may differ */
+        emit_rep20();
         fprintf(outf, "@%s:\n", b->name);
         acache_invalidate();
 
-        for (i = b->ins; i < &b->ins[b->nins]; i++)
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            /* Dead return store elimination: detect last instruction
+             * producing a temp that's only used as the return value */
+            skip_dead_retstore_temp = -1;
+            if (leaf_opt && i == &b->ins[b->nins] - 1 && isret(b->jmp.type)
+                && rtype(i->to) == RTmp && i->to.val >= Tmp0
+                && req(i->to, b->jmp.arg)) {
+                int idx = i->to.val - Tmp0;
+                if (idx >= 0 && idx < MAX_ALIAS_TEMPS
+                    && temp_use_count[idx] == 1 && temp_is_retval[idx])
+                    skip_dead_retstore_temp = idx;
+            }
             emitins(i, fn);
+            skip_dead_retstore_temp = -1;
+        }
 
         if (isret(b->jmp.type)) {
+            /* Ensure 16-bit before epilogue (emitjmp + stack cleanup) */
+            emit_rep20();
             emitjmp(b, fn);
             if (framesize > 2) {
-                fprintf(outf, "\ttax\n");   /* save return value */
+                if (b->jmp.type != Jret0)
+                    fprintf(outf, "\ttax\n");   /* save return value (non-void only) */
                 fprintf(outf, "\ttsa\n");
                 fprintf(outf, "\tclc\n");
                 fprintf(outf, "\tadc.w #%d\n", framesize);
                 fprintf(outf, "\ttas\n");
-                fprintf(outf, "\ttxa\n");   /* restore return value */
+                if (b->jmp.type != Jret0)
+                    fprintf(outf, "\ttxa\n");   /* restore return value (non-void only) */
             }
             fprintf(outf, "\tplp\n");
             fprintf(outf, "\trtl\n");
         } else {
+            /* Ensure 16-bit before jump (phi moves use 16-bit lda/sta) */
+            emit_rep20();
             emitjmp(b, fn);
         }
     }
