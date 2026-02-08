@@ -30,6 +30,14 @@ static FILE *outf;
 static int framesize;  /* Current function's frame size */
 static int argbytes;   /* Bytes of arguments pushed for current call */
 
+/* A-register cache: track which Ref is currently in A to skip redundant loads */
+static int acache_valid;
+static Ref acache_ref;
+
+static void acache_set(Ref r) { acache_valid = 1; acache_ref = r; }
+static void acache_invalidate(void) { acache_valid = 0; }
+static int acache_has(Ref r) { return acache_valid && req(acache_ref, r); }
+
 /* Alloc slot offset tracking - computed from w65816_alloc_size */
 static int allocslot[MAX_ALLOC_TEMPS];  /* stack offset for each alloc temp */
 
@@ -163,6 +171,9 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
     Con *c;
     int slot;
 
+    if (sp_adjust == 0 && acache_has(r))
+        return;
+
     switch (rtype(r)) {
     case RTmp:
         if (r.val >= R0 && r.val <= R7) {
@@ -215,6 +226,12 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
         fprintf(outf, "\t; unknown ref type %d\n", rtype(r));
         break;
     }
+    /* After loading, A changed — invalidate any stale cache entry.
+     * The cache will be properly set by emitstore() after the
+     * instruction finishes computing and stores its result.
+     */
+    if (sp_adjust == 0)
+        acache_invalidate();
 }
 
 /* Convenience wrapper for normal loads (no SP adjustment) */
@@ -231,6 +248,7 @@ static void
 emitstore(Ref r, Fn *fn)
 {
     int slot;
+    int stored = 0;
 
     if (req(r, R))
         return;
@@ -239,10 +257,13 @@ emitstore(Ref r, Fn *fn)
     case RTmp:
         if (r.val >= R0 && r.val <= R7) {
             fprintf(outf, "\tsta.b $%02X\n", regaddr(r.val));
+            stored = 1;
         } else if (r.val >= Tmp0) {
             slot = fn->tmp[r.val].slot;
-            if (slot >= 0)
+            if (slot >= 0) {
                 fprintf(outf, "\tsta %d,s\n", (slot + 1) * 2);
+                stored = 1;
+            }
         }
         break;
     case RSlot:
@@ -251,10 +272,14 @@ emitstore(Ref r, Fn *fn)
             fprintf(outf, "\tsta %d,s\n", framesize + 3 + (-slot));
         else
             fprintf(outf, "\tsta %d,s\n", (slot + 1) * 2);
+        stored = 1;
         break;
     default:
         break;
     }
+    /* After sta, A still holds the stored value — set cache */
+    if (stored)
+        acache_set(r);
 }
 
 /*
@@ -809,6 +834,7 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "\tsta.l $0002,x\n");
             }
         }
+        acache_invalidate();
         break;
 
     case Ostorew:
@@ -844,6 +870,7 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "\tsta.l $0000,x\n");
             }
         }
+        acache_invalidate();
         break;
 
     case Ostoreb:
@@ -884,6 +911,7 @@ emitins(Ins *i, Fn *fn)
             }
         }
         fprintf(outf, "\trep #$20\n");
+        acache_invalidate();
         break;
 
     case Oloadsw:
@@ -1011,6 +1039,7 @@ emitins(Ins *i, Fn *fn)
         emitload_adj(r0, fn, argbytes);
         fprintf(outf, "\tpha\n");
         argbytes += 2;  /* All args pushed as 16-bit */
+        acache_invalidate();
         break;
 
     case Ocall:
@@ -1060,6 +1089,8 @@ emitins(Ins *i, Fn *fn)
                     fprintf(outf, "\ttxa\n");
                 }
                 emitstore(i->to, fn);
+            } else {
+                acache_invalidate();
             }
         }
         break;
@@ -1084,8 +1115,13 @@ emitins(Ins *i, Fn *fn)
 
     default:
         fprintf(outf, "\t; unhandled op %d\n", i->op);
+        acache_invalidate();
         break;
     }
+
+    /* A-cache is now maintained entirely by emitstore() (sets on store)
+     * and emitload_adj() (invalidates on miss). No second switch needed.
+     */
 }
 
 /*
@@ -1152,29 +1188,63 @@ emitjmp(Blk *b, Fn *fn)
         break;
     case Jjmp:
         emitphimoves(b, b->s1, fn);
-        fprintf(outf, "\tjmp @%s\n", b->s1->name);
+        if (b->s1 != b->link)
+            fprintf(outf, "\tjmp @%s\n", b->s1->name);
         break;
     case Jjnz:
         emitload(b->jmp.arg, fn);
-        /* For conditional: emit phi moves on each branch */
-        fprintf(outf, "\tbne +\n");
-        /* False branch (fall through to s2) */
-        emitphimoves(b, b->s2, fn);
-        fprintf(outf, "\tjmp @%s\n", b->s2->name);
-        /* True branch */
-        fprintf(outf, "+\n");
-        emitphimoves(b, b->s1, fn);
-        fprintf(outf, "\tjmp @%s\n", b->s1->name);
-        break;
-    default:
-        if (b->jmp.type >= Jjf && b->jmp.type <= Jjf1) {
-            emitload(b->jmp.arg, fn);
+        /* Ensure Z flag is set correctly for the branch condition.
+         * When A-cache skips the lda, flags may be stale (e.g., after
+         * Oloadsb's cmp.w #$0080 which corrupts Z for zero values). */
+        fprintf(outf, "\tcmp.w #0\n");
+        if (b->s1 == b->link) {
+            /* True branch falls through - invert: branch on zero to s2 */
+            fprintf(outf, "\tbne +\n");
+            emitphimoves(b, b->s2, fn);
+            fprintf(outf, "\tjmp @%s\n", b->s2->name);
+            fprintf(outf, "+\n");
+            emitphimoves(b, b->s1, fn);
+        } else if (b->s2 == b->link) {
+            /* False branch falls through - branch on nonzero to s1 */
+            fprintf(outf, "\tbeq +\n");
+            emitphimoves(b, b->s1, fn);
+            fprintf(outf, "\tjmp @%s\n", b->s1->name);
+            fprintf(outf, "+\n");
+            emitphimoves(b, b->s2, fn);
+        } else {
+            /* Neither falls through */
             fprintf(outf, "\tbne +\n");
             emitphimoves(b, b->s2, fn);
             fprintf(outf, "\tjmp @%s\n", b->s2->name);
             fprintf(outf, "+\n");
             emitphimoves(b, b->s1, fn);
             fprintf(outf, "\tjmp @%s\n", b->s1->name);
+        }
+        break;
+    default:
+        if (b->jmp.type >= Jjf && b->jmp.type <= Jjf1) {
+            emitload(b->jmp.arg, fn);
+            fprintf(outf, "\tcmp.w #0\n");
+            if (b->s1 == b->link) {
+                fprintf(outf, "\tbne +\n");
+                emitphimoves(b, b->s2, fn);
+                fprintf(outf, "\tjmp @%s\n", b->s2->name);
+                fprintf(outf, "+\n");
+                emitphimoves(b, b->s1, fn);
+            } else if (b->s2 == b->link) {
+                fprintf(outf, "\tbeq +\n");
+                emitphimoves(b, b->s1, fn);
+                fprintf(outf, "\tjmp @%s\n", b->s1->name);
+                fprintf(outf, "+\n");
+                emitphimoves(b, b->s2, fn);
+            } else {
+                fprintf(outf, "\tbne +\n");
+                emitphimoves(b, b->s2, fn);
+                fprintf(outf, "\tjmp @%s\n", b->s2->name);
+                fprintf(outf, "+\n");
+                emitphimoves(b, b->s1, fn);
+                fprintf(outf, "\tjmp @%s\n", b->s1->name);
+            }
         }
         break;
     }
@@ -1233,8 +1303,10 @@ w65816_emitfn(Fn *fn, FILE *f)
         fprintf(outf, "\ttas\n");
     }
 
+    acache_invalidate();
     for (b = fn->start; b; b = b->link) {
         fprintf(outf, "@%s:\n", b->name);
+        acache_invalidate();
 
         for (i = b->ins; i < &b->ins[b->nins]; i++)
             emitins(i, fn);
