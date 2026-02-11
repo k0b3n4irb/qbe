@@ -41,6 +41,11 @@ static int acache_has(Ref r) { return acache_valid && req(acache_ref, r); }
 /* 8/16-bit A-mode tracking: avoid redundant sep #$20 / rep #$20 */
 static int amode_8bit;  /* 0 = 16-bit (default), 1 = 8-bit */
 
+/* Tracks whether the last emitload call actually emitted an lda instruction.
+ * When true, N and Z flags reflect the loaded value (no cmp.w #0 needed).
+ * When false (A-cache hit), flags are stale and cmp.w #0 is required. */
+static int last_load_emitted;
+
 static void emit_sep20(void) {
     if (!amode_8bit) {
         fprintf(outf, "\tsep #$20\n");
@@ -57,6 +62,62 @@ static void emit_rep20(void) {
     }
 }
 
+/* Check if opcode is a word/long comparison */
+static int
+is_cmp_op(int op)
+{
+    return (op >= Ocmpw && op <= Ocmpw1)
+        || (op >= Ocmpl && op <= Ocmpl1);
+}
+
+/*
+ * For a comparison opcode, determine:
+ * - swap: whether to swap operands before comparing
+ * - bt: branch instruction name when condition is TRUE
+ * - bf: branch instruction name when condition is FALSE
+ *
+ * Mapping is derived from existing boolean materialization code:
+ *  ceq: load a, cmp b → Z=1 means TRUE → beq/bne
+ *  cne: load a, cmp b → Z=0 means TRUE → bne/beq
+ *  cslt: load a, cmp b → N=1 means TRUE → bmi/bpl
+ *  csge: load a, cmp b → N=0 means TRUE → bpl/bmi
+ *  csgt: swap, load b, cmp a → N=1 means TRUE → bmi/bpl
+ *  csle: swap, load b, cmp a → N=0 means TRUE → bpl/bmi
+ *  cult: load a, cmp b → C=0 means TRUE → bcc/bcs
+ *  cuge: load a, cmp b → C=1 means TRUE → bcs/bcc
+ *  cugt: swap, load b, cmp a → C=0 means TRUE → bcc/bcs
+ *  cule: swap, load b, cmp a → C=1 means TRUE → bcs/bcc
+ */
+static void
+cmp_branch_info(int op, int *swap, const char **bt, const char **bf)
+{
+    *swap = 0;
+    switch (op) {
+    case Oceqw: case Oceql:
+        *bt = "beq"; *bf = "bne"; break;
+    case Ocnew: case Ocnel:
+        *bt = "bne"; *bf = "beq"; break;
+    case Ocsltw: case Ocsltl:
+        *bt = "bmi"; *bf = "bpl"; break;
+    case Ocsgew: case Ocsgel:
+        *bt = "bpl"; *bf = "bmi"; break;
+    case Ocsgtw: case Ocsgtl:
+        *swap = 1; *bt = "bmi"; *bf = "bpl"; break;
+    case Ocslew: case Ocslel:
+        *swap = 1; *bt = "bpl"; *bf = "bmi"; break;
+    case Ocultw: case Ocultl:
+        *bt = "bcc"; *bf = "bcs"; break;
+    case Ocugew: case Ocugel:
+        *bt = "bcs"; *bf = "bcc"; break;
+    case Ocugtw: case Ocugtl:
+        *swap = 1; *bt = "bcc"; *bf = "bcs"; break;
+    case Oculew: case Oculel:
+        *swap = 1; *bt = "bcs"; *bf = "bcc"; break;
+    default:
+        *bt = "bne"; *bf = "beq"; break;
+    }
+}
+
 /* Leaf function optimization: parameter alias propagation + dead return store */
 #define MAX_ALIAS_TEMPS 256
 static int temp_alias[MAX_ALIAS_TEMPS];    /* 0 = no alias, negative = param slot */
@@ -67,6 +128,15 @@ static int leaf_opt;                        /* 1 = leaf optimizations active */
 static int temp_use_count[MAX_ALIAS_TEMPS];
 static int temp_is_retval[MAX_ALIAS_TEMPS];
 static int skip_dead_retstore_temp;  /* temp index to skip store, or -1 */
+
+/* Comparison+branch fusion state:
+ * When a comparison instruction's result is used only by the block's jnz,
+ * we skip boolean materialization (0/1) and emit a direct compare+branch.
+ */
+static int fused_cmp;       /* 1 if a fused comparison is pending */
+static int fused_cmp_op;    /* the comparison opcode */
+static Ref fused_cmp_r0;    /* first operand */
+static Ref fused_cmp_r1;    /* second operand */
 
 /* Pre-pass: count how many times each temp is used as an operand */
 static void
@@ -392,8 +462,10 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
     Con *c;
     int slot;
 
-    if (sp_adjust == 0 && acache_has(r))
+    if (sp_adjust == 0 && acache_has(r)) {
+        last_load_emitted = 0;
         return;
+    }
 
     switch (rtype(r)) {
     case RTmp:
@@ -458,6 +530,7 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
      * The cache will be properly set by emitstore() after the
      * instruction finishes computing and stores its result.
      */
+    last_load_emitted = 1;
     if (sp_adjust == 0)
         acache_invalidate();
 }
@@ -665,52 +738,52 @@ emitins(Ins *i, Fn *fn)
             } else if (val == 3) {
                 /* x*3 = x*2 + x */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.l tcc__r9\n");
+                fprintf(outf, "\tsta.w tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.l tcc__r9\n");
+                fprintf(outf, "\tadc.w tcc__r9\n");
             } else if (val == 5) {
                 /* x*5 = x*4 + x */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.l tcc__r9\n");
+                fprintf(outf, "\tsta.w tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.l tcc__r9\n");
+                fprintf(outf, "\tadc.w tcc__r9\n");
             } else if (val == 6) {
                 /* x*6 = (x*2 + x) * 2 = x*3*2 */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.l tcc__r9\n");
+                fprintf(outf, "\tsta.w tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.l tcc__r9\n");
+                fprintf(outf, "\tadc.w tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
             } else if (val == 7) {
                 /* x*7 = x*8 - x */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.l tcc__r9\n");
+                fprintf(outf, "\tsta.w tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tsec\n");
-                fprintf(outf, "\tsbc.l tcc__r9\n");
+                fprintf(outf, "\tsbc.w tcc__r9\n");
             } else if (val == 9) {
                 /* x*9 = x*8 + x */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.l tcc__r9\n");
+                fprintf(outf, "\tsta.w tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.l tcc__r9\n");
+                fprintf(outf, "\tadc.w tcc__r9\n");
             } else if (val == 10) {
                 /* x*10 = (x*4 + x) * 2 = x*5*2 */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.l tcc__r9\n");
+                fprintf(outf, "\tsta.w tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.l tcc__r9\n");
+                fprintf(outf, "\tadc.w tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
             } else {
                 /* General case: use stack for multiplier, call __mul */
@@ -776,20 +849,20 @@ emitins(Ins *i, Fn *fn)
             } else {
                 /* General case: call __div16 */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.l tcc__r0\n");
+                fprintf(outf, "\tsta.w tcc__r0\n");
                 emitload(r1, fn);
-                fprintf(outf, "\tsta.l tcc__r1\n");
+                fprintf(outf, "\tsta.w tcc__r1\n");
                 fprintf(outf, "\tjsl __div16\n");
-                fprintf(outf, "\tlda.l tcc__r0\n");
+                fprintf(outf, "\tlda.w tcc__r0\n");
             }
         } else {
             /* Variable / variable - call __div16 */
             emitload(r0, fn);
-            fprintf(outf, "\tsta.l tcc__r0\n");
+            fprintf(outf, "\tsta.w tcc__r0\n");
             emitload(r1, fn);
-            fprintf(outf, "\tsta.l tcc__r1\n");
+            fprintf(outf, "\tsta.w tcc__r1\n");
             fprintf(outf, "\tjsl __div16\n");
-            fprintf(outf, "\tlda.l tcc__r0\n");
+            fprintf(outf, "\tlda.w tcc__r0\n");
         }
         emitstore(i->to, fn);
         break;
@@ -818,20 +891,20 @@ emitins(Ins *i, Fn *fn)
             } else {
                 /* General case: call __mod16 */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.l tcc__r0\n");
+                fprintf(outf, "\tsta.w tcc__r0\n");
                 emitload(r1, fn);
-                fprintf(outf, "\tsta.l tcc__r1\n");
+                fprintf(outf, "\tsta.w tcc__r1\n");
                 fprintf(outf, "\tjsl __mod16\n");
-                fprintf(outf, "\tlda.l tcc__r0\n");
+                fprintf(outf, "\tlda.w tcc__r0\n");
             }
         } else {
             /* Variable % variable - call __mod16 */
             emitload(r0, fn);
-            fprintf(outf, "\tsta.l tcc__r0\n");
+            fprintf(outf, "\tsta.w tcc__r0\n");
             emitload(r1, fn);
-            fprintf(outf, "\tsta.l tcc__r1\n");
+            fprintf(outf, "\tsta.w tcc__r1\n");
             fprintf(outf, "\tjsl __mod16\n");
-            fprintf(outf, "\tlda.l tcc__r0\n");
+            fprintf(outf, "\tlda.w tcc__r0\n");
         }
         emitstore(i->to, fn);
         break;
@@ -877,14 +950,16 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Osar:
-        /* Arithmetic shift right - for 16-bit values, using LSR is safe
-         * since high bits are already zero. For negative values, this
-         * doesn't properly sign-extend, but SNES code rarely needs that. */
+        /* Arithmetic shift right: cmp #$8000 sets carry to sign bit,
+         * then ror shifts carry (sign) into bit 15. This preserves
+         * the sign for negative values (sign extension). */
         emitload(r0, fn);
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
-            for (int j = 0; j < c->bits.i && j < 16; j++)
-                fprintf(outf, "\tlsr a\n");
+            for (int j = 0; j < c->bits.i && j < 16; j++) {
+                fprintf(outf, "\tcmp.w #$8000\n");
+                fprintf(outf, "\tror a\n");
+            }
         } else {
             fprintf(outf, "\tpha\n");
             emitload(r1, fn);
@@ -892,7 +967,8 @@ emitins(Ins *i, Fn *fn)
             fprintf(outf, "\tpla\n");
             fprintf(outf, "\tcpx #0\n");
             fprintf(outf, "\tbeq +\n");
-            fprintf(outf, "-\tlsr a\n");
+            fprintf(outf, "-\tcmp.w #$8000\n");
+            fprintf(outf, "\tror a\n");
             fprintf(outf, "\tdex\n");
             fprintf(outf, "\tbne -\n");
             fprintf(outf, "+\n");
@@ -1089,14 +1165,13 @@ emitins(Ins *i, Fn *fn)
                 /* Direct address constant or symbol */
                 c = &fn->con[r1.val];
                 if (c->type == CAddr) {
-                    fprintf(outf, "\tsta.l %s", stripsym(str(c->sym.id)));
+                    fprintf(outf, "\tsta.w %s", stripsym(str(c->sym.id)));
                     if (c->bits.i)
                         fprintf(outf, "+%d", (int)c->bits.i);
                     fprintf(outf, "\n");
-                    /* Store high word */
-                    fprintf(outf, "\tlda.w #0\n");
-                    fprintf(outf, "\tsta.l %s", stripsym(str(c->sym.id)));
-                    fprintf(outf, "+%d\n", (int)c->bits.i + 2);
+                    /* Store high word (always 0 for near pointers) */
+                    fprintf(outf, "\tstz.w %s+%d\n", stripsym(str(c->sym.id)),
+                            (int)c->bits.i + 2);
                 } else {
                     fprintf(outf, "\tsta.l $%06lX\n", (unsigned long)c->bits.i);
                     fprintf(outf, "\tlda.w #0\n");
@@ -1125,6 +1200,18 @@ emitins(Ins *i, Fn *fn)
             if (aidx >= 0 && aidx < MAX_ALIAS_TEMPS && alloc_param[aidx] != 0)
                 break;  /* param already in caller frame, skip copy */
         }
+        /* stz optimization: store zero to symbol without loading A */
+        if (rtype(r0) == RCon && fn->con[r0.val].type == CBits
+            && (fn->con[r0.val].bits.i & 0xFFFF) == 0
+            && rtype(r1) == RCon && fn->con[r1.val].type == CAddr) {
+            c = &fn->con[r1.val];
+            fprintf(outf, "\tstz.w %s", stripsym(str(c->sym.id)));
+            if (c->bits.i)
+                fprintf(outf, "+%d", (int)c->bits.i);
+            fprintf(outf, "\n");
+            acache_invalidate();
+            break;
+        }
         emitload(r0, fn);
         {
             int aslot = getallocslot(r1, fn);
@@ -1138,7 +1225,7 @@ emitins(Ins *i, Fn *fn)
                 c = &fn->con[r1.val];
                 if (c->type == CAddr) {
                     /* Symbol address - emit symbol name */
-                    fprintf(outf, "\tsta.l %s", stripsym(str(c->sym.id)));
+                    fprintf(outf, "\tsta.w %s", stripsym(str(c->sym.id)));
                     if (c->bits.i)
                         fprintf(outf, "+%d", (int)c->bits.i);
                     fprintf(outf, "\n");
@@ -1161,9 +1248,23 @@ emitins(Ins *i, Fn *fn)
 
     case Ostoreb:
         /* Byte store with mode tracking.
+         * For constant zero to symbol: use stz (no lda needed).
          * For constant values: switch to 8-bit first, use 8-bit immediate (2 bytes).
          * For variable values: load in 16-bit, then switch to 8-bit for store.
          */
+        if (rtype(r0) == RCon && fn->con[r0.val].type == CBits
+            && (fn->con[r0.val].bits.i & 0xFF) == 0
+            && rtype(r1) == RCon && fn->con[r1.val].type == CAddr) {
+            /* Byte store zero to symbol: use stz */
+            emit_sep20();
+            c = &fn->con[r1.val];
+            fprintf(outf, "\tstz.w %s", stripsym(str(c->sym.id)));
+            if (c->bits.i)
+                fprintf(outf, "+%d", (int)c->bits.i);
+            fprintf(outf, "\n");
+            acache_invalidate();
+            break;
+        }
         if (rtype(r0) == RCon && fn->con[r0.val].type == CBits) {
             /* Constant value: switch to 8-bit first, then 8-bit immediate */
             int val = fn->con[r0.val].bits.i & 0xFF;
@@ -1186,7 +1287,7 @@ emitins(Ins *i, Fn *fn)
                 c = &fn->con[r1.val];
                 if (c->type == CAddr) {
                     /* Symbol address - emit symbol name */
-                    fprintf(outf, "\tsta.l %s", stripsym(str(c->sym.id)));
+                    fprintf(outf, "\tsta.w %s", stripsym(str(c->sym.id)));
                     if (c->bits.i)
                         fprintf(outf, "+%d", (int)c->bits.i);
                     fprintf(outf, "\n");
@@ -1250,7 +1351,7 @@ emitins(Ins *i, Fn *fn)
             } else if (rtype(r0) == RCon && fn->con[r0.val].type == CAddr) {
                 /* Direct load from global/extern symbol */
                 Con *c = &fn->con[r0.val];
-                fprintf(outf, "\tlda.l %s", stripsym(str(c->sym.id)));
+                fprintf(outf, "\tlda.w %s", stripsym(str(c->sym.id)));
                 if (c->bits.i)
                     fprintf(outf, "+%d", (int)c->bits.i);
                 fprintf(outf, "\n");
@@ -1276,7 +1377,7 @@ emitins(Ins *i, Fn *fn)
             /* Direct load from global/extern symbol */
             Con *c = &fn->con[r0.val];
             emit_sep20();
-            fprintf(outf, "\tlda.l %s", stripsym(str(c->sym.id)));
+            fprintf(outf, "\tlda.w %s", stripsym(str(c->sym.id)));
             if (c->bits.i)
                 fprintf(outf, "+%d", (int)c->bits.i);
             fprintf(outf, "\n");
@@ -1391,15 +1492,31 @@ emitins(Ins *i, Fn *fn)
     case Oargub:
     case Oargsh:
     case Oarguh:
-        /* Push argument to stack
-         * IMPORTANT: Use emitload_adj with argbytes offset because
-         * previous argument pushes have already modified SP, making
-         * stack-relative offsets wrong if not adjusted.
+        /* Push argument to stack.
+         * Use pea.w for constants (saves 1 byte + 2 cycles, doesn't touch A).
+         * For variables, use lda+pha with SP adjustment for prior pushes.
          */
-        emitload_adj(r0, fn, argbytes);
-        fprintf(outf, "\tpha\n");
+        if (rtype(r0) == RCon) {
+            Con *ac = &fn->con[r0.val];
+            if (ac->type == CBits) {
+                fprintf(outf, "\tpea.w %d\n", (int)(ac->bits.i & 0xFFFF));
+            } else if (ac->type == CAddr) {
+                fprintf(outf, "\tpea.w %s", stripsym(str(ac->sym.id)));
+                if (ac->bits.i)
+                    fprintf(outf, "+%d", (int)ac->bits.i);
+                fprintf(outf, "\n");
+            } else {
+                emitload_adj(r0, fn, argbytes);
+                fprintf(outf, "\tpha\n");
+                acache_invalidate();
+            }
+            /* pea doesn't touch A — keep A-cache valid */
+        } else {
+            emitload_adj(r0, fn, argbytes);
+            fprintf(outf, "\tpha\n");
+            acache_invalidate();
+        }
         argbytes += 2;  /* All args pushed as 16-bit */
-        acache_invalidate();
         break;
 
     case Ocall:
@@ -1562,39 +1679,82 @@ emitjmp(Blk *b, Fn *fn)
             fprintf(outf, "\tjmp @%s\n", b->s1->name);
         break;
     case Jjnz:
-        emitload(b->jmp.arg, fn);
-        /* Ensure Z flag is set correctly for the branch condition.
-         * When A-cache skips the lda, flags may be stale (e.g., after
-         * Oloadsb's cmp.w #$0080 which corrupts Z for zero values). */
-        fprintf(outf, "\tcmp.w #0\n");
-        if (b->s1 == b->link) {
-            /* True branch falls through - invert: branch on zero to s2 */
-            fprintf(outf, "\tbne +\n");
-            emitphimoves(b, b->s2, fn);
-            fprintf(outf, "\tjmp @%s\n", b->s2->name);
-            fprintf(outf, "+\n");
-            emitphimoves(b, b->s1, fn);
-        } else if (b->s2 == b->link) {
-            /* False branch falls through - branch on nonzero to s1 */
-            fprintf(outf, "\tbeq +\n");
-            emitphimoves(b, b->s1, fn);
-            fprintf(outf, "\tjmp @%s\n", b->s1->name);
-            fprintf(outf, "+\n");
-            emitphimoves(b, b->s2, fn);
+        if (fused_cmp) {
+            /* Fused comparison+branch: emit compare and conditional branch
+             * directly, skipping boolean materialization (0/1 on stack).
+             * Saves ~6-10 instructions per conditional. */
+            int swap;
+            const char *bt, *bf;
+            cmp_branch_info(fused_cmp_op, &swap, &bt, &bf);
+            if (swap) {
+                emitload(fused_cmp_r1, fn);
+                emitop2("cmp", fused_cmp_r0, fn);
+            } else {
+                emitload(fused_cmp_r0, fn);
+                emitop2("cmp", fused_cmp_r1, fn);
+            }
+            acache_invalidate();
+            if (b->s1 == b->link) {
+                /* True falls through: skip false path on TRUE */
+                fprintf(outf, "\t%s +\n", bt);
+                emitphimoves(b, b->s2, fn);
+                fprintf(outf, "\tjmp @%s\n", b->s2->name);
+                fprintf(outf, "+\n");
+                emitphimoves(b, b->s1, fn);
+            } else if (b->s2 == b->link) {
+                /* False falls through: skip true path on FALSE */
+                fprintf(outf, "\t%s +\n", bf);
+                emitphimoves(b, b->s1, fn);
+                fprintf(outf, "\tjmp @%s\n", b->s1->name);
+                fprintf(outf, "+\n");
+                emitphimoves(b, b->s2, fn);
+            } else {
+                /* Neither falls through */
+                fprintf(outf, "\t%s +\n", bt);
+                emitphimoves(b, b->s2, fn);
+                fprintf(outf, "\tjmp @%s\n", b->s2->name);
+                fprintf(outf, "+\n");
+                emitphimoves(b, b->s1, fn);
+                fprintf(outf, "\tjmp @%s\n", b->s1->name);
+            }
+            fused_cmp = 0;
         } else {
-            /* Neither falls through */
-            fprintf(outf, "\tbne +\n");
-            emitphimoves(b, b->s2, fn);
-            fprintf(outf, "\tjmp @%s\n", b->s2->name);
-            fprintf(outf, "+\n");
-            emitphimoves(b, b->s1, fn);
-            fprintf(outf, "\tjmp @%s\n", b->s1->name);
+            emitload(b->jmp.arg, fn);
+            /* Only emit cmp.w #0 when A-cache hit skipped the lda.
+             * When emitload actually emitted an lda, Z flag is already
+             * correctly set from the loaded value. */
+            if (!last_load_emitted)
+                fprintf(outf, "\tcmp.w #0\n");
+            if (b->s1 == b->link) {
+                /* True branch falls through - invert: branch on zero to s2 */
+                fprintf(outf, "\tbne +\n");
+                emitphimoves(b, b->s2, fn);
+                fprintf(outf, "\tjmp @%s\n", b->s2->name);
+                fprintf(outf, "+\n");
+                emitphimoves(b, b->s1, fn);
+            } else if (b->s2 == b->link) {
+                /* False branch falls through - branch on nonzero to s1 */
+                fprintf(outf, "\tbeq +\n");
+                emitphimoves(b, b->s1, fn);
+                fprintf(outf, "\tjmp @%s\n", b->s1->name);
+                fprintf(outf, "+\n");
+                emitphimoves(b, b->s2, fn);
+            } else {
+                /* Neither falls through */
+                fprintf(outf, "\tbne +\n");
+                emitphimoves(b, b->s2, fn);
+                fprintf(outf, "\tjmp @%s\n", b->s2->name);
+                fprintf(outf, "+\n");
+                emitphimoves(b, b->s1, fn);
+                fprintf(outf, "\tjmp @%s\n", b->s1->name);
+            }
         }
         break;
     default:
         if (b->jmp.type >= Jjf && b->jmp.type <= Jjf1) {
             emitload(b->jmp.arg, fn);
-            fprintf(outf, "\tcmp.w #0\n");
+            if (!last_load_emitted)
+                fprintf(outf, "\tcmp.w #0\n");
             if (b->s1 == b->link) {
                 fprintf(outf, "\tbne +\n");
                 emitphimoves(b, b->s2, fn);
@@ -1694,7 +1854,28 @@ w65816_emitfn(Fn *fn, FILE *f)
         fprintf(outf, "@%s:\n", b->name);
         acache_invalidate();
 
+        fused_cmp = 0;
         for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            /* Comparison+branch fusion: if the last instruction is a
+             * comparison whose result is used only by this block's jnz,
+             * skip boolean materialization and let emitjmp emit
+             * a direct compare+conditional branch instead. */
+            if (i == &b->ins[b->nins] - 1
+                && b->jmp.type == Jjnz
+                && is_cmp_op(i->op)
+                && rtype(i->to) == RTmp && i->to.val >= Tmp0
+                && req(i->to, b->jmp.arg)) {
+                int cidx = i->to.val - Tmp0;
+                if (cidx >= 0 && cidx < MAX_ALIAS_TEMPS
+                    && temp_use_count[cidx] == 0) {
+                    fused_cmp = 1;
+                    fused_cmp_op = i->op;
+                    fused_cmp_r0 = i->arg[0];
+                    fused_cmp_r1 = i->arg[1];
+                    continue;  /* skip emitins for this comparison */
+                }
+            }
+
             /* Dead return store elimination: detect last instruction
              * producing a temp that's only used as the return value */
             skip_dead_retstore_temp = -1;
