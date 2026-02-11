@@ -30,6 +30,17 @@ static FILE *outf;
 static int framesize;  /* Current function's frame size */
 static int argbytes;   /* Bytes of arguments pushed for current call */
 
+/* Offset from SP to caller's parameter area, past local frame + JSL return address.
+ * Stack layout after prologue (framesize F):
+ *   S+1 to S+F:   local frame (F bytes)
+ *   S+F+1:        PCL  }
+ *   S+F+2:        PCH  } JSL return address (3 bytes)
+ *   S+F+3:        PBR  }
+ *   S+F+4:        first param low byte
+ * Param slot=-2 (first) -> offset = F + 2 + (-slot) = F + 4
+ */
+#define PARAM_OFFSET 2  /* framesize + PARAM_OFFSET + (-slot) */
+
 /* A-register cache: track which Ref is currently in A to skip redundant loads */
 static int acache_valid;
 static Ref acache_ref;
@@ -477,7 +488,7 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
             int idx = r.val - Tmp0;
             if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
                 int neg_slot = temp_alias[idx];
-                fprintf(outf, "\tlda %d,s\n", framesize + 3 + (-neg_slot) + sp_adjust);
+                fprintf(outf, "\tlda %d,s\n", framesize + PARAM_OFFSET + (-neg_slot) + sp_adjust);
             } else {
                 /* Spilled temp */
                 slot = fn->tmp[r.val].slot;
@@ -507,16 +518,15 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
             /* Negative slot = parameter from caller's frame */
             /* Stack layout after prologue (framesize F):
              *   S+1 to S+F: local frame (F bytes)
-             *   S+(F+1): P (from PHP, 1 byte)
-             *   S+(F+2): PCL (1 byte) }
-             *   S+(F+3): PCH (1 byte) } JSL return (3 bytes)
-             *   S+(F+4): PBR (1 byte) }
-             *   S+(F+5): first param low byte
-             *   S+(F+6): first param high byte
+             *   S+(F+1): PCL  }
+             *   S+(F+2): PCH  } JSL return address (3 bytes)
+             *   S+(F+3): PBR  }
+             *   S+(F+4): first param low byte
+             *   S+(F+5): first param high byte
              * slot=-2 means first param, slot=-4 means second, etc.
-             * Offset = framesize + 5 + (-slot) - 2 = framesize + 3 + (-slot)
+             * Offset = framesize + 4 + (-slot) - 2 = framesize + PARAM_OFFSET + (-slot)
              */
-            fprintf(outf, "\tlda %d,s\n", framesize + 3 + (-slot) + sp_adjust);
+            fprintf(outf, "\tlda %d,s\n", framesize + PARAM_OFFSET + (-slot) + sp_adjust);
         } else {
             /* Positive slot = local variable in our frame */
             fprintf(outf, "\tlda %d,s\n", (slot + 1) * 2 + sp_adjust);
@@ -588,7 +598,7 @@ emitstore(Ref r, Fn *fn)
     case RSlot:
         slot = rsval(r);
         if (slot < 0)
-            fprintf(outf, "\tsta %d,s\n", framesize + 3 + (-slot));
+            fprintf(outf, "\tsta %d,s\n", framesize + PARAM_OFFSET + (-slot));
         else
             fprintf(outf, "\tsta %d,s\n", (slot + 1) * 2);
         stored = 1;
@@ -619,7 +629,7 @@ emitop2(char *op, Ref r, Fn *fn)
             int idx = r.val - Tmp0;
             if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
                 int neg_slot = temp_alias[idx];
-                fprintf(outf, "\t%s %d,s\n", op, framesize + 3 + (-neg_slot));
+                fprintf(outf, "\t%s %d,s\n", op, framesize + PARAM_OFFSET + (-neg_slot));
             } else {
                 slot = fn->tmp[r.val].slot;
                 if (slot >= 0)
@@ -641,7 +651,7 @@ emitop2(char *op, Ref r, Fn *fn)
     case RSlot:
         slot = rsval(r);
         if (slot < 0)
-            fprintf(outf, "\t%s %d,s\n", op, framesize + 3 + (-slot));
+            fprintf(outf, "\t%s %d,s\n", op, framesize + PARAM_OFFSET + (-slot));
         else
             fprintf(outf, "\t%s %d,s\n", op, (slot + 1) * 2);
         break;
@@ -1641,7 +1651,7 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
                     if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
                         /* Aliased to param slot — load from caller frame */
                         int neg_slot = temp_alias[idx];
-                        fprintf(outf, "\tlda %d,s\n", framesize + 3 + (-neg_slot));
+                        fprintf(outf, "\tlda %d,s\n", framesize + PARAM_OFFSET + (-neg_slot));
                         fprintf(outf, "\tsta %d,s\n", (dstslot + 1) * 2);
                     } else {
                         /* Temp: check if we need to copy */
@@ -1836,9 +1846,9 @@ w65816_emitfn(Fn *fn, FILE *f)
     fprintf(outf, ".SECTION \".text.%s\" SUPERFREE\n", fn->name);
     fprintf(outf, "%s:\n", fn->name);
 
-    /* Prologue */
-    fprintf(outf, "\tphp\n");
-    fprintf(outf, "\trep #$30\n");
+    /* Prologue — no php/rep: calling convention guarantees 16-bit A/X/Y.
+     * Phase 2 (emit_rep20) ensures 16-bit mode is restored before every
+     * return, so callees never leave the caller in 8-bit mode. */
     if (framesize > 2) {
         fprintf(outf, "\ttsa\n");
         fprintf(outf, "\tsec\n");
@@ -1847,7 +1857,7 @@ w65816_emitfn(Fn *fn, FILE *f)
     }
 
     acache_invalidate();
-    amode_8bit = 0;  /* Start in 16-bit mode (after rep #$30 in prologue) */
+    amode_8bit = 0;  /* Start in 16-bit mode (calling convention) */
     for (b = fn->start; b; b = b->link) {
         /* Ensure 16-bit mode at block entry — incoming edges may differ */
         emit_rep20();
@@ -1905,7 +1915,6 @@ w65816_emitfn(Fn *fn, FILE *f)
                 if (b->jmp.type != Jret0)
                     fprintf(outf, "\ttxa\n");   /* restore return value (non-void only) */
             }
-            fprintf(outf, "\tplp\n");
             fprintf(outf, "\trtl\n");
         } else {
             /* Ensure 16-bit before jump (phi moves use 16-bit lda/sta) */
