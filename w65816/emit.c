@@ -583,14 +583,16 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Osar:
-        /* Arithmetic shift right - for 16-bit values, using LSR is safe
-         * since high bits are already zero. For negative values, this
-         * doesn't properly sign-extend, but SNES code rarely needs that. */
+        /* Arithmetic shift right (signed). 65816 has no native ASR, so we use
+         * the standard idiom: cmp.w #$8000 sets carry = sign bit, then ror a
+         * rotates right through carry, propagating the sign bit into the MSB. */
         emitload(r0, fn);
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
-            for (int j = 0; j < c->bits.i && j < 16; j++)
-                fprintf(outf, "\tlsr a\n");
+            for (int j = 0; j < c->bits.i && j < 16; j++) {
+                fprintf(outf, "\tcmp.w #$8000\n");
+                fprintf(outf, "\tror a\n");
+            }
         } else {
             fprintf(outf, "\tpha\n");
             emitload(r1, fn);
@@ -598,7 +600,8 @@ emitins(Ins *i, Fn *fn)
             fprintf(outf, "\tpla\n");
             fprintf(outf, "\tcpx #0\n");
             fprintf(outf, "\tbeq +\n");
-            fprintf(outf, "-\tlsr a\n");
+            fprintf(outf, "-\tcmp.w #$8000\n");
+            fprintf(outf, "\tror a\n");
             fprintf(outf, "\tdex\n");
             fprintf(outf, "\tbne -\n");
             fprintf(outf, "+\n");
