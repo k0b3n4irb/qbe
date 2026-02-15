@@ -501,6 +501,30 @@ mark_dead_stores(Fn *fn)
                     temp_is_dead_store[idx] = 1;
                 }
             }
+
+            /* Case 4: used once as arg[1] of immediately next indirect store.
+             * The A-cache optimization transfers address to X via tax, so the
+             * slot store is never read. Only for Ostorew/Ostoreh (not Ostoreb
+             * which has different 8-bit mode handling). */
+            if (temp_use_count[idx] == 1 && !temp_is_retval[idx]
+                && !temp_is_dead_store[idx]) {
+                next = i + 1;
+                while (next < &b->ins[b->nins] && is_nop_instruction(next))
+                    next++;
+
+                if (next < &b->ins[b->nins]
+                    && (next->op == Ostorew || next->op == Ostoreh)
+                    && rtype(next->arg[1]) == RTmp
+                    && next->arg[1].val >= Tmp0
+                    && (next->arg[1].val - Tmp0) == idx) {
+                    /* Verify not an alloc slot (would use stack-relative store) */
+                    int a1idx = next->arg[1].val - Tmp0;
+                    if (a1idx < 0 || a1idx >= MAX_ALLOC_TEMPS
+                        || w65816_alloc_size[a1idx] <= 0) {
+                        temp_is_dead_store[idx] = 1;
+                    }
+                }
+            }
         }
     }
 }
@@ -1062,6 +1086,57 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "\tclc\n");
                 fprintf(outf, "\tadc.w tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
+            } else if (val == 11) {
+                /* x*11 = (x*2+x)*4 - x = 12x - x */
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tclc\n");
+                fprintf(outf, "\tadc.w tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tsec\n");
+                fprintf(outf, "\tsbc.w tcc__r9\n");
+            } else if (val == 12) {
+                /* x*12 = (x*2+x)*4 = x*3*4 */
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tclc\n");
+                fprintf(outf, "\tadc.w tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+            } else if (val == 13) {
+                /* x*13 = (x*2+x)*4 + x = 12x + x */
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tclc\n");
+                fprintf(outf, "\tadc.w tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tclc\n");
+                fprintf(outf, "\tadc.w tcc__r9\n");
+            } else if (val == 14) {
+                /* x*14 = (x*8-x)*2 = x*7*2 */
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tsec\n");
+                fprintf(outf, "\tsbc.w tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+            } else if (val == 15) {
+                /* x*15 = x*16 - x */
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tsec\n");
+                fprintf(outf, "\tsbc.w tcc__r9\n");
             } else {
                 /* General case: use stack for multiplier, call __mul */
                 emitload(r1, fn);
@@ -1540,6 +1615,20 @@ emitins(Ins *i, Fn *fn)
             fprintf(outf, "\n");
             acache_invalidate();
             break;
+        }
+        /* Indirect store with r1 in A-cache: address already in A,
+         * transfer to X before loading value. Avoids pha/emitload_adj/tax/pla. */
+        {
+            int aslot_r1 = getallocslot(r1, fn);
+            if (aslot_r1 < 0 && !isvreg(r1) && rtype(r1) != RCon
+                && acache_has(r1)) {
+                fprintf(outf, "\ttax\n");
+                acache_invalidate();
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.l $0000,x\n");
+                acache_invalidate();
+                break;
+            }
         }
         emitload(r0, fn);
         {
