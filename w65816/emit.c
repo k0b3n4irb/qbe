@@ -140,6 +140,9 @@ static int temp_use_count[MAX_ALIAS_TEMPS];
 static int temp_is_retval[MAX_ALIAS_TEMPS];
 static int skip_dead_retstore_temp;  /* temp index to skip store, or -1 */
 
+/* Dead store elimination: temps whose stack slot stores can be skipped */
+static int temp_is_dead_store[MAX_ALIAS_TEMPS];
+
 /* Comparison+branch fusion state:
  * When a comparison instruction's result is used only by the block's jnz,
  * we skip boolean materialization (0/1) and emit a direct compare+branch.
@@ -284,6 +287,172 @@ build_alias_table(Fn *fn)
     }
 }
 
+/* Check if instruction is a no-op (emits no real code) given current alias/param state.
+ * Used by mark_dead_stores to skip over instructions that don't touch A. */
+static int
+is_nop_instruction(Ins *i)
+{
+    int idx;
+
+    /* Alloc with param-shadow → nop when frameless */
+    if (i->op == Oalloc4 || i->op == Oalloc8 || i->op == Oalloc16) {
+        if (rtype(i->to) == RTmp && i->to.val >= Tmp0) {
+            idx = i->to.val - Tmp0;
+            if (idx >= 0 && idx < MAX_ALIAS_TEMPS && alloc_param[idx] != 0)
+                return 1;
+        }
+        return 0;
+    }
+
+    /* Copy with aliased source → skipped */
+    if (i->op == Ocopy && rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0) {
+        idx = i->arg[0].val - Tmp0;
+        if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0)
+            return 1;
+    }
+
+    /* Store into param-shadow alloc → skipped */
+    if ((i->op == Ostorew || i->op == Ostoreh)
+        && rtype(i->arg[1]) == RTmp && i->arg[1].val >= Tmp0) {
+        idx = i->arg[1].val - Tmp0;
+        if (idx >= 0 && idx < MAX_ALIAS_TEMPS && alloc_param[idx] != 0)
+            return 1;
+    }
+
+    /* Load from param slot or param-shadow alloc → aliased, skipped */
+    if (i->op == Oloadsw || i->op == Oloaduw || i->op == Oload) {
+        if (rtype(i->arg[0]) == RSlot && rsval(i->arg[0]) < 0)
+            return 1;
+        if (rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0) {
+            idx = i->arg[0].val - Tmp0;
+            if (idx >= 0 && idx < MAX_ALIAS_TEMPS && alloc_param[idx] != 0)
+                return 1;
+        }
+    }
+
+    /* Extensions with aliased source → skipped */
+    if ((i->op == Oextuh || i->op == Oextub || i->op == Oextsh
+         || i->op == Oextsb || i->op == Oextsw || i->op == Oextuw)
+        && rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0) {
+        idx = i->arg[0].val - Tmp0;
+        if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0)
+            return 1;
+    }
+
+    return 0;
+}
+
+/* Check if instruction consumes arg[0] via emitload (A-cache hit possible).
+ * Instructions that load r1 first (swapped cmp) or use emitload_adj with
+ * sp_adjust > 0 (Oarg) cannot benefit from A-cache for r0. */
+static int
+consumes_r0_via_emitload(Ins *i)
+{
+    switch (i->op) {
+    /* Swapped comparisons: r0 goes through emitop2 (slot read, not A-cache) */
+    case Ocsgtw: case Ocsgtl:
+    case Ocslew: case Ocslel:
+    case Ocugtw: case Ocugtl:
+    case Oculew: case Oculel:
+        return 0;
+    /* Arg push: uses emitload_adj with argbytes (may not hit A-cache) */
+    case Oarg: case Oargsb: case Oargub: case Oargsh: case Oarguh:
+    case Ocall:
+        return 0;
+    /* Alloc: doesn't load arg[0] value */
+    case Oalloc4: case Oalloc8: case Oalloc16:
+        return 0;
+    /* Mul: variable*variable loads r1 first; conservative exclude */
+    case Omul:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
+/* Mark temps whose stack slot stores can be safely skipped.
+ * A temp is a dead store if:
+ *  Case 1: use_count==0 and not a jnz/ret arg → truly unused
+ *  Case 2: use_count==1, used as arg[0] of immediately next real instruction
+ *           in the same block, and that instruction loads r0 via emitload
+ *           → A-cache serves the value, slot never read
+ * Exclusions: aliased temps, alloc instructions, phi args, jnz args */
+static void
+mark_dead_stores(Fn *fn)
+{
+    Blk *b;
+    Ins *i, *next;
+    Phi *p;
+    int idx, n;
+    int is_phi_arg[MAX_ALIAS_TEMPS];
+    int is_jnz_arg[MAX_ALIAS_TEMPS];
+
+    memset(temp_is_dead_store, 0, sizeof(temp_is_dead_store));
+    memset(is_phi_arg, 0, sizeof(is_phi_arg));
+    memset(is_jnz_arg, 0, sizeof(is_jnz_arg));
+
+    /* Identify phi args and jnz args (both need their slots) */
+    for (b = fn->start; b; b = b->link) {
+        for (p = b->phi; p; p = p->link)
+            for (n = 0; n < p->narg; n++)
+                if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
+                    idx = p->arg[n].val - Tmp0;
+                    if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+                        is_phi_arg[idx] = 1;
+                }
+        if (b->jmp.type == Jjnz && rtype(b->jmp.arg) == RTmp
+            && b->jmp.arg.val >= Tmp0) {
+            idx = b->jmp.arg.val - Tmp0;
+            if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+                is_jnz_arg[idx] = 1;
+        }
+    }
+
+    for (b = fn->start; b; b = b->link) {
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (rtype(i->to) != RTmp || i->to.val < Tmp0)
+                continue;
+            idx = i->to.val - Tmp0;
+            if (idx < 0 || idx >= MAX_ALIAS_TEMPS)
+                continue;
+
+            /* Exclude aliased temps (already optimized) */
+            if (temp_alias[idx] != 0)
+                continue;
+            /* Exclude alloc instructions (produce addresses, not values) */
+            if (i->op == Oalloc4 || i->op == Oalloc8 || i->op == Oalloc16)
+                continue;
+            /* Exclude phi args (need slot for inter-block moves) */
+            if (is_phi_arg[idx])
+                continue;
+            /* Exclude jnz args (loaded by emitjmp, A-cache may be stale) */
+            if (is_jnz_arg[idx])
+                continue;
+
+            /* Case 1: never used as operand (jnz/ret not counted here) */
+            if (temp_use_count[idx] == 0 && !temp_is_retval[idx]) {
+                temp_is_dead_store[idx] = 1;
+                continue;
+            }
+
+            /* Case 2: used once as arg[0] of immediately next real instruction */
+            if (temp_use_count[idx] == 1 && !temp_is_retval[idx]) {
+                next = i + 1;
+                while (next < &b->ins[b->nins] && is_nop_instruction(next))
+                    next++;
+
+                if (next < &b->ins[b->nins]
+                    && rtype(next->arg[0]) == RTmp
+                    && next->arg[0].val >= Tmp0
+                    && (next->arg[0].val - Tmp0) == idx
+                    && consumes_r0_via_emitload(next)) {
+                    temp_is_dead_store[idx] = 1;
+                }
+            }
+        }
+    }
+}
+
 /* Check if a leaf function can be frameless (no real stack slots needed) */
 static int
 can_be_frameless(Fn *fn)
@@ -328,6 +497,9 @@ can_be_frameless(Fn *fn)
 
             /* Skip aliased temps (param copies / copy chains) */
             if (temp_alias[idx] != 0) continue;
+
+            /* Skip dead store temps (slot never read, A-cache serves value) */
+            if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_is_dead_store[idx]) continue;
 
             /* Skip dead return stores */
             if (is_ret_block && i == last && req(i->to, b->jmp.arg)
@@ -568,6 +740,15 @@ emitstore(Ref r, Fn *fn)
     if (leaf_opt && rtype(r) == RTmp && r.val >= Tmp0) {
         int idx = r.val - Tmp0;
         if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
+            acache_set(r);
+            return;
+        }
+    }
+
+    /* Dead store elimination: skip store when temp's slot is never read */
+    if (rtype(r) == RTmp && r.val >= Tmp0) {
+        int idx = r.val - Tmp0;
+        if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_is_dead_store[idx]) {
             acache_set(r);
             return;
         }
@@ -1828,6 +2009,7 @@ w65816_emitfn(Fn *fn, FILE *f)
     skip_dead_retstore_temp = -1;
     count_temp_uses(fn);
     build_alias_table(fn);
+    mark_dead_stores(fn);
 
     /* Frame elimination: if all temps are aliased or dead-retval, go frameless */
     if (leaf_opt && can_be_frameless(fn))
