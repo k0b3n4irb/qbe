@@ -292,7 +292,7 @@ can_be_frameless(Fn *fn)
     Ins *i;
     int a, idx;
 
-    if (!fn->leaf || fn->dynalloc) return 0;
+    if (fn->dynalloc) return 0;
 
     /* Check alloc slots: allow param-shadow allocs (fully optimized away),
      * but reject allocs used for other purposes */
@@ -1824,7 +1824,7 @@ w65816_emitfn(Fn *fn, FILE *f)
     argbytes = 0;  /* Reset argument tracking for this function */
 
     /* Leaf function optimization pre-passes */
-    leaf_opt = (fn->leaf && !fn->dynalloc);
+    leaf_opt = !fn->dynalloc;
     skip_dead_retstore_temp = -1;
     count_temp_uses(fn);
     build_alias_table(fn);
