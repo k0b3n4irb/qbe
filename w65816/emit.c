@@ -1039,104 +1039,104 @@ emitins(Ins *i, Fn *fn)
             } else if (val == 3) {
                 /* x*3 = x*2 + x */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tsta.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.w tcc__r9\n");
+                fprintf(outf, "\tadc.b tcc__r9\n");
             } else if (val == 5) {
                 /* x*5 = x*4 + x */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tsta.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.w tcc__r9\n");
+                fprintf(outf, "\tadc.b tcc__r9\n");
             } else if (val == 6) {
                 /* x*6 = (x*2 + x) * 2 = x*3*2 */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tsta.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.w tcc__r9\n");
+                fprintf(outf, "\tadc.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
             } else if (val == 7) {
                 /* x*7 = x*8 - x */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tsta.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tsec\n");
-                fprintf(outf, "\tsbc.w tcc__r9\n");
+                fprintf(outf, "\tsbc.b tcc__r9\n");
             } else if (val == 9) {
                 /* x*9 = x*8 + x */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tsta.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.w tcc__r9\n");
+                fprintf(outf, "\tadc.b tcc__r9\n");
             } else if (val == 10) {
                 /* x*10 = (x*4 + x) * 2 = x*5*2 */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tsta.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.w tcc__r9\n");
+                fprintf(outf, "\tadc.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
             } else if (val == 11) {
                 /* x*11 = (x*2+x)*4 - x = 12x - x */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tsta.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.w tcc__r9\n");
+                fprintf(outf, "\tadc.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tsec\n");
-                fprintf(outf, "\tsbc.w tcc__r9\n");
+                fprintf(outf, "\tsbc.b tcc__r9\n");
             } else if (val == 12) {
                 /* x*12 = (x*2+x)*4 = x*3*4 */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tsta.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.w tcc__r9\n");
+                fprintf(outf, "\tadc.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
             } else if (val == 13) {
                 /* x*13 = (x*2+x)*4 + x = 12x + x */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tsta.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.w tcc__r9\n");
+                fprintf(outf, "\tadc.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.w tcc__r9\n");
+                fprintf(outf, "\tadc.b tcc__r9\n");
             } else if (val == 14) {
                 /* x*14 = (x*8-x)*2 = x*7*2 */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tsta.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tsec\n");
-                fprintf(outf, "\tsbc.w tcc__r9\n");
+                fprintf(outf, "\tsbc.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
             } else if (val == 15) {
                 /* x*15 = x*16 - x */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r9\n");
+                fprintf(outf, "\tsta.b tcc__r9\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tasl a\n");
                 fprintf(outf, "\tsec\n");
-                fprintf(outf, "\tsbc.w tcc__r9\n");
+                fprintf(outf, "\tsbc.b tcc__r9\n");
             } else {
                 /* General case: use stack for multiplier, call __mul */
                 emitload(r1, fn);
@@ -1191,22 +1191,20 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "\txba\n");  /* swap bytes = /256 */
                 fprintf(outf, "\tand.w #$00FF\n");
             } else {
-                /* General case: call __div16 */
+                /* General case: call __div16 (returns quotient in A) */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r0\n");
+                fprintf(outf, "\tsta.b tcc__r0\n");
                 emitload(r1, fn);
-                fprintf(outf, "\tsta.w tcc__r1\n");
+                fprintf(outf, "\tsta.b tcc__r1\n");
                 fprintf(outf, "\tjsl __div16\n");
-                fprintf(outf, "\tlda.w tcc__r0\n");
             }
         } else {
-            /* Variable / variable - call __div16 */
+            /* Variable / variable - call __div16 (returns quotient in A) */
             emitload(r0, fn);
-            fprintf(outf, "\tsta.w tcc__r0\n");
+            fprintf(outf, "\tsta.b tcc__r0\n");
             emitload(r1, fn);
-            fprintf(outf, "\tsta.w tcc__r1\n");
+            fprintf(outf, "\tsta.b tcc__r1\n");
             fprintf(outf, "\tjsl __div16\n");
-            fprintf(outf, "\tlda.w tcc__r0\n");
         }
         emitstore(i->to, fn);
         break;
@@ -1233,22 +1231,20 @@ emitins(Ins *i, Fn *fn)
                 emitload(r0, fn);
                 fprintf(outf, "\tand.w #255\n");
             } else {
-                /* General case: call __mod16 */
+                /* General case: call __mod16 (returns remainder in A) */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta.w tcc__r0\n");
+                fprintf(outf, "\tsta.b tcc__r0\n");
                 emitload(r1, fn);
-                fprintf(outf, "\tsta.w tcc__r1\n");
+                fprintf(outf, "\tsta.b tcc__r1\n");
                 fprintf(outf, "\tjsl __mod16\n");
-                fprintf(outf, "\tlda.w tcc__r0\n");
             }
         } else {
-            /* Variable % variable - call __mod16 */
+            /* Variable % variable - call __mod16 (returns remainder in A) */
             emitload(r0, fn);
-            fprintf(outf, "\tsta.w tcc__r0\n");
+            fprintf(outf, "\tsta.b tcc__r0\n");
             emitload(r1, fn);
-            fprintf(outf, "\tsta.w tcc__r1\n");
+            fprintf(outf, "\tsta.b tcc__r1\n");
             fprintf(outf, "\tjsl __mod16\n");
-            fprintf(outf, "\tlda.w tcc__r0\n");
         }
         emitstore(i->to, fn);
         break;
