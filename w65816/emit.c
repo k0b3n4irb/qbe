@@ -272,9 +272,11 @@ build_alias_table(Fn *fn)
                     && dst_idx >= 0 && dst_idx < MAX_ALIAS_TEMPS)
                     temp_alias[dst_idx] = temp_alias[src_idx];
             }
-            /* Oextuh/Oextub/etc: propagate alias through extensions */
-            else if ((i->op == Oextuh || i->op == Oextub || i->op == Oextsh
-                      || i->op == Oextsb || i->op == Oextuw || i->op == Oextsw)
+            /* Oextuh/etc: propagate alias through no-op extensions.
+             * NOTE: Oextub/Oextsb are NOT included — they perform real work
+             * (AND #$00FF / sign-extend) and break the alias chain. */
+            else if ((i->op == Oextuh || i->op == Oextsh
+                      || i->op == Oextuw || i->op == Oextsw)
                 && rtype(r0) == RTmp && r0.val >= Tmp0
                 && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
                 src_idx = r0.val - Tmp0;
@@ -330,9 +332,10 @@ is_nop_instruction(Ins *i)
         }
     }
 
-    /* Extensions with aliased source → skipped */
-    if ((i->op == Oextuh || i->op == Oextub || i->op == Oextsh
-         || i->op == Oextsb || i->op == Oextsw || i->op == Oextuw)
+    /* No-op extensions with aliased source → skipped.
+     * NOTE: Oextub/Oextsb excluded — they emit real code (AND/sign-extend). */
+    if ((i->op == Oextuh || i->op == Oextsh
+         || i->op == Oextsw || i->op == Oextuw)
         && rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0) {
         idx = i->arg[0].val - Tmp0;
         if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0)
@@ -2015,8 +2018,12 @@ w65816_emitfn(Fn *fn, FILE *f)
     if (leaf_opt && can_be_frameless(fn))
         framesize = 0;
 
-    /* Reset alias table for emission pass (will be rebuilt during emission) */
-    memset(temp_alias, 0, sizeof(temp_alias));
+    /* NOTE: temp_alias is NOT reset here. build_alias_table() already computed
+     * correct aliases. The emission pass uses these aliases via emitload_adj()
+     * and emitstore() to redirect param accesses to the caller's frame.
+     * Resetting here caused a mismatch: can_be_frameless() saw aliases,
+     * set framesize=0, but the emission lost the aliases and wrote to
+     * non-existent local slots, corrupting the caller's stack. */
 
     /* Debug: show slot assignments */
     fprintf(outf, "\n; Function: %s (framesize=%d, slots=%d, alloc_slots=%d, fn_leaf=%d, leaf_opt=%d)\n",
