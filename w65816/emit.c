@@ -380,8 +380,9 @@ consumes_r0_via_emitload(Ins *i)
     case Ocugtw: case Ocugtl:
     case Oculew: case Oculel:
         return 0;
-    /* Arg push: uses emitload_adj with argbytes (may not hit A-cache) */
+    /* Arg push: uses emitload_adj which checks A-cache (hits if just produced) */
     case Oarg: case Oargsb: case Oargub: case Oargsh: case Oarguh:
+        return 1;
     case Ocall:
         return 0;
     /* Alloc: doesn't load arg[0] value */
@@ -688,7 +689,7 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
     Con *c;
     int slot;
 
-    if (sp_adjust == 0 && acache_has(r)) {
+    if (acache_has(r)) {
         last_load_emitted = 0;
         return;
     }
@@ -756,8 +757,7 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
      * instruction finishes computing and stores its result.
      */
     last_load_emitted = 1;
-    if (sp_adjust == 0)
-        acache_invalidate();
+    acache_invalidate();
 }
 
 /* Convenience wrapper for normal loads (no SP adjustment) */
@@ -914,8 +914,25 @@ emitins(Ins *i, Fn *fn)
 
     switch (i->op) {
     case Oadd:
+        /* INC/DEC optimization: inc a (2 cyc) vs clc;adc #1 (5 cyc) */
+        if (rtype(r1) == RCon && fn->con[r1.val].type == CBits
+            && (fn->con[r1.val].bits.i & 0xFFFF) == 1) {
+            emitload(r0, fn);
+            fprintf(outf, "\tinc a\n");
+        } else if (rtype(r0) == RCon && fn->con[r0.val].type == CBits
+            && (fn->con[r0.val].bits.i & 0xFFFF) == 1) {
+            emitload(r1, fn);  /* commutative: swap */
+            fprintf(outf, "\tinc a\n");
+        } else if (rtype(r1) == RCon && fn->con[r1.val].type == CBits
+            && (fn->con[r1.val].bits.i & 0xFFFF) == 0xFFFF) {
+            emitload(r0, fn);  /* add -1 = dec */
+            fprintf(outf, "\tdec a\n");
+        } else if (rtype(r0) == RCon && fn->con[r0.val].type == CBits
+            && (fn->con[r0.val].bits.i & 0xFFFF) == 0xFFFF) {
+            emitload(r1, fn);  /* commutative: swap, add -1 = dec */
+            fprintf(outf, "\tdec a\n");
         /* Commutative swap: if r1 is in A-cache, use it as the loaded operand */
-        if (acache_has(r1) && !acache_has(r0)) {
+        } else if (acache_has(r1) && !acache_has(r0)) {
             emitload(r1, fn);  /* A-cache hit, no emission */
             fprintf(outf, "\tclc\n");
             emitop2("adc", r0, fn);
@@ -928,9 +945,20 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Osub:
-        emitload(r0, fn);
-        fprintf(outf, "\tsec\n");
-        emitop2("sbc", r1, fn);
+        /* DEC optimization: dec a (2 cyc) vs sec;sbc #1 (5 cyc) */
+        if (rtype(r1) == RCon && fn->con[r1.val].type == CBits
+            && (fn->con[r1.val].bits.i & 0xFFFF) == 1) {
+            emitload(r0, fn);
+            fprintf(outf, "\tdec a\n");
+        } else if (rtype(r1) == RCon && fn->con[r1.val].type == CBits
+            && (fn->con[r1.val].bits.i & 0xFFFF) == 0xFFFF) {
+            emitload(r0, fn);  /* sub -1 = inc */
+            fprintf(outf, "\tinc a\n");
+        } else {
+            emitload(r0, fn);
+            fprintf(outf, "\tsec\n");
+            emitop2("sbc", r1, fn);
+        }
         emitstore(i->to, fn);
         break;
 
@@ -1787,7 +1815,7 @@ emitins(Ins *i, Fn *fn)
     case Oarguh:
         /* Push argument to stack.
          * Use pea.w for constants (saves 1 byte + 2 cycles, doesn't touch A).
-         * For variables, use lda+pha with SP adjustment for prior pushes.
+         * For variables, use lda+pha. pha doesn't modify A, so set A-cache after.
          */
         if (rtype(r0) == RCon) {
             Con *ac = &fn->con[r0.val];
@@ -1801,13 +1829,12 @@ emitins(Ins *i, Fn *fn)
             } else {
                 emitload_adj(r0, fn, argbytes);
                 fprintf(outf, "\tpha\n");
-                acache_invalidate();
+                acache_set(r0);  /* pha doesn't change A — restore cache */
             }
-            /* pea doesn't touch A — keep A-cache valid */
         } else {
             emitload_adj(r0, fn, argbytes);
             fprintf(outf, "\tpha\n");
-            acache_invalidate();
+            acache_set(r0);  /* pha doesn't change A — restore cache */
         }
         argbytes += 2;  /* All args pushed as 16-bit */
         break;
