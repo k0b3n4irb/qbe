@@ -1846,9 +1846,11 @@ w65816_emitfn(Fn *fn, FILE *f)
     fprintf(outf, ".SECTION \".text.%s\" SUPERFREE\n", fn->name);
     fprintf(outf, "%s:\n", fn->name);
 
-    /* Prologue — no php/rep: calling convention guarantees 16-bit A/X/Y.
-     * Phase 2 (emit_rep20) ensures 16-bit mode is restored before every
-     * return, so callees never leave the caller in 8-bit mode. */
+    /* Prologue — no php/plp (PARAM_OFFSET=2 assumes no P byte on stack).
+     * rep #$20 ensures 16-bit A: assembly callers (NMI handler, mode7)
+     * may call C functions after sep #$20 (8-bit A mode).
+     * Phase 2 (emit_rep20) ensures 16-bit before every return. */
+    fprintf(outf, "\trep #$20\n");
     if (framesize > 2) {
         fprintf(outf, "\ttsa\n");
         fprintf(outf, "\tsec\n");
