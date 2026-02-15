@@ -174,6 +174,13 @@ static int fused_cmp_op;    /* the comparison opcode */
 static Ref fused_cmp_r0;    /* first operand */
 static Ref fused_cmp_r1;    /* second operand */
 
+/* Tail call optimization state (per block) */
+static Ins *tail_call_ins;        /* Pointer to the tail-call Ocall, or NULL */
+static Ins *tail_call_first_arg;  /* Pointer to first Oarg of the tail call */
+static int tail_call_nargs;       /* Number of args for the tail call */
+static int tail_call_arg_idx;     /* Current arg index during emission */
+static int caller_param_bytes;    /* Our function's total parameter bytes */
+
 /* Pre-pass: count how many times each temp is used as an operand */
 static void
 count_temp_uses(Fn *fn)
@@ -586,6 +593,126 @@ can_be_frameless(Fn *fn)
         }
     }
     return 1;
+}
+
+/*
+ * Count the function's incoming parameter bytes.
+ * Scans alloc_param[] and temp_alias[] for the most negative param slot.
+ * Slots: -2 = first param, -4 = second, etc. (each 2 bytes on stack).
+ * Returns total param bytes: e.g., 2 params → 4 bytes.
+ */
+static int
+count_fn_param_bytes(void)
+{
+    int min_slot = 0;
+    for (int i = 0; i < MAX_ALIAS_TEMPS; i++) {
+        if (alloc_param[i] < min_slot)
+            min_slot = alloc_param[i];
+    }
+    for (int i = 0; i < MAX_ALIAS_TEMPS; i++) {
+        if (temp_alias[i] < min_slot)
+            min_slot = temp_alias[i];
+    }
+    return min_slot < 0 ? -min_slot : 0;
+}
+
+/*
+ * Detect if a block ends with a tail call pattern.
+ * Requirements: last instruction is Ocall, block returns the call result
+ * (or void), function is frameless, direct call, same arg byte count.
+ * Sets tail_call_ins, tail_call_first_arg, tail_call_nargs on success.
+ */
+static void
+detect_block_tail_call(Blk *b, Fn *fn)
+{
+    Ins *i;
+    int nargs, k, callee_bytes, is_same;
+
+    tail_call_ins = NULL;
+    tail_call_first_arg = NULL;
+    tail_call_nargs = 0;
+    tail_call_arg_idx = 0;
+
+    /* Must be a return block */
+    if (!isret(b->jmp.type))
+        return;
+
+    /* Must be frameless */
+    if (framesize > 0)
+        return;
+
+    /* Find the last instruction — must be Ocall */
+    if (b->nins == 0)
+        return;
+    i = &b->ins[b->nins - 1];
+    if (i->op != Ocall)
+        return;
+
+    /* For non-void returns: call result must be the return value */
+    if (b->jmp.type != Jret0) {
+        if (!req(i->to, b->jmp.arg))
+            return;
+    }
+
+    /* Direct call only (not indirect — jml [addr] not safe for TCO) */
+    if (rtype(i->arg[0]) != RCon)
+        return;
+    {
+        Con *c = &fn->con[i->arg[0].val];
+        if (c->type != CAddr)
+            return;
+    }
+
+    /* Count Oarg instructions immediately before the Ocall */
+    nargs = 0;
+    tail_call_first_arg = &b->ins[b->nins - 1];  /* points to Ocall initially */
+    if (b->nins >= 2) {
+        for (i = &b->ins[b->nins - 2]; i >= b->ins; i--) {
+            if (i->op == Oarg || i->op == Oargsb || i->op == Oargub
+                || i->op == Oargsh || i->op == Oarguh) {
+                nargs++;
+                tail_call_first_arg = i;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /* Check: callee arg bytes == our param bytes */
+    callee_bytes = nargs * 2;
+    if (callee_bytes != caller_param_bytes)
+        return;
+
+    /* For nargs >= 2: verify all args are already at correct stack positions
+     * (no stores needed → no overlap risk). For nargs 0-1: always safe. */
+    if (nargs >= 2) {
+        k = 0;
+        for (i = tail_call_first_arg; i < &b->ins[b->nins - 1]; i++) {
+            if (i->op != Oarg && i->op != Oargsb && i->op != Oargub
+                && i->op != Oargsh && i->op != Oarguh)
+                continue;
+            {
+                int target_offset = 4 + (nargs - 1 - k) * 2;
+                Ref arg_ref = i->arg[0];
+                is_same = 0;
+                if (rtype(arg_ref) == RTmp && arg_ref.val >= Tmp0) {
+                    int idx = arg_ref.val - Tmp0;
+                    if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
+                        int param_offset = PARAM_OFFSET + (-temp_alias[idx]);
+                        if (param_offset == target_offset)
+                            is_same = 1;
+                    }
+                }
+                if (!is_same)
+                    return;  /* arg not at same position → overlap risk */
+            }
+            k++;
+        }
+    }
+
+    /* All checks pass — enable tail call for this block */
+    tail_call_ins = &b->ins[b->nins - 1];
+    tail_call_nargs = nargs;
 }
 
 /* Alloc slot offset tracking - computed from w65816_alloc_size */
@@ -1906,7 +2033,30 @@ emitins(Ins *i, Fn *fn)
     case Oargub:
     case Oargsh:
     case Oarguh:
-        /* Push argument to stack.
+        /* Tail call: store arg to param slot instead of pushing */
+        if (tail_call_ins && i >= tail_call_first_arg && i < tail_call_ins) {
+            int tgt_off = 4 + (tail_call_nargs - 1 - tail_call_arg_idx) * 2;
+            /* Check if arg is already at the correct position */
+            int same_pos = 0;
+            if (rtype(r0) == RTmp && r0.val >= Tmp0) {
+                int aidx = r0.val - Tmp0;
+                if (aidx >= 0 && aidx < MAX_ALIAS_TEMPS && temp_alias[aidx] != 0) {
+                    int poff = PARAM_OFFSET + (-temp_alias[aidx]);
+                    if (poff == tgt_off)
+                        same_pos = 1;
+                }
+            }
+            if (!same_pos) {
+                /* Load value and store to target param slot */
+                emitload(r0, fn);
+                fprintf(outf, "\tsta %d,s\n", tgt_off);
+                acache_invalidate();
+            }
+            tail_call_arg_idx++;
+            /* Don't increment argbytes — no push happened */
+            break;
+        }
+        /* Normal: push argument to stack.
          * Use pea.w for constants (saves 1 byte + 2 cycles, doesn't touch A).
          * For variables, use lda+pha. pha doesn't modify A, so set A-cache after.
          */
@@ -1933,6 +2083,14 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Ocall:
+        /* Tail call: jml instead of jsl, skip cleanup and rtl */
+        if (tail_call_ins && i == tail_call_ins) {
+            c = &fn->con[r0.val];
+            fprintf(outf, "\tjml %s\n", stripsym(str(c->sym.id)));
+            acache_invalidate();
+            argbytes = 0;
+            break;
+        }
         if (rtype(r0) == RCon) {
             c = &fn->con[r0.val];
             if (c->type == CAddr) {
@@ -2237,6 +2395,7 @@ w65816_emitfn(Fn *fn, FILE *f)
     count_temp_uses(fn);
     build_alias_table(fn);
     mark_dead_stores(fn);
+    caller_param_bytes = count_fn_param_bytes();
 
     /* Frame elimination: if all temps are aliased or dead-retval, go frameless */
     if (leaf_opt && can_be_frameless(fn))
@@ -2280,6 +2439,7 @@ w65816_emitfn(Fn *fn, FILE *f)
         acache_invalidate();
 
         fused_cmp = 0;
+        detect_block_tail_call(b, fn);
         for (i = b->ins; i < &b->ins[b->nins]; i++) {
             /* Comparison+branch fusion: if the last instruction is a
              * comparison whose result is used only by this block's jnz,
@@ -2317,29 +2477,34 @@ w65816_emitfn(Fn *fn, FILE *f)
         }
 
         if (isret(b->jmp.type)) {
-            /* Ensure 16-bit before epilogue (emitjmp + stack cleanup) */
-            emit_rep20();
-            emitjmp(b, fn);
-            if (framesize > 2) {
-                int nplx = framesize / 2;
-                int has_retval = (b->jmp.type != Jret0);
-                /* PLX threshold: 5 cycles/plx vs arithmetic (13 w/retval, 9 void) */
-                int plx_limit = has_retval ? 2 : 1;
-                if (nplx <= plx_limit) {
-                    /* PLX epilogue: doesn't clobber A, preserves return value */
-                    emit_plx_cleanup(framesize);
-                } else {
-                    if (has_retval)
-                        fprintf(outf, "\ttax\n");
-                    fprintf(outf, "\ttsa\n");
-                    fprintf(outf, "\tclc\n");
-                    fprintf(outf, "\tadc.w #%d\n", framesize);
-                    fprintf(outf, "\ttas\n");
-                    if (has_retval)
-                        fprintf(outf, "\ttxa\n");
+            if (tail_call_ins) {
+                /* Tail call: jml already emitted — skip epilogue and rtl.
+                 * The callee's rtl returns directly to our caller. */
+            } else {
+                /* Normal return: emit epilogue (emitjmp + frame cleanup + rtl) */
+                emit_rep20();
+                emitjmp(b, fn);
+                if (framesize > 2) {
+                    int nplx = framesize / 2;
+                    int has_retval = (b->jmp.type != Jret0);
+                    /* PLX threshold: 5 cycles/plx vs arithmetic (13 w/retval, 9 void) */
+                    int plx_limit = has_retval ? 2 : 1;
+                    if (nplx <= plx_limit) {
+                        /* PLX epilogue: doesn't clobber A, preserves return value */
+                        emit_plx_cleanup(framesize);
+                    } else {
+                        if (has_retval)
+                            fprintf(outf, "\ttax\n");
+                        fprintf(outf, "\ttsa\n");
+                        fprintf(outf, "\tclc\n");
+                        fprintf(outf, "\tadc.w #%d\n", framesize);
+                        fprintf(outf, "\ttas\n");
+                        if (has_retval)
+                            fprintf(outf, "\ttxa\n");
+                    }
                 }
+                fprintf(outf, "\trtl\n");
             }
-            fprintf(outf, "\trtl\n");
         } else {
             /* Ensure 16-bit before jump (phi moves use 16-bit lda/sta) */
             emit_rep20();
