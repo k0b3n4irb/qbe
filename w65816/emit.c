@@ -73,12 +73,34 @@ static void emit_rep20(void) {
     }
 }
 
+/* Emit PLX-based stack cleanup: pops N bytes (must be even) using PLX.
+ * PLX is 5 cycles on 65816 with 16-bit X and does NOT clobber A.
+ * For non-void calls with small cleanup, this avoids the expensive
+ * tax/tsa/clc/adc/tas/txa sequence (13 cycles).
+ * Threshold: PLX for ≤ 4 bytes (non-void) or ≤ 2 bytes (void).
+ */
+static void
+emit_plx_cleanup(int nbytes)
+{
+    int nplx = nbytes / 2;
+    for (int j = 0; j < nplx; j++)
+        fprintf(outf, "\tplx\n");
+}
+
 /* Check if opcode is a word/long comparison */
 static int
 is_cmp_op(int op)
 {
     return (op >= Ocmpw && op <= Ocmpw1)
         || (op >= Ocmpl && op <= Ocmpl1);
+}
+
+/* Check if opcode is a commutative ALU operation.
+ * Used by dead store analysis (Case 3) and operand swap optimization. */
+static int
+is_commutative_op(int op)
+{
+    return op == Oadd || op == Oand || op == Oor || op == Oxor;
 }
 
 /*
@@ -449,6 +471,24 @@ mark_dead_stores(Fn *fn)
                     && next->arg[0].val >= Tmp0
                     && (next->arg[0].val - Tmp0) == idx
                     && consumes_r0_via_emitload(next)) {
+                    temp_is_dead_store[idx] = 1;
+                }
+            }
+
+            /* Case 3: used once as arg[1] of immediately next commutative instruction.
+             * The commutative swap will load r1 from A-cache (since we just produced it)
+             * and use r0 as the emitop2 operand, so the slot store is never read. */
+            if (temp_use_count[idx] == 1 && !temp_is_retval[idx]
+                && !temp_is_dead_store[idx]) {
+                next = i + 1;
+                while (next < &b->ins[b->nins] && is_nop_instruction(next))
+                    next++;
+
+                if (next < &b->ins[b->nins]
+                    && rtype(next->arg[1]) == RTmp
+                    && next->arg[1].val >= Tmp0
+                    && (next->arg[1].val - Tmp0) == idx
+                    && is_commutative_op(next->op)) {
                     temp_is_dead_store[idx] = 1;
                 }
             }
@@ -874,9 +914,16 @@ emitins(Ins *i, Fn *fn)
 
     switch (i->op) {
     case Oadd:
-        emitload(r0, fn);
-        fprintf(outf, "\tclc\n");
-        emitop2("adc", r1, fn);
+        /* Commutative swap: if r1 is in A-cache, use it as the loaded operand */
+        if (acache_has(r1) && !acache_has(r0)) {
+            emitload(r1, fn);  /* A-cache hit, no emission */
+            fprintf(outf, "\tclc\n");
+            emitop2("adc", r0, fn);
+        } else {
+            emitload(r0, fn);
+            fprintf(outf, "\tclc\n");
+            emitop2("adc", r1, fn);
+        }
         emitstore(i->to, fn);
         break;
 
@@ -986,12 +1033,8 @@ emitins(Ins *i, Fn *fn)
                 emitload_adj(r0, fn, 2);  /* Adjust for pushed value */
                 fprintf(outf, "\tpha\n");
                 fprintf(outf, "\tjsl __mul16\n");
-                fprintf(outf, "\ttax\n");  /* Save result in X */
-                fprintf(outf, "\ttsa\n");
-                fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.w #4\n");
-                fprintf(outf, "\ttas\n");
-                fprintf(outf, "\ttxa\n");  /* Restore result to A */
+                /* PLX cleanup: 4 bytes (2 args), doesn't clobber A */
+                emit_plx_cleanup(4);
             }
         } else {
             /* Variable * variable - call __mul16 */
@@ -1000,12 +1043,8 @@ emitins(Ins *i, Fn *fn)
             emitload_adj(r0, fn, 2);  /* Adjust for pushed value */
             fprintf(outf, "\tpha\n");
             fprintf(outf, "\tjsl __mul16\n");
-            fprintf(outf, "\ttax\n");  /* Save result in X */
-            fprintf(outf, "\ttsa\n");
-            fprintf(outf, "\tclc\n");
-            fprintf(outf, "\tadc.w #4\n");
-            fprintf(outf, "\ttas\n");
-            fprintf(outf, "\ttxa\n");  /* Restore result to A */
+            /* PLX cleanup: 4 bytes (2 args), doesn't clobber A */
+            emit_plx_cleanup(4);
         }
         emitstore(i->to, fn);
         break;
@@ -1104,20 +1143,35 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Oand:
-        emitload(r0, fn);
-        emitop2("and", r1, fn);
+        if (acache_has(r1) && !acache_has(r0)) {
+            emitload(r1, fn);
+            emitop2("and", r0, fn);
+        } else {
+            emitload(r0, fn);
+            emitop2("and", r1, fn);
+        }
         emitstore(i->to, fn);
         break;
 
     case Oor:
-        emitload(r0, fn);
-        emitop2("ora", r1, fn);
+        if (acache_has(r1) && !acache_has(r0)) {
+            emitload(r1, fn);
+            emitop2("ora", r0, fn);
+        } else {
+            emitload(r0, fn);
+            emitop2("ora", r1, fn);
+        }
         emitstore(i->to, fn);
         break;
 
     case Oxor:
-        emitload(r0, fn);
-        emitop2("eor", r1, fn);
+        if (acache_has(r1) && !acache_has(r0)) {
+            emitload(r1, fn);
+            emitop2("eor", r0, fn);
+        } else {
+            emitload(r0, fn);
+            emitop2("eor", r1, fn);
+        }
         emitstore(i->to, fn);
         break;
 
@@ -1125,8 +1179,20 @@ emitins(Ins *i, Fn *fn)
         emitload(r0, fn);
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
-            for (int j = 0; j < c->bits.i && j < 16; j++)
-                fprintf(outf, "\tasl a\n");
+            int cnt = (int)c->bits.i;
+            if (cnt >= 16) {
+                /* Shift ≥ 16: result is always 0 */
+                fprintf(outf, "\tlda.w #0\n");
+            } else if (cnt >= 8) {
+                /* XBA optimization: swap bytes + mask + remaining shifts */
+                fprintf(outf, "\txba\n");
+                fprintf(outf, "\tand.w #$FF00\n");
+                for (int j = 0; j < cnt - 8; j++)
+                    fprintf(outf, "\tasl a\n");
+            } else {
+                for (int j = 0; j < cnt; j++)
+                    fprintf(outf, "\tasl a\n");
+            }
         } else {
             /* Variable-count shift: save A, load count into X, loop */
             fprintf(outf, "\tpha\n");
@@ -1144,15 +1210,36 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Osar:
-        /* Arithmetic shift right: cmp #$8000 sets carry to sign bit,
-         * then ror shifts carry (sign) into bit 15. This preserves
-         * the sign for negative values (sign extension). */
+        /* Arithmetic shift right: preserves sign for negative values. */
         emitload(r0, fn);
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
-            for (int j = 0; j < c->bits.i && j < 16; j++) {
+            int cnt = (int)c->bits.i;
+            if (cnt >= 16) {
+                /* Shift ≥ 16: result is 0 (positive) or -1 (negative) */
                 fprintf(outf, "\tcmp.w #$8000\n");
-                fprintf(outf, "\tror a\n");
+                fprintf(outf, "\tlda.w #0\n");
+                fprintf(outf, "\tbcc +\n");
+                fprintf(outf, "\tdec a\n");  /* A = $FFFF = -1 */
+                fprintf(outf, "+\n");
+            } else if (cnt >= 8) {
+                /* XBA + mask + sign extend byte + remaining sar shifts */
+                fprintf(outf, "\txba\n");
+                fprintf(outf, "\tand.w #$00FF\n");
+                /* Sign extend: if byte bit 7 set, fill high byte */
+                fprintf(outf, "\tcmp.w #$0080\n");
+                fprintf(outf, "\tbcc +\n");
+                fprintf(outf, "\tora.w #$FF00\n");
+                fprintf(outf, "+\n");
+                for (int j = 0; j < cnt - 8; j++) {
+                    fprintf(outf, "\tcmp.w #$8000\n");
+                    fprintf(outf, "\tror a\n");
+                }
+            } else {
+                for (int j = 0; j < cnt; j++) {
+                    fprintf(outf, "\tcmp.w #$8000\n");
+                    fprintf(outf, "\tror a\n");
+                }
             }
         } else {
             fprintf(outf, "\tpha\n");
@@ -1174,8 +1261,20 @@ emitins(Ins *i, Fn *fn)
         emitload(r0, fn);
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
-            for (int j = 0; j < c->bits.i && j < 16; j++)
-                fprintf(outf, "\tlsr a\n");
+            int cnt = (int)c->bits.i;
+            if (cnt >= 16) {
+                /* Shift ≥ 16: result is always 0 */
+                fprintf(outf, "\tlda.w #0\n");
+            } else if (cnt >= 8) {
+                /* XBA + mask + remaining shifts */
+                fprintf(outf, "\txba\n");
+                fprintf(outf, "\tand.w #$00FF\n");
+                for (int j = 0; j < cnt - 8; j++)
+                    fprintf(outf, "\tlsr a\n");
+            } else {
+                for (int j = 0; j < cnt; j++)
+                    fprintf(outf, "\tlsr a\n");
+            }
         } else {
             fprintf(outf, "\tpha\n");
             emitload(r1, fn);
@@ -1741,24 +1840,29 @@ emitins(Ins *i, Fn *fn)
         }
         {
             int cleanup = argbytes;
+            int has_retval = !req(i->to, R);
             argbytes = 0;
-            /* Return value is in A - save it before stack cleanup */
-            if (!req(i->to, R) && cleanup > 0) {
-                /* Save return value to X temporarily */
-                fprintf(outf, "\ttax\n");
-            }
-            /* Clean up pushed arguments */
             if (cleanup > 0) {
-                fprintf(outf, "\ttsa\n");
-                fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.w #%d\n", cleanup);
-                fprintf(outf, "\ttas\n");
-            }
-            /* Restore return value from X and store it */
-            if (!req(i->to, R)) {
-                if (cleanup > 0) {
-                    fprintf(outf, "\ttxa\n");
+                int nplx = cleanup / 2;
+                /* PLX threshold: 5 cycles/plx vs arithmetic (13 w/retval, 9 void).
+                 * PLX for ≤ 4 bytes (non-void) or ≤ 2 bytes (void). */
+                int plx_limit = has_retval ? 2 : 1;
+                if (nplx <= plx_limit) {
+                    /* PLX cleanup: doesn't clobber A, preserves return value */
+                    emit_plx_cleanup(cleanup);
+                } else {
+                    /* Arithmetic cleanup: clobbers A, needs tax/txa for retval */
+                    if (has_retval)
+                        fprintf(outf, "\ttax\n");
+                    fprintf(outf, "\ttsa\n");
+                    fprintf(outf, "\tclc\n");
+                    fprintf(outf, "\tadc.w #%d\n", cleanup);
+                    fprintf(outf, "\ttas\n");
+                    if (has_retval)
+                        fprintf(outf, "\ttxa\n");
                 }
+            }
+            if (has_retval) {
                 emitstore(i->to, fn);
             } else {
                 acache_invalidate();
@@ -2097,14 +2201,23 @@ w65816_emitfn(Fn *fn, FILE *f)
             emit_rep20();
             emitjmp(b, fn);
             if (framesize > 2) {
-                if (b->jmp.type != Jret0)
-                    fprintf(outf, "\ttax\n");   /* save return value (non-void only) */
-                fprintf(outf, "\ttsa\n");
-                fprintf(outf, "\tclc\n");
-                fprintf(outf, "\tadc.w #%d\n", framesize);
-                fprintf(outf, "\ttas\n");
-                if (b->jmp.type != Jret0)
-                    fprintf(outf, "\ttxa\n");   /* restore return value (non-void only) */
+                int nplx = framesize / 2;
+                int has_retval = (b->jmp.type != Jret0);
+                /* PLX threshold: 5 cycles/plx vs arithmetic (13 w/retval, 9 void) */
+                int plx_limit = has_retval ? 2 : 1;
+                if (nplx <= plx_limit) {
+                    /* PLX epilogue: doesn't clobber A, preserves return value */
+                    emit_plx_cleanup(framesize);
+                } else {
+                    if (has_retval)
+                        fprintf(outf, "\ttax\n");
+                    fprintf(outf, "\ttsa\n");
+                    fprintf(outf, "\tclc\n");
+                    fprintf(outf, "\tadc.w #%d\n", framesize);
+                    fprintf(outf, "\ttas\n");
+                    if (has_retval)
+                        fprintf(outf, "\ttxa\n");
+                }
             }
             fprintf(outf, "\trtl\n");
         } else {
