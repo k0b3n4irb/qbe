@@ -451,9 +451,17 @@ mark_dead_stores(Fn *fn)
             /* Exclude phi args (need slot for inter-block moves) */
             if (is_phi_arg[idx])
                 continue;
-            /* Exclude jnz args (loaded by emitjmp, A-cache may be stale) */
-            if (is_jnz_arg[idx])
-                continue;
+            /* Exclude jnz args — UNLESS the temp is a fusable comparison.
+             * When comparison+branch fusion fires (is_cmp_op, last in block,
+             * use_count==0), emitjmp re-emits the comparison from operands
+             * and never reads the result from its stack slot → dead store. */
+            if (is_jnz_arg[idx]) {
+                int fusable = (is_cmp_op(i->op)
+                    && temp_use_count[idx] == 0
+                    && i == &b->ins[b->nins] - 1);
+                if (!fusable)
+                    continue;
+            }
 
             /* Case 1: never used as operand (jnz/ret not counted here) */
             if (temp_use_count[idx] == 0 && !temp_is_retval[idx]) {
