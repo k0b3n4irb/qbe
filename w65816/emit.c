@@ -180,6 +180,7 @@ static Ins *tail_call_first_arg;  /* Pointer to first Oarg of the tail call */
 static int tail_call_nargs;       /* Number of args for the tail call */
 static int tail_call_arg_idx;     /* Current arg index during emission */
 static int caller_param_bytes;    /* Our function's total parameter bytes */
+static int tail_call_all_args_same_pos;  /* 1 if all args are already at correct positions */
 
 /* Pre-pass: count how many times each temp is used as an operand */
 static void
@@ -632,6 +633,7 @@ detect_block_tail_call(Blk *b, Fn *fn)
     tail_call_first_arg = NULL;
     tail_call_nargs = 0;
     tail_call_arg_idx = 0;
+    tail_call_all_args_same_pos = 0;
 
     /* Must be a return block */
     if (!isret(b->jmp.type))
@@ -707,6 +709,24 @@ detect_block_tail_call(Blk *b, Fn *fn)
                     return;  /* arg not at same position → overlap risk */
             }
             k++;
+        }
+    }
+
+    /* Determine if all args are at correct positions (for lazy rep #$20).
+     * nargs >= 2: already verified above (would have returned otherwise).
+     * nargs == 0: trivially true. nargs == 1: check the single arg. */
+    tail_call_all_args_same_pos = 1;
+    if (nargs == 1) {
+        i = tail_call_first_arg;
+        Ref arg_ref = i->arg[0];
+        tail_call_all_args_same_pos = 0;
+        if (rtype(arg_ref) == RTmp && arg_ref.val >= Tmp0) {
+            int idx = arg_ref.val - Tmp0;
+            if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
+                int param_offset = PARAM_OFFSET + (-temp_alias[idx]);
+                if (param_offset == 4)  /* target offset for nargs=1: 4+(1-1-0)*2 = 4 */
+                    tail_call_all_args_same_pos = 1;
+            }
         }
     }
 
@@ -2418,11 +2438,40 @@ w65816_emitfn(Fn *fn, FILE *f)
     fprintf(outf, ".SECTION \".text.%s\" SUPERFREE\n", fn->name);
     fprintf(outf, "%s:\n", fn->name);
 
+    /* Pre-scan: detect pure tail call for lazy rep #$20 optimization.
+     * A "pure tail call" is a frameless function where ALL return blocks are
+     * tail calls with all args at correct positions. The only emitted code
+     * is jml, which doesn't depend on the M flag. The callee's own rep #$20
+     * prologue will set 16-bit mode. Saves 3 cycles per pure tail call. */
+    int skip_prologue_rep = 0;
+    if (framesize == 0) {
+        int found_pure_tco = 0;
+        int found_non_tco_ret = 0;
+        for (b = fn->start; b; b = b->link) {
+            if (isret(b->jmp.type)) {
+                detect_block_tail_call(b, fn);
+                if (tail_call_ins && tail_call_all_args_same_pos)
+                    found_pure_tco = 1;
+                else
+                    found_non_tco_ret = 1;
+            }
+        }
+        if (found_pure_tco && !found_non_tco_ret)
+            skip_prologue_rep = 1;
+        /* Reset — will be re-detected per-block in the loop */
+        tail_call_ins = NULL;
+        tail_call_first_arg = NULL;
+        tail_call_nargs = 0;
+        tail_call_arg_idx = 0;
+        tail_call_all_args_same_pos = 0;
+    }
+
     /* Prologue — no php/plp (PARAM_OFFSET=2 assumes no P byte on stack).
      * rep #$20 ensures 16-bit A: assembly callers (NMI handler, mode7)
      * may call C functions after sep #$20 (8-bit A mode).
      * Phase 2 (emit_rep20) ensures 16-bit before every return. */
-    fprintf(outf, "\trep #$20\n");
+    if (!skip_prologue_rep)
+        fprintf(outf, "\trep #$20\n");
     if (framesize > 2) {
         fprintf(outf, "\ttsa\n");
         fprintf(outf, "\tsec\n");
