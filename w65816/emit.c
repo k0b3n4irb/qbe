@@ -1450,7 +1450,7 @@ emitins(Ins *i, Fn *fn)
         } else {
             /* Variable-count shift: save A, load count into X, loop */
             fprintf(outf, "\tpha\n");
-            emitload(r1, fn);
+            emitload_adj(r1, fn, 2);
             fprintf(outf, "\ttax\n");
             fprintf(outf, "\tpla\n");
             fprintf(outf, "\tcpx #0\n");
@@ -1497,7 +1497,7 @@ emitins(Ins *i, Fn *fn)
             }
         } else {
             fprintf(outf, "\tpha\n");
-            emitload(r1, fn);
+            emitload_adj(r1, fn, 2);
             fprintf(outf, "\ttax\n");
             fprintf(outf, "\tpla\n");
             fprintf(outf, "\tcpx #0\n");
@@ -1531,7 +1531,7 @@ emitins(Ins *i, Fn *fn)
             }
         } else {
             fprintf(outf, "\tpha\n");
-            emitload(r1, fn);
+            emitload_adj(r1, fn, 2);
             fprintf(outf, "\ttax\n");
             fprintf(outf, "\tpla\n");
             fprintf(outf, "\tcpx #0\n");
