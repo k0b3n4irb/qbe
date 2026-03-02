@@ -1179,10 +1179,20 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "\tasl a\n");
             } else if (val == 32) {
                 emitload(r0, fn);
-                fprintf(outf, "\txba\n");  /* swap bytes = *256 */
-                fprintf(outf, "\tlsr a\n");
-                fprintf(outf, "\tlsr a\n");
-                fprintf(outf, "\tlsr a\n");  /* /8 = *32 */
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\tasl a\n");
+            } else if (val == 64 || val == 128 || val == 256 ||
+                       val == 512 || val == 1024 || val == 2048 ||
+                       val == 4096 || val == 8192 || val == 16384) {
+                /* Generic power-of-2 multiply: emit N × asl a */
+                emitload(r0, fn);
+                int v = val, shifts = 0;
+                while (v > 1) { v >>= 1; shifts++; }
+                for (int s = 0; s < shifts; s++)
+                    fprintf(outf, "\tasl a\n");
             } else if (val == 3) {
                 /* x*3 = x*2 + x */
                 emitload(r0, fn);
@@ -1337,6 +1347,13 @@ emitins(Ins *i, Fn *fn)
                 emitload(r0, fn);
                 fprintf(outf, "\txba\n");  /* swap bytes = /256 */
                 fprintf(outf, "\tand.w #$00FF\n");
+            } else if (val > 0 && (val & (val - 1)) == 0) {
+                /* Generic power-of-2 divide: emit N × lsr a */
+                emitload(r0, fn);
+                int v = val, shifts = 0;
+                while (v > 1) { v >>= 1; shifts++; }
+                for (int s = 0; s < shifts; s++)
+                    fprintf(outf, "\tlsr a\n");
             } else {
                 /* General case: call __div16 (returns quotient in A) */
                 emitload(r0, fn);
@@ -1377,6 +1394,10 @@ emitins(Ins *i, Fn *fn)
             } else if (val == 256) {
                 emitload(r0, fn);
                 fprintf(outf, "\tand.w #255\n");
+            } else if (val > 0 && (val & (val - 1)) == 0) {
+                /* Generic power-of-2 modulo: and.w #(val-1) */
+                emitload(r0, fn);
+                fprintf(outf, "\tand.w #%d\n", val - 1);
             } else {
                 /* General case: call __mod16 (returns remainder in A) */
                 emitload(r0, fn);
