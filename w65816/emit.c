@@ -2603,6 +2603,11 @@ w65816_emitfn(Fn *fn, FILE *f)
         fprintf(outf, "; temp %d: slot=%d, alloc=%d\n", t, fn->tmp[t].slot, aslot);
     }
     fprintf(outf, ".SECTION \".text.%s\" SUPERFREE\n", fn->name);
+    /* Tell WLA-DX that registers are 16-bit (65816 native mode ABI).
+     * Without these, WLA-DX defaults to 8-bit and misassembles
+     * index-register immediates like cpx #0 (2 bytes vs 3 bytes). */
+    fprintf(outf, ".ACCU 16\n");
+    fprintf(outf, ".INDEX 16\n");
     fprintf(outf, "%s:\n", fn->name);
 
     /* Pre-scan: detect pure tail call for lazy rep #$20 optimization.
