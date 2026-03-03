@@ -375,11 +375,30 @@ is_nop_instruction(Ins *i)
     return 0;
 }
 
+/* Check if a constant multiply value will be inlined (emitload(r0) first).
+ * Returns 1 for values handled by shift-add patterns and composite decomposition.
+ * Returns 0 for values that fall through to __mul16 (loads r1 first). */
+static int
+is_inline_mul_const(int val)
+{
+    int k, base;
+    if (val >= 1 && val <= 15) return 1;
+    /* Powers of 2 up to 16384 */
+    if (val > 0 && (val & (val - 1)) == 0 && val <= 16384) return 1;
+    /* Composite: base * 2^k where base in [3..15] */
+    for (k = 1; (1 << k) <= val; k++)
+        if (val % (1 << k) == 0) {
+            base = val / (1 << k);
+            if (base >= 3 && base <= 15) return 1;
+        }
+    return 0;
+}
+
 /* Check if instruction consumes arg[0] via emitload (A-cache hit possible).
  * Instructions that load r1 first (swapped cmp) or use emitload_adj with
  * sp_adjust > 0 (Oarg) cannot benefit from A-cache for r0. */
 static int
-consumes_r0_via_emitload(Ins *i)
+consumes_r0_via_emitload(Ins *i, Fn *fn)
 {
     switch (i->op) {
     /* Swapped comparisons: r0 goes through emitop2 (slot read, not A-cache) */
@@ -396,8 +415,13 @@ consumes_r0_via_emitload(Ins *i)
     /* Alloc: doesn't load arg[0] value */
     case Oalloc4: case Oalloc8: case Oalloc16:
         return 0;
-    /* Mul: variable*variable loads r1 first; conservative exclude */
+    /* Mul: inline constant multiplies load r0 first (A-cache hit);
+     * variable*variable and __mul16 fallback load r1 first (no A-cache for r0) */
     case Omul:
+        if (rtype(i->arg[1]) == RCon) {
+            Con *c = &fn->con[i->arg[1].val];
+            return is_inline_mul_const(c->bits.i);
+        }
         return 0;
     default:
         return 1;
@@ -487,7 +511,7 @@ mark_dead_stores(Fn *fn)
                     && rtype(next->arg[0]) == RTmp
                     && next->arg[0].val >= Tmp0
                     && (next->arg[0].val - Tmp0) == idx
-                    && consumes_r0_via_emitload(next)) {
+                    && consumes_r0_via_emitload(next, fn)) {
                     temp_is_dead_store[idx] = 1;
                 }
             }
@@ -1064,6 +1088,109 @@ emitop2(char *op, Ref r, Fn *fn)
 }
 
 /*
+ * Emit shift+add/sub body for inline multiply by base (2..15).
+ * Assumes A is loaded with the value and tcc__r9 holds a copy.
+ * Result left in A.
+ */
+static void
+emit_mul_body(FILE *outf, int base)
+{
+    switch (base) {
+    case 2:
+        fprintf(outf, "\tasl a\n");
+        break;
+    case 3: /* x*3 = x*2 + x */
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tclc\n");
+        fprintf(outf, "\tadc.b tcc__r9\n");
+        break;
+    case 4:
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        break;
+    case 5: /* x*5 = x*4 + x */
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tclc\n");
+        fprintf(outf, "\tadc.b tcc__r9\n");
+        break;
+    case 6: /* x*6 = x*3 * 2 */
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tclc\n");
+        fprintf(outf, "\tadc.b tcc__r9\n");
+        fprintf(outf, "\tasl a\n");
+        break;
+    case 7: /* x*7 = x*8 - x */
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tsec\n");
+        fprintf(outf, "\tsbc.b tcc__r9\n");
+        break;
+    case 8:
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        break;
+    case 9: /* x*9 = x*8 + x */
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tclc\n");
+        fprintf(outf, "\tadc.b tcc__r9\n");
+        break;
+    case 10: /* x*10 = x*5 * 2 */
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tclc\n");
+        fprintf(outf, "\tadc.b tcc__r9\n");
+        fprintf(outf, "\tasl a\n");
+        break;
+    case 11: /* x*11 = x*3*4 - x */
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tclc\n");
+        fprintf(outf, "\tadc.b tcc__r9\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tsec\n");
+        fprintf(outf, "\tsbc.b tcc__r9\n");
+        break;
+    case 12: /* x*12 = x*3 * 4 */
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tclc\n");
+        fprintf(outf, "\tadc.b tcc__r9\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        break;
+    case 13: /* x*13 = x*3*4 + x */
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tclc\n");
+        fprintf(outf, "\tadc.b tcc__r9\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tclc\n");
+        fprintf(outf, "\tadc.b tcc__r9\n");
+        break;
+    case 14: /* x*14 = (x*8 - x) * 2 */
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tsec\n");
+        fprintf(outf, "\tsbc.b tcc__r9\n");
+        fprintf(outf, "\tasl a\n");
+        break;
+    case 15: /* x*15 = x*16 - x */
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tasl a\n");
+        fprintf(outf, "\tsec\n");
+        fprintf(outf, "\tsbc.b tcc__r9\n");
+        break;
+    }
+}
+
+/*
  * Emit instruction
  */
 static void
@@ -1295,14 +1422,33 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "\tsec\n");
                 fprintf(outf, "\tsbc.b tcc__r9\n");
             } else {
-                /* General case: use stack for multiplier, call __mul */
-                emitload(r1, fn);
-                fprintf(outf, "\tpha\n");
-                emitload_adj(r0, fn, 2);  /* Adjust for pushed value */
-                fprintf(outf, "\tpha\n");
-                fprintf(outf, "\tjsl __mul16\n");
-                /* PLX cleanup: 4 bytes (2 args), doesn't clobber A */
-                emit_plx_cleanup(4);
+                /* Try composite: val = base * 2^k, base in [3..15] */
+                int best_base = 0, best_k = 0;
+                for (int k = 13; k >= 1; k--) {
+                    if (val % (1 << k) == 0) {
+                        int base = val / (1 << k);
+                        if (base >= 3 && base <= 15) {
+                            best_base = base;
+                            best_k = k;
+                            break;
+                        }
+                    }
+                }
+                if (best_base) {
+                    emitload(r0, fn);
+                    fprintf(outf, "\tsta.b tcc__r9\n");
+                    emit_mul_body(outf, best_base);
+                    for (int j = 0; j < best_k; j++)
+                        fprintf(outf, "\tasl a\n");
+                } else {
+                    /* General case: call __mul16 */
+                    emitload(r1, fn);
+                    fprintf(outf, "\tpha\n");
+                    emitload_adj(r0, fn, 2);
+                    fprintf(outf, "\tpha\n");
+                    fprintf(outf, "\tjsl __mul16\n");
+                    emit_plx_cleanup(4);
+                }
             }
         } else {
             /* Variable * variable - call __mul16 */
