@@ -2403,15 +2403,21 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
                     int idx = p->arg[n].val - Tmp0;
                     if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
                         /* Aliased to param slot — load from caller frame */
-                        int neg_slot = temp_alias[idx];
-                        fprintf(outf, "\tlda %d,s\n", framesize + PARAM_OFFSET + (-neg_slot));
+                        if (!acache_has(p->arg[n])) {
+                            int neg_slot = temp_alias[idx];
+                            fprintf(outf, "\tlda %d,s\n", framesize + PARAM_OFFSET + (-neg_slot));
+                            acache_set(p->arg[n]);
+                        }
                         fprintf(outf, "\tsta %d,s\n", (dstslot + 1) * 2);
                     } else {
                         /* Temp: check if we need to copy */
                         int srcslot = fn->tmp[p->arg[n].val].slot;
                         if (srcslot >= 0 && srcslot != dstslot) {
                             /* Different slots - need to copy */
-                            fprintf(outf, "\tlda %d,s\n", (srcslot + 1) * 2);
+                            if (!acache_has(p->arg[n])) {
+                                fprintf(outf, "\tlda %d,s\n", (srcslot + 1) * 2);
+                                acache_set(p->arg[n]);
+                            }
                             fprintf(outf, "\tsta %d,s\n", (dstslot + 1) * 2);
                         }
                         /* If same slot, no copy needed (coalesced) */
