@@ -1463,9 +1463,8 @@ emitins(Ins *i, Fn *fn)
         emitstore(i->to, fn);
         break;
 
-    case Odiv:
     case Oudiv:
-        /* Division - use shifts for powers of 2, library call otherwise */
+        /* Unsigned division - use shifts for powers of 2, __div16 otherwise */
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
             int val = c->bits.i;
@@ -1519,9 +1518,32 @@ emitins(Ins *i, Fn *fn)
         emitstore(i->to, fn);
         break;
 
-    case Orem:
+    case Odiv:
+        /* Signed division - call __sdiv16 */
+        if (rtype(r1) == RCon) {
+            c = &fn->con[r1.val];
+            int val = c->bits.i;
+            if (val == 1) {
+                emitload(r0, fn);
+            } else {
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.b tcc__r0\n");
+                emitload(r1, fn);
+                fprintf(outf, "\tsta.b tcc__r1\n");
+                fprintf(outf, "\tjsl __sdiv16\n");
+            }
+        } else {
+            emitload(r0, fn);
+            fprintf(outf, "\tsta.b tcc__r0\n");
+            emitload(r1, fn);
+            fprintf(outf, "\tsta.b tcc__r1\n");
+            fprintf(outf, "\tjsl __sdiv16\n");
+        }
+        emitstore(i->to, fn);
+        break;
+
     case Ourem:
-        /* Modulo - use AND for powers of 2, library call otherwise */
+        /* Unsigned modulo - use AND for powers of 2, __mod16 otherwise */
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
             int val = c->bits.i;
@@ -1559,6 +1581,31 @@ emitins(Ins *i, Fn *fn)
             emitload(r1, fn);
             fprintf(outf, "\tsta.b tcc__r1\n");
             fprintf(outf, "\tjsl __mod16\n");
+        }
+        emitstore(i->to, fn);
+        break;
+
+    case Orem:
+        /* Signed modulo - call __smod16 */
+        if (rtype(r1) == RCon) {
+            c = &fn->con[r1.val];
+            int val = c->bits.i;
+            if (val == 1) {
+                /* x % 1 = 0 */
+                fprintf(outf, "\tlda.w #0\n");
+            } else {
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.b tcc__r0\n");
+                emitload(r1, fn);
+                fprintf(outf, "\tsta.b tcc__r1\n");
+                fprintf(outf, "\tjsl __smod16\n");
+            }
+        } else {
+            emitload(r0, fn);
+            fprintf(outf, "\tsta.b tcc__r0\n");
+            emitload(r1, fn);
+            fprintf(outf, "\tsta.b tcc__r1\n");
+            fprintf(outf, "\tjsl __smod16\n");
         }
         emitstore(i->to, fn);
         break;
