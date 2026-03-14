@@ -2388,15 +2388,17 @@ emitins(Ins *i, Fn *fn)
         if (framesize == 0)
             break;  /* frameless — allocs are dead, skip */
         /* alloc returns a pointer to stack space.
-         * The slot was already assigned in the pre-pass.
-         * We just emit a no-op here since loads/stores through
-         * this temp use direct stack-relative addressing.
+         * Compute absolute stack address: SP + offset.
+         * The old code stored just the offset (2, 4, 6...),
+         * which aliases tcc registers ($0000-$001F) when used
+         * as a pointer via sta.l $0000,x.
          */
         {
             int aslot = getallocslot(i->to, fn);
             if (aslot >= 0) {
-                /* Store slot offset to temp (for debugging/consistency) */
-                fprintf(outf, "\tlda.w #%d\n", (aslot + 1) * 2);
+                fprintf(outf, "\ttsa\n");
+                fprintf(outf, "\tclc\n");
+                fprintf(outf, "\tadc.w #%d\n", (aslot + 1) * 2);
                 emitstore(i->to, fn);
             }
         }
