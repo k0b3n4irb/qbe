@@ -211,7 +211,7 @@ count_temp_uses(Fn *fn)
             }
         }
         for (p = b->phi; p; p = p->link)
-            for (n = 0; n < p->narg; n++)
+            for (n = 0; n < (int)p->narg; n++)
                 if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
                     idx = p->arg[n].val - Tmp0;
                     if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
@@ -452,7 +452,7 @@ mark_dead_stores(Fn *fn)
     /* Identify phi args and jnz args (both need their slots) */
     for (b = fn->start; b; b = b->link) {
         for (p = b->phi; p; p = p->link)
-            for (n = 0; n < p->narg; n++)
+            for (n = 0; n < (int)p->narg; n++)
                 if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
                     idx = p->arg[n].val - Tmp0;
                     if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
@@ -866,7 +866,7 @@ assignslots(Fn *fn)
         /* Process phi nodes - result already handled, check args */
         for (p = b->phi; p; p = p->link) {
             maxslot = maybeassign(p->to, fn, maxslot);
-            for (n = 0; n < p->narg; n++)
+            for (n = 0; n < (int)p->narg; n++)
                 maxslot = maybeassign(p->arg[n], fn, maxslot);
         }
         /* Process instructions */
@@ -2434,7 +2434,7 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
 
     for (p = to->phi; p; p = p->link) {
         /* Find the argument corresponding to 'from' */
-        for (n = 0; n < p->narg; n++) {
+        for (n = 0; n < (int)p->narg; n++) {
             if (p->blk[n] == from) {
                 /* Get destination slot (phi result) */
                 if (rtype(p->to) != RTmp || p->to.val < Tmp0)

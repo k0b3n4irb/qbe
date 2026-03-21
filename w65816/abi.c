@@ -167,6 +167,7 @@ w65816_abi(Fn *fn)
     for (b = fn->start; b; b = b->link) {
         curi = &insb[NIns];
         npars = countpars(b);
+        (void)npars;
         parn = 0;
 
         for (i = &b->ins[b->nins]; i > b->ins;) {

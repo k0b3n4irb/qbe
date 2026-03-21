@@ -90,7 +90,7 @@ alloc(size_t n)
 }
 
 void
-freeall()
+freeall(void)
 {
 	void **pp;
 
