@@ -2631,8 +2631,10 @@ w65816_emitfn(Fn *fn, FILE *f)
     framesize = (fn->slot + 1) * 2;
     argbytes = 0;  /* Reset argument tracking for this function */
 
-    /* Leaf function optimization pre-passes */
-    leaf_opt = !fn->dynalloc;
+    /* Leaf function optimization: only for true leaf functions (no calls).
+     * Non-leaf functions MUST have a frame — without one, SSA temporaries
+     * for ternary expressions overlap the JSL return address on the stack. */
+    leaf_opt = fn->leaf && !fn->dynalloc;
     skip_dead_retstore_temp = -1;
     count_temp_uses(fn);
     build_alias_table(fn);
