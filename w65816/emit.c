@@ -622,12 +622,58 @@ can_be_frameless(Fn *fn)
 
 /*
  * Count the function's incoming parameter bytes.
- * Scans alloc_param[] and temp_alias[] for the most negative param slot.
- * Slots: -2 = first param, -4 = second, etc. (each 2 bytes on stack).
- * Returns total param bytes: e.g., 2 params → 4 bytes.
+ *
+ * In leaf_opt mode, alloc_param[]/temp_alias[] hold the per-param negative
+ * slot offsets; the "most negative slot" gives us the deepest param and so
+ * the total. That path is the original behaviour and still works for
+ * frameless wrappers.
+ *
+ * In non-leaf mode (where leaf_opt is off and the alias tables are empty),
+ * fall back to walking Opar* instructions in the start block — those are
+ * QBE's canonical representation of incoming parameters and their count is
+ * authoritative regardless of whether aliasing got computed. Each param
+ * occupies 2 bytes on this target's 16-bit stack.
+ *
+ * Slots: -2 = first param, -4 = second, etc.
+ * Returns total param bytes: e.g. 2 params → 4 bytes.
  */
+/* w65816_abi() rewrites every Opar* into an `Oloadsw SLOT(-paroff)`
+ * (paroff = 2, 4, 6, ...) at line ~188 of abi.c. By the time emit runs
+ * there is no Opar left, so we recover the param count from the most
+ * negative slot referenced anywhere in the function. The deepest param
+ * dominates the count whether the value was actually used or not — the
+ * abi pass emits the load unconditionally and the slot survives DCE
+ * because of the implicit ABI contract. */
 static int
-count_fn_param_bytes(void)
+count_fn_param_bytes_via_slots(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    int min_slot = 0;
+    int a;
+
+    for (b = fn->start; b; b = b->link) {
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            for (a = 0; a < 2; a++) {
+                Ref r = i->arg[a];
+                if (rtype(r) == RSlot) {
+                    int s = rsval(r);
+                    if (s < min_slot)
+                        min_slot = s;
+                }
+            }
+            if (rtype(i->to) == RSlot) {
+                int s = rsval(i->to);
+                if (s < min_slot)
+                    min_slot = s;
+            }
+        }
+    }
+    return min_slot < 0 ? -min_slot : 0;
+}
+
+static int
+count_fn_param_bytes(Fn *fn)
 {
     int min_slot = 0;
     for (int i = 0; i < MAX_ALIAS_TEMPS; i++) {
@@ -638,7 +684,12 @@ count_fn_param_bytes(void)
         if (temp_alias[i] < min_slot)
             min_slot = temp_alias[i];
     }
-    return min_slot < 0 ? -min_slot : 0;
+    if (min_slot < 0)
+        return -min_slot;
+    /* Aliases gave us nothing — this is the non-leaf path where Opar
+     * has already been lowered to slot loads. Recover from the
+     * negative-slot references the abi pass emits. */
+    return count_fn_param_bytes_via_slots(fn);
 }
 
 /*
@@ -839,27 +890,52 @@ detect_block_tail_call(Blk *b, Fn *fn)
         }
     }
 
-    /* All structural checks pass. Final gate: handle the framesize.
+    /* All structural checks pass. The framesize/nargs combinations:
      *
      *   framesize == 0           → original C.1 path (frameless TCO).
-     *   framesize > 0, nargs==0  → C.2.1: emit frame teardown before jml.
-     *   framesize > 0, nargs>=1  → C.2.2 territory: args sit on top of the
-     *                              frame and must move to caller's slots
-     *                              before teardown. Not yet implemented;
-     *                              log as candidate, leave unoptimised.
+     *   framesize > 0, nargs==0  → C.2.1: frame teardown before jml.
+     *   framesize > 0, nargs>=1  → C.2.2: args stored to caller-slot at
+     *                              `4 + framesize + ...` (still under the
+     *                              frame), then teardown lifts SP so the
+     *                              callee sees them at the canonical
+     *                              `4`, `6`, ... offsets. The Oarg handler
+     *                              picks up the framesize-aware target.
      *
-     * Either accept-with-teardown is a real TCO (jml + skipped epilogue);
-     * the only difference from the frameless case is the four-instruction
-     * teardown emitted right before the jml in the Ocall handler. */
+     * C.2.2 alloc safety check: if the function contains an Oalloc* the
+     * frame holds a local array (or other addressable storage). Any
+     * pointer-to-local that the function passes as an outgoing arg
+     * becomes a dangling pointer the moment we tear the frame down —
+     * the callee may dereference it BEFORE its own pushes overwrite the
+     * old frame area, but as soon as the callee or any sub-call pushes
+     * deep enough the bytes get clobbered. Concrete victim caught while
+     * implementing this: textPrintU16's `char buf[6]; ... textPrint(p)`
+     * tail call lost characters mid-string because textPutChar's
+     * push/jsl pair overwrote the buffer between successive iterations
+     * inside textPrint. Until we add precise alloc-escape tracking
+     * (chantier C.2.3 territory) the safe rule is: no C.2.2 if the
+     * function has any local alloc. The leaf-level frameless C.1 path
+     * is unaffected — it only fires when can_be_frameless() has already
+     * vetted the alloc usage. */
     if (framesize > 0 && nargs > 0) {
-        if (getenv("CC_TRACE_TCO"))
-            fprintf(stderr, "[tco] %s/%s: c2-candidate "
-                    "(framesize=%d, nargs=%d) — needs C.2.2 (arg motion)\n",
-                    fn->name, b->name, framesize, nargs);
-        return;
+        Blk *bb;
+        Ins *ii;
+        for (bb = fn->start; bb; bb = bb->link) {
+            for (ii = bb->ins; ii < &bb->ins[bb->nins]; ii++) {
+                if (ii->op == Oalloc4 || ii->op == Oalloc8
+                    || ii->op == Oalloc16) {
+                    if (getenv("CC_TRACE_TCO"))
+                        fprintf(stderr, "[tco] %s/%s: c2-candidate "
+                                "(framesize=%d, nargs=%d) — function has "
+                                "local alloc, declined to avoid escaping "
+                                "stack pointer\n",
+                                fn->name, b->name, framesize, nargs);
+                    return;
+                }
+            }
+        }
     }
 
-    /* Eligible: frameless OR (framed && nargs=0). Enable tail call. */
+    /* Eligible: enable tail call. */
     tail_call_ins = &b->ins[b->nins - 1];
     tail_call_nargs = nargs;
     if (getenv("CC_TRACE_TCO"))
@@ -2380,10 +2456,19 @@ emitins(Ins *i, Fn *fn)
     case Oarguh:
         /* Tail call: store arg to param slot instead of pushing */
         if (tail_call_ins && i >= tail_call_first_arg && i < tail_call_ins) {
-            int tgt_off = 4 + (tail_call_nargs - 1 - tail_call_arg_idx) * 2;
-            /* Check if arg is already at the correct position */
+            /* Target slot for this argument. With a frame in flight, the
+             * caller-slot lives at `4 + framesize + idx*2` from current SP;
+             * the Ocall handler's teardown will then add framesize back to
+             * SP so the callee sees the arg at the canonical `4 + idx*2`.
+             * For the C.1 frameless case framesize=0 so this collapses to
+             * the original expression. */
+            int tgt_off = 4 + framesize + (tail_call_nargs - 1 - tail_call_arg_idx) * 2;
+            /* Check if the arg is already at the correct position. The
+             * alias check only applies in the frameless (leaf_opt) path —
+             * with a frame leaf_opt is off, temp_alias is empty, and we
+             * fall through to the load+store path. */
             int same_pos = 0;
-            if (rtype(r0) == RTmp && r0.val >= Tmp0) {
+            if (framesize == 0 && rtype(r0) == RTmp && r0.val >= Tmp0) {
                 int aidx = r0.val - Tmp0;
                 if (aidx >= 0 && aidx < MAX_ALIAS_TEMPS && temp_alias[aidx] != 0) {
                     int poff = PARAM_OFFSET + (-temp_alias[aidx]);
@@ -2392,7 +2477,10 @@ emitins(Ins *i, Fn *fn)
                 }
             }
             if (!same_pos) {
-                /* Load value and store to target param slot */
+                /* Load value and store to target param slot. emitload uses
+                 * argbytes-adjusted offsets when reading from caller's
+                 * params; argbytes is 0 in the tail-call branch (we don't
+                 * push) so the read is correct under either framesize. */
                 emitload(r0, fn);
                 fprintf(outf, "\tsta %d,s\n", tgt_off);
                 acache_invalidate();
@@ -2796,7 +2884,7 @@ w65816_emitfn(Fn *fn, FILE *f)
     count_temp_uses(fn);
     build_alias_table(fn);
     mark_dead_stores(fn);
-    caller_param_bytes = count_fn_param_bytes();
+    caller_param_bytes = count_fn_param_bytes(fn);
 
     /* Frame elimination: if all temps are aliased or dead-retval, go frameless */
     if (leaf_opt && can_be_frameless(fn))
