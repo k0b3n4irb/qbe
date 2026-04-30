@@ -642,6 +642,56 @@ count_fn_param_bytes(void)
 }
 
 /*
+ * Conservative whole-function check: every Ocall in this function lives
+ * at the end of a return block, with the call's result being the returned
+ * value (or the function returns void).
+ *
+ * Used as the relaxed leaf_opt gate (see assignment site for the safety
+ * argument). We do NOT call detect_block_tail_call here because that
+ * function consults framesize and other per-block state which is set
+ * later in the pipeline; this is a structural check only.
+ *
+ * Returns 0 as soon as a non-tail Ocall is found.
+ */
+static int
+all_calls_are_tail(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    Ins *last;
+    int saw_call = 0;
+
+    for (b = fn->start; b; b = b->link) {
+        if (b->nins == 0)
+            continue;
+        last = &b->ins[b->nins - 1];
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (i->op != Ocall)
+                continue;
+            saw_call = 1;
+            /* Must be the very last instruction in its block — anything
+             * after it would mean code runs past the call's return. */
+            if (i != last)
+                return 0;
+            /* The block must terminate with a return jump. */
+            if (!isret(b->jmp.type))
+                return 0;
+            /* For non-void returns, the call's result must be the
+             * value the block returns. If the function discards the
+             * call's result and returns something else, the call's
+             * temp is live across "exit" — not actually a tail call. */
+            if (b->jmp.type != Jret0 && !req(i->to, b->jmp.arg))
+                return 0;
+        }
+    }
+    /* A function with zero Ocalls is a leaf — fn->leaf already covers it,
+     * but returning 1 here is harmless (the caller still ANDs with the
+     * leaf check). Treat zero-call as a degenerate "all tail" too. */
+    (void)saw_call;
+    return 1;
+}
+
+/*
  * Detect if a block ends with a tail call pattern.
  * Requirements: last instruction is Ocall, block returns the call result
  * (or void), function is frameless, direct call, same arg byte count.
@@ -652,6 +702,15 @@ detect_block_tail_call(Blk *b, Fn *fn)
 {
     Ins *i;
     int nargs, k, callee_bytes, is_same;
+    /* C.0 diagnostic: when CC_TRACE_TCO=1, log the gate that rejected
+     * each block so we can see exactly why TCO didn't fire. fn->name and
+     * b->name uniquely identify the location. No runtime impact when the
+     * env var is unset. */
+#define TCO_REJECT(reason) do { \
+        if (getenv("CC_TRACE_TCO")) \
+            fprintf(stderr, "[tco] %s/%s: reject (" reason ")\n", \
+                    fn->name, b->name); \
+    } while (0)
 
     tail_call_ins = NULL;
     tail_call_first_arg = NULL;
@@ -660,33 +719,49 @@ detect_block_tail_call(Blk *b, Fn *fn)
     tail_call_all_args_same_pos = 0;
 
     /* Must be a return block */
-    if (!isret(b->jmp.type))
+    if (!isret(b->jmp.type)) {
+        TCO_REJECT("not a return block");
         return;
+    }
 
     /* Must be frameless */
-    if (framesize > 0)
+    if (framesize > 0) {
+        if (getenv("CC_TRACE_TCO"))
+            fprintf(stderr, "[tco] %s/%s: reject (framesize=%d > 0)\n",
+                    fn->name, b->name, framesize);
         return;
+    }
 
     /* Find the last instruction — must be Ocall */
-    if (b->nins == 0)
+    if (b->nins == 0) {
+        TCO_REJECT("empty block");
         return;
+    }
     i = &b->ins[b->nins - 1];
-    if (i->op != Ocall)
+    if (i->op != Ocall) {
+        TCO_REJECT("last insn is not Ocall");
         return;
+    }
 
     /* For non-void returns: call result must be the return value */
     if (b->jmp.type != Jret0) {
-        if (!req(i->to, b->jmp.arg))
+        if (!req(i->to, b->jmp.arg)) {
+            TCO_REJECT("call result is not the return value");
             return;
+        }
     }
 
     /* Direct call only (not indirect — jml [addr] not safe for TCO) */
-    if (rtype(i->arg[0]) != RCon)
+    if (rtype(i->arg[0]) != RCon) {
+        TCO_REJECT("indirect call (target is not RCon)");
         return;
+    }
     {
         Con *c = &fn->con[i->arg[0].val];
-        if (c->type != CAddr)
+        if (c->type != CAddr) {
+            TCO_REJECT("call target is not address-typed");
             return;
+        }
     }
 
     /* Count Oarg instructions immediately before the Ocall */
@@ -706,8 +781,13 @@ detect_block_tail_call(Blk *b, Fn *fn)
 
     /* Check: callee arg bytes == our param bytes */
     callee_bytes = nargs * 2;
-    if (callee_bytes != caller_param_bytes)
+    if (callee_bytes != caller_param_bytes) {
+        if (getenv("CC_TRACE_TCO"))
+            fprintf(stderr, "[tco] %s/%s: reject "
+                    "(callee_bytes=%d != caller_param_bytes=%d)\n",
+                    fn->name, b->name, callee_bytes, caller_param_bytes);
         return;
+    }
 
     /* For nargs >= 2: verify all args are already at correct stack positions
      * (no stores needed → no overlap risk). For nargs 0-1: always safe. */
@@ -729,8 +809,13 @@ detect_block_tail_call(Blk *b, Fn *fn)
                             is_same = 1;
                     }
                 }
-                if (!is_same)
+                if (!is_same) {
+                    if (getenv("CC_TRACE_TCO"))
+                        fprintf(stderr, "[tco] %s/%s: reject "
+                                "(arg %d not at expected slot, target=%d)\n",
+                                fn->name, b->name, k, target_offset);
                     return;  /* arg not at same position → overlap risk */
+                }
             }
             k++;
         }
@@ -757,6 +842,11 @@ detect_block_tail_call(Blk *b, Fn *fn)
     /* All checks pass — enable tail call for this block */
     tail_call_ins = &b->ins[b->nins - 1];
     tail_call_nargs = nargs;
+    if (getenv("CC_TRACE_TCO"))
+        fprintf(stderr, "[tco] %s/%s: ACCEPT "
+                "(nargs=%d, all_same_pos=%d)\n",
+                fn->name, b->name, nargs, tail_call_all_args_same_pos);
+#undef TCO_REJECT
 }
 
 /* Alloc slot offset tracking - computed from w65816_alloc_size */
@@ -2631,10 +2721,27 @@ w65816_emitfn(Fn *fn, FILE *f)
     framesize = (fn->slot + 1) * 2;
     argbytes = 0;  /* Reset argument tracking for this function */
 
-    /* Leaf function optimization: only for true leaf functions (no calls).
-     * Non-leaf functions MUST have a frame — without one, SSA temporaries
-     * for ternary expressions overlap the JSL return address on the stack. */
-    leaf_opt = fn->leaf && !fn->dynalloc;
+    /* Leaf function optimization: enabled for true leaf functions (no calls)
+     * AND for "tail-only" non-leaf functions where every Ocall is in tail
+     * position (last insn of a return block, returning the call's result).
+     *
+     * Why this is safe for tail-only non-leaf:
+     *   - Before reaching any Ocall in this function, no JSL has fired
+     *     yet, so caller's parameter area is still intact and any temp
+     *     aliased to a negative caller slot reads valid data.
+     *   - Each Ocall in tail position will be emitted as `jml` (no return
+     *     PC pushed, no own frame teardown needed) per the existing TCO
+     *     path in detect_block_tail_call + the Ocall handler. Because
+     *     no return ever lands here, post-call temp state is irrelevant.
+     *
+     * Why it would NOT be safe for a non-tail call: a JSL pushes a 3-byte
+     * return address onto the stack mid-function, and any SSA temp that
+     * needs to live across that point would be clobbered if it had no
+     * frame slot. The original "Non-leaf functions MUST have a frame"
+     * comment is correct for that case — we're only relaxing it for the
+     * sub-case where there IS no across-call live range because the
+     * function never executes past the call. */
+    leaf_opt = (fn->leaf || all_calls_are_tail(fn)) && !fn->dynalloc;
     skip_dead_retstore_temp = -1;
     count_temp_uses(fn);
     build_alias_table(fn);
