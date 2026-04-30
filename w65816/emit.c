@@ -724,13 +724,13 @@ detect_block_tail_call(Blk *b, Fn *fn)
         return;
     }
 
-    /* Must be frameless */
-    if (framesize > 0) {
-        if (getenv("CC_TRACE_TCO"))
-            fprintf(stderr, "[tco] %s/%s: reject (framesize=%d > 0)\n",
-                    fn->name, b->name, framesize);
-        return;
-    }
+    /* The framesize check that gates emission lives at the very bottom
+     * (just before we set tail_call_ins). Running it last lets the
+     * earlier rejection messages — "indirect call", "arg not at slot",
+     * "callee_bytes mismatch" — fire even on functions that have a
+     * frame, which is exactly the population chantier C.2 needs to
+     * catalogue. The actual TCO emission still requires framesize=0
+     * until C.2.1 lands. */
 
     /* Find the last instruction — must be Ocall */
     if (b->nins == 0) {
@@ -839,13 +839,34 @@ detect_block_tail_call(Blk *b, Fn *fn)
         }
     }
 
-    /* All checks pass — enable tail call for this block */
+    /* All structural checks pass. Final gate: handle the framesize.
+     *
+     *   framesize == 0           → original C.1 path (frameless TCO).
+     *   framesize > 0, nargs==0  → C.2.1: emit frame teardown before jml.
+     *   framesize > 0, nargs>=1  → C.2.2 territory: args sit on top of the
+     *                              frame and must move to caller's slots
+     *                              before teardown. Not yet implemented;
+     *                              log as candidate, leave unoptimised.
+     *
+     * Either accept-with-teardown is a real TCO (jml + skipped epilogue);
+     * the only difference from the frameless case is the four-instruction
+     * teardown emitted right before the jml in the Ocall handler. */
+    if (framesize > 0 && nargs > 0) {
+        if (getenv("CC_TRACE_TCO"))
+            fprintf(stderr, "[tco] %s/%s: c2-candidate "
+                    "(framesize=%d, nargs=%d) — needs C.2.2 (arg motion)\n",
+                    fn->name, b->name, framesize, nargs);
+        return;
+    }
+
+    /* Eligible: frameless OR (framed && nargs=0). Enable tail call. */
     tail_call_ins = &b->ins[b->nins - 1];
     tail_call_nargs = nargs;
     if (getenv("CC_TRACE_TCO"))
         fprintf(stderr, "[tco] %s/%s: ACCEPT "
-                "(nargs=%d, all_same_pos=%d)\n",
-                fn->name, b->name, nargs, tail_call_all_args_same_pos);
+                "(framesize=%d, nargs=%d, all_same_pos=%d)\n",
+                fn->name, b->name, framesize, nargs,
+                tail_call_all_args_same_pos);
 #undef TCO_REJECT
 }
 
@@ -2407,8 +2428,37 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Ocall:
-        /* Tail call: jml instead of jsl, skip cleanup and rtl */
+        /* Tail call: jml instead of jsl, skip cleanup and rtl.
+         *
+         * For framed functions (chantier C.2.1) we emit the frame
+         * teardown right before the jml: the four-instruction sequence
+         * `tsa; clc; adc.w #framesize; tas` restores the caller's SP so
+         * that when `jml callee` lands, the stack looks like a normal
+         * direct call from the original caller — `0,s` is the caller's
+         * 24-bit return PC and the callee's `rtl` will skip our wrapper
+         * entirely. We don't need to preserve A across the teardown
+         * because the callee owns the return value (we're transferring
+         * control, not collecting a result). For nargs > 0 we'd also
+         * need to move the pushed args from "above the frame" to the
+         * caller's param slots; that's chantier C.2.2 and is gated out
+         * earlier in detect_block_tail_call so we never reach here for
+         * those cases.
+         *
+         * Threshold: framesize > 2. The prologue elides the four-byte
+         * allocation when framesize <= 2 (line ~2852: `if (framesize > 2)`)
+         * because fn->slot=0 still yields framesize=2 from the alignment
+         * `(slot+1)*2`, and a phantom 2-byte slot needs no real stack
+         * space — pea/pha for outgoing args carry the load. The normal
+         * epilogue mirrors this elision; the tail-call path must too,
+         * or `tsa/clc/adc #2/tas` walks SP past the caller's return PC
+         * and the callee's rtl pops garbage. */
         if (tail_call_ins && i == tail_call_ins) {
+            if (framesize > 2) {
+                fprintf(outf, "\ttsa\n");
+                fprintf(outf, "\tclc\n");
+                fprintf(outf, "\tadc.w #%d\n", framesize);
+                fprintf(outf, "\ttas\n");
+            }
             c = &fn->con[r0.val];
             fprintf(outf, "\tjml %s\n", stripsym(str(c->sym.id)));
             acache_invalidate();
