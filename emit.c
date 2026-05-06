@@ -170,7 +170,34 @@ emitfnlnk(char *n, Lnk *l, FILE *f)
 	emitlnk(n, l, SecText, f);
 }
 
-/* Emit buffered init data items to file */
+/* Emit buffered init data items to file
+ *
+ * WLA-DX directive byte counts diverge from QBE's `dtype_size` for two
+ * cases:
+ *   - `.dl <symbol>` writes a 24-bit long address (3 bytes), not 4.
+ *   - `.dl <number>` writes 4 bytes, but DL items are 8 bytes wide on
+ *     this target (cproc treats `unsigned long` and pointers as 8 bytes
+ *     to match the SSA register width).
+ * Without padding, `static const` aggregates with pointer fields end
+ * up shorter in ROM than the C struct layout cproc compiles against,
+ * and every field after the first pointer is read at the wrong offset.
+ * We close the gap by emitting `.dsb N, 0` after each WLA directive
+ * whose written size is smaller than the QBE `dtype_size`.
+ */
+static int reftype_emit_size[] = {
+	[DB] = 1,  /* .db <sym>  — 1 byte (unlikely path) */
+	[DH] = 2,  /* .dw <sym>  — 16-bit address */
+	[DW] = 3,  /* .dl <sym>  — 24-bit address */
+	[DL] = 3,  /* .dl <sym>  — 24-bit address */
+};
+
+static int numtype_emit_size[] = {
+	[DB] = 1,  /* .db <n>  */
+	[DH] = 2,  /* .dw <n>  */
+	[DW] = 4,  /* .dl <n>  */
+	[DL] = 4,  /* .dl <n>  — 32-bit literal, dtype_size says 8 → pad */
+};
+
 static void
 emit_init_data(FILE *f)
 {
@@ -181,7 +208,7 @@ emit_init_data(FILE *f)
 		[DL] = "\t.dl"
 	};
 	char *p;
-	int i;
+	int i, type, pad;
 
 	for (i = 0; i < init_count; i++) {
 		if (init_items[i].type == -1) {
@@ -193,16 +220,24 @@ emit_init_data(FILE *f)
 			if (refname[0] == '.' && refname[1] == 'L')
 				refname = refname + 2;
 			p = refname[0] == '"' ? "" : T.assym;
+			type = init_items[i].reftype;
 			fprintf(f, "%s %s%s%+"PRId64"\n",
-				dtoa[init_items[i].reftype], p, refname,
+				dtoa[type], p, refname,
 				init_items[i].ref.off);
+			pad = dtype_size[type] - reftype_emit_size[type];
+			if (pad > 0)
+				fprintf(f, "\t.dsb %d, 0\n", pad);
 		} else if (init_items[i].type == -3) {
 			/* Zero-fill */
 			fprintf(f, "\t.dsb %"PRId64", 0\n", init_items[i].num);
 		} else {
 			/* Numeric value */
+			type = init_items[i].type;
 			fprintf(f, "%s %"PRId64"\n",
-				dtoa[init_items[i].type], init_items[i].num);
+				dtoa[type], init_items[i].num);
+			pad = dtype_size[type] - numtype_emit_size[type];
+			if (pad > 0)
+				fprintf(f, "\t.dsb %d, 0\n", pad);
 		}
 	}
 }
