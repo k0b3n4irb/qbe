@@ -543,26 +543,28 @@ parserefl(int arg)
 			err("invalid argument");
 		if (!arg && rtype(r) != RTmp)
 			err("invalid function parameter");
+		/* Trailing 0 in each (Ins){...} below is the OpenSNES
+		 * `volat` field default — see all.h chantier A2 patch. */
 		if (env)
 			if (arg)
-				*curi = (Ins){Oarge, k, R, {r}};
+				*curi = (Ins){Oarge, k, R, {r}, 0};
 			else
-				*curi = (Ins){Opare, k, r, {R}};
+				*curi = (Ins){Opare, k, r, {R}, 0};
 		else if (k == Kc)
 			if (arg)
-				*curi = (Ins){Oargc, Kl, R, {TYPE(ty), r}};
+				*curi = (Ins){Oargc, Kl, R, {TYPE(ty), r}, 0};
 			else
-				*curi = (Ins){Oparc, Kl, r, {TYPE(ty)}};
+				*curi = (Ins){Oparc, Kl, r, {TYPE(ty)}, 0};
 		else if (k >= Ksb)
 			if (arg)
-				*curi = (Ins){Oargsb+(k-Ksb), Kw, R, {r}};
+				*curi = (Ins){Oargsb+(k-Ksb), Kw, R, {r}, 0};
 			else
-				*curi = (Ins){Oparsb+(k-Ksb), Kw, r, {R}};
+				*curi = (Ins){Oparsb+(k-Ksb), Kw, r, {R}, 0};
 		else
 			if (arg)
-				*curi = (Ins){Oarg, k, R, {r}};
+				*curi = (Ins){Oarg, k, R, {r}, 0};
 			else
-				*curi = (Ins){Opar, k, r, {R}};
+				*curi = (Ins){Opar, k, r, {R}, 0};
 		curi++;
 	Next:
 		if (peek() == Trparen)

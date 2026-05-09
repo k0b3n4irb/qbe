@@ -77,7 +77,8 @@ iins(int cls, int op, Ref a0, Ref a1, Loc *l)
 	ist->num = inum++;
 	ist->bid = l->blk->id;
 	ist->off = l->off;
-	ist->new.ins = (Ins){op, cls, R, {a0, a1}};
+	/* Trailing 0 is the OpenSNES `volat` field default — chantier A2. */
+	ist->new.ins = (Ins){op, cls, R, {a0, a1}, 0};
 	return ist->new.ins.to = newtmp("ld", cls, curf);
 }
 

@@ -15,7 +15,13 @@ OBJ      = $(COMMOBJ) $(AMD64OBJ) $(ARM64OBJ) $(RV64OBJ) $(W65816OBJ)
 SRCALL   = $(OBJ:.o=.c)
 
 CC       = cc
-CFLAGS   = -std=c99 -g -Wall -Wextra -Wpedantic
+CFLAGS   = -std=c99 -g -Wall -Wextra -Wpedantic -Wno-missing-field-initializers
+# -Wno-missing-field-initializers: the OpenSNES `volat` field (chantier
+# A2) is appended to struct Ins after arg[2] specifically so the
+# existing positional initialisers `(Ins){Op, Cls, To, {Args}}`
+# scattered across every backend continue to compile and default it
+# to 0. The flag silences clang's noise about those default-inits.
+# Designated initialisers `{.op = ..., ...}` already work without it.
 
 qbe: $(OBJ)
 	$(CC) $(LDFLAGS) $(OBJ) -o $@

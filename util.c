@@ -313,6 +313,12 @@ void
 emiti(Ins i)
 {
 	emit(i.op, i.cls, i.to, i.arg[0], i.arg[1]);
+	/* Preserve the OpenSNES `volat` flag through emiti() so a pass
+	 * that copies an existing Ins (e.g. simpl.c:105 or rega.c:368)
+	 * doesn't silently lose volatility on its way out. The Ins
+	 * just emitted is at curi; flag it post-emit since `emit()`
+	 * itself uses designated initialisers and doesn't take volat. */
+	curi->volat = i.volat;
 }
 
 void
