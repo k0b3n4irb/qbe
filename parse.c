@@ -51,6 +51,7 @@ enum Token {
 	Tcall,
 	Tenv,
 	Tphi,
+	Tvolat,
 	Tjmp,
 	Tjnz,
 	Tret,
@@ -110,6 +111,11 @@ static char *kwmap[Ntok] = {
 	[Tcall] = "call",
 	[Tenv] = "env",
 	[Tphi] = "phi",
+	/* OpenSNES patch (chantier A2): `volat` keyword on a load or
+	 * store line marks the access as volatile (no value-numbering,
+	 * no load forwarding, no dead-store elimination). Set by cproc
+	 * when the C type carries QUALVOLATILE. */
+	[Tvolat] = "volat",
 	[Tjmp] = "jmp",
 	[Tjnz] = "jnz",
 	[Tret] = "ret",
@@ -603,8 +609,18 @@ parseline(PState ps)
 	Blk *b;
 	Con *c;
 	int t, op, i, k, ty;
+	int is_volat;     /* OpenSNES patch (chantier A2) */
 
+	is_volat = 0;
 	t = nextnl();
+	/* OpenSNES patch (chantier A2): `volat` keyword at line start
+	 * marks the next instruction as volatile (used by cproc for
+	 * stores, which have no result token). Consume the keyword and
+	 * fall through to parse the actual op. */
+	if (t == Tvolat) {
+		is_volat = 1;
+		t = nextnl();
+	}
 	if (ps == PLbl && t != Tlbl && t != Trbrace)
 		err("label or } expected");
 	switch (t) {
@@ -613,6 +629,12 @@ parseline(PState ps)
 		expect(Teq);
 		k = parsecls(&ty);
 		op = next();
+		/* OpenSNES patch (chantier A2): `volat` keyword between
+		 * the result class and the op marks a volatile load. */
+		if (op == Tvolat) {
+			is_volat = 1;
+			op = next();
+		}
 		break;
 	default:
 		if (isstore(t)) {
@@ -786,6 +808,13 @@ parseline(PState ps)
 			err("too many instructions");
 		curi->op = op;
 		curi->cls = k;
+		/* OpenSNES patch (chantier A2): propagate the `volat` flag
+		 * captured above onto the freshly-built Ins. The flag must
+		 * survive through every subsequent QBE pass; passes that
+		 * could alter the semantic shape of a volatile access
+		 * (loadopt, gcm) gate themselves on `i->volat` to skip the
+		 * affected instructions. */
+		curi->volat = is_volat ? 1 : 0;
 		curi->to = r;
 		curi->arg[0] = arg[0];
 		curi->arg[1] = arg[1];
@@ -1364,9 +1393,19 @@ printfn(Fn *fn, FILE *f)
 		}
 		for (i=b->ins; i<&b->ins[b->nins]; i++) {
 			fprintf(f, "\t");
+			/* OpenSNES patch (chantier A2): if this instruction
+			 * is volatile and has no result token, the `volat`
+			 * keyword goes at the line start. */
+			if (i->volat && req(i->to, R))
+				fprintf(f, "volat ");
 			if (!req(i->to, R)) {
 				printref(i->to, fn, f);
 				fprintf(f, " =%c ", ktoc[i->cls]);
+				/* For instructions with a result token, the
+				 * `volat` keyword goes between the class and
+				 * the op (matches the parser input shape). */
+				if (i->volat)
+					fprintf(f, "volat ");
 			}
 			assert(optab[i->op].name);
 			fprintf(f, "%s", optab[i->op].name);

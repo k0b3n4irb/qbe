@@ -232,6 +232,19 @@ struct Ins {
 	uint cls:2;
 	Ref to;
 	Ref arg[2];
+	/* OpenSNES patch (chantier A2): volatile load/store marker. Set
+	 * by cproc when the C type carries QUALVOLATILE. Honoured by
+	 * loadopt (no forwarding) and gcm/promote (no elimination /
+	 * promotion) so the C standard's "each access is a side effect"
+	 * volatile semantics are preserved.
+	 *
+	 * Placed after arg[2] (not packed into the op:30 field) so the
+	 * existing positional initializers `(Ins){Op, Cls, To, {Args}}`
+	 * scattered through parse.c / load.c keep compiling — they
+	 * leave the new field default-initialised to 0 (the non-volatile
+	 * default), so only the explicit volatile-emission path in
+	 * cproc / parse.c needs to be patched. */
+	uchar volat;
 };
 
 struct Phi {

@@ -428,6 +428,16 @@ loadopt(Fn *fn)
 		for (i=b->ins; i<&b->ins[b->nins]; ++i) {
 			if (!isload(i->op))
 				continue;
+			/* OpenSNES patch (chantier A2, 2026-05-09): a volatile
+			 * load must NOT be forwarded — the C standard requires
+			 * each access to a `volatile` object to be its own side
+			 * effect (read/write). Skipping the def() call here
+			 * leaves arg[1] = R, so the rewrite loop below treats
+			 * the load as a "fresh" load with no candidate def to
+			 * substitute, preserving the original load instruction
+			 * intact in the emit pass. */
+			if (i->volat)
+				continue;
 			sz = loadsz(i);
 			sl = (Slice){i->arg[0], 0, sz, i->cls};
 			l = (Loc){LRoot, i-b->ins, b};

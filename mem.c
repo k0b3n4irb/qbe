@@ -30,6 +30,14 @@ promote(Fn *fn)
 			if (u->type != UIns)
 				goto Skip;
 			l = u->u.ins;
+			/* OpenSNES patch (chantier A2): a volatile load or
+			 * store of this alloca's slot must NOT be promoted
+			 * out to an SSA temp — that would convert the
+			 * memory access into a register copy and lose the
+			 * volatile semantics. Bail out of the promotion
+			 * attempt so the alloca stays put. */
+			if (l->volat)
+				goto Skip;
 			if (isload(l->op))
 			if (s == -1 || s == loadsz(l)) {
 				s = loadsz(l);

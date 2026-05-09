@@ -26,6 +26,12 @@ pinned(Ins *i)
 static int
 canelim(Ins *i)
 {
+	/* OpenSNES patch (chantier A2, 2026-05-09): a volatile load is
+	 * a SIDE EFFECT (the C standard says each access reads memory
+	 * even if the result is unused) and cannot be elided here even
+	 * when its result temp has no users. Stay pinned-in-place. */
+	if (i->volat)
+		return 0;
 	return isload(i->op) || isalloc(i->op) || isdivwl(i);
 }
 
