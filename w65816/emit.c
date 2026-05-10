@@ -30,6 +30,81 @@ static FILE *outf;
 static int framesize;  /* Current function's frame size */
 static int argbytes;   /* Bytes of arguments pushed for current call */
 
+/* Large-frame addressing mode (chantier A6.8).
+ *
+ * The 65816's `lda <off>,s` addressing has an 8-bit offset (0-255).
+ * For functions whose frame + param-access offsets exceed 255, the
+ * assembler rejects the emission. Solution: copy SP into a DP slot
+ * (tcc__fp) at prologue time, then access stack via
+ * `ldy.w #N; lda [tcc__fp],y` — 24-bit indirect indexed, ignoring DBR.
+ *
+ * Set per function in emit_fn_header() based on max possible offset:
+ * `framesize + PARAM_OFFSET + max_param_bytes + max_argbytes`. The
+ * threshold leaves headroom because `argbytes` can grow during call
+ * arg pushing — we conservatively switch to indirect mode if the
+ * frame alone is already past LARGE_FRAME_THRESHOLD.
+ *
+ * Cost: ~5 cyc per stack access in indirect mode (4 for ldy + 7 for
+ * lda [DP],y vs 5 for lda <N>,s). Only large-frame functions pay it.
+ *
+ * The bank byte at tcc__fp+2 is naturally zero from the WRAM zero-init
+ * at boot (templates/crt0.asm:510-524). The stack lives in bank $00,
+ * so the [tcc__fp],y access lands in the right bank regardless of DBR. */
+#define LARGE_FRAME_THRESHOLD 200  /* switch to indirect when frame >= this */
+static int large_frame_mode;       /* 1 = use indirect via tcc__fp */
+
+/* Emit a load from the stack frame. Picks direct `lda <N>,s` or
+ * indirect `ldy.w #frame_off; lda [tcc__fp],y` based on the access
+ * offset and the function's large_frame_mode.
+ *
+ * frame_off:  byte offset within the function's frame as set by
+ *             prologue (positive for local slots, includes
+ *             framesize+PARAM_OFFSET for params).
+ * sp_adjust:  bytes pushed since prologue (argbytes during call setup).
+ *
+ * In direct mode, the assembler's `<N>,s` addressing implicitly
+ * tracks SP, so the emitted offset is frame_off + sp_adjust.
+ *
+ * In indirect mode, tcc__fp = SP-after-prologue (set ONCE), so the
+ * Y-index is just frame_off. The pushed args are at SP positions
+ * BELOW tcc__fp's reference and never need indirect access (they're
+ * touched via PHA from accumulator only). */
+static void
+emit_stack_load(int frame_off, int sp_adjust)
+{
+    int direct_off = frame_off + sp_adjust;
+    if (!large_frame_mode || direct_off <= 255) {
+        fprintf(outf, "\tlda %d,s\n", direct_off);
+    } else {
+        fprintf(outf, "\tldy.w #%d\n", frame_off);
+        fprintf(outf, "\tlda [tcc__fp],y\n");
+    }
+}
+
+static void
+emit_stack_store(int frame_off, int sp_adjust)
+{
+    int direct_off = frame_off + sp_adjust;
+    if (!large_frame_mode || direct_off <= 255) {
+        fprintf(outf, "\tsta %d,s\n", direct_off);
+    } else {
+        fprintf(outf, "\tldy.w #%d\n", frame_off);
+        fprintf(outf, "\tsta [tcc__fp],y\n");
+    }
+}
+
+static void
+emit_stack_op(const char *op, int frame_off, int sp_adjust)
+{
+    int direct_off = frame_off + sp_adjust;
+    if (!large_frame_mode || direct_off <= 255) {
+        fprintf(outf, "\t%s %d,s\n", op, direct_off);
+    } else {
+        fprintf(outf, "\tldy.w #%d\n", frame_off);
+        fprintf(outf, "\t%s [tcc__fp],y\n", op);
+    }
+}
+
 /* Offset from SP to caller's parameter area, past local frame + JSL return address.
  * Stack layout after prologue (framesize F):
  *   S+1 to S+F:   local frame (F bytes)
@@ -982,7 +1057,10 @@ isvreg(Ref r)
 }
 
 /*
- * Assign a slot to a temp if not already assigned
+ * Assign a slot to a temp if not already assigned.
+ * Kl temps reserve 2 slots (4 bytes) — chantier A6.
+ * Functions with many Kl temps may push framesize > 255; large_frame_mode
+ * activates indirect addressing via tcc__fp (chantier A6.8).
  */
 static int
 maybeassign(Ref r, Fn *fn, int slot)
@@ -990,6 +1068,8 @@ maybeassign(Ref r, Fn *fn, int slot)
     if (rtype(r) == RTmp && r.val >= Tmp0) {
         if (fn->tmp[r.val].slot < 0) {
             fn->tmp[r.val].slot = slot++;
+            if (fn->tmp[r.val].cls == Kl)
+                slot++;
         }
     }
     return slot;
@@ -1015,6 +1095,8 @@ coalescephi(Phi *p, Fn *fn)
 
     if (fn->tmp[p->to.val].slot < 0) {
         fn->tmp[p->to.val].slot = fn->slot++;
+        if (p->cls == Kl)
+            fn->slot++;
     }
 
     /* Don't coalesce phi arguments - let emitphimoves handle copies */
@@ -1094,12 +1176,12 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
             int idx = r.val - Tmp0;
             if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
                 int neg_slot = temp_alias[idx];
-                fprintf(outf, "\tlda %d,s\n", framesize + PARAM_OFFSET + (-neg_slot) + sp_adjust);
+                emit_stack_load(framesize + PARAM_OFFSET + (-neg_slot), sp_adjust);
             } else {
                 /* Spilled temp */
                 slot = fn->tmp[r.val].slot;
                 if (slot >= 0)
-                    fprintf(outf, "\tlda %d,s\n", (slot + 1) * 2 + sp_adjust);
+                    emit_stack_load((slot + 1) * 2, sp_adjust);
                 else
                     fprintf(outf, "\t; unallocated temp %d\n", r.val);
             }
@@ -1132,10 +1214,10 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
              * slot=-2 means first param, slot=-4 means second, etc.
              * Offset = framesize + 4 + (-slot) - 2 = framesize + PARAM_OFFSET + (-slot)
              */
-            fprintf(outf, "\tlda %d,s\n", framesize + PARAM_OFFSET + (-slot) + sp_adjust);
+            emit_stack_load(framesize + PARAM_OFFSET + (-slot), sp_adjust);
         } else {
             /* Positive slot = local variable in our frame */
-            fprintf(outf, "\tlda %d,s\n", (slot + 1) * 2 + sp_adjust);
+            emit_stack_load((slot + 1) * 2, sp_adjust);
         }
         break;
     default:
@@ -1204,7 +1286,7 @@ emitstore(Ref r, Fn *fn)
         } else if (r.val >= Tmp0) {
             slot = fn->tmp[r.val].slot;
             if (slot >= 0) {
-                fprintf(outf, "\tsta %d,s\n", (slot + 1) * 2);
+                emit_stack_store((slot + 1) * 2, 0);
                 stored = 1;
             }
         }
@@ -1212,9 +1294,9 @@ emitstore(Ref r, Fn *fn)
     case RSlot:
         slot = rsval(r);
         if (slot < 0)
-            fprintf(outf, "\tsta %d,s\n", framesize + PARAM_OFFSET + (-slot));
+            emit_stack_store(framesize + PARAM_OFFSET + (-slot), 0);
         else
-            fprintf(outf, "\tsta %d,s\n", (slot + 1) * 2);
+            emit_stack_store((slot + 1) * 2, 0);
         stored = 1;
         break;
     default:
@@ -1243,11 +1325,11 @@ emitop2(char *op, Ref r, Fn *fn)
             int idx = r.val - Tmp0;
             if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
                 int neg_slot = temp_alias[idx];
-                fprintf(outf, "\t%s %d,s\n", op, framesize + PARAM_OFFSET + (-neg_slot));
+                emit_stack_op(op, framesize + PARAM_OFFSET + (-neg_slot), 0);
             } else {
                 slot = fn->tmp[r.val].slot;
                 if (slot >= 0)
-                    fprintf(outf, "\t%s %d,s\n", op, (slot + 1) * 2);
+                    emit_stack_op(op, (slot + 1) * 2, 0);
             }
         }
         break;
@@ -1265,9 +1347,9 @@ emitop2(char *op, Ref r, Fn *fn)
     case RSlot:
         slot = rsval(r);
         if (slot < 0)
-            fprintf(outf, "\t%s %d,s\n", op, framesize + PARAM_OFFSET + (-slot));
+            emit_stack_op(op, framesize + PARAM_OFFSET + (-slot), 0);
         else
-            fprintf(outf, "\t%s %d,s\n", op, (slot + 1) * 2);
+            emit_stack_op(op, (slot + 1) * 2, 0);
         break;
     default:
         break;
@@ -2100,10 +2182,10 @@ emitins(Ins *i, Fn *fn)
             int aslot = getallocslot(r1, fn);
             if (aslot >= 0) {
                 /* Store to stack-allocated local variable */
-                fprintf(outf, "\tsta %d,s\n", (aslot + 1) * 2);
+                emit_stack_store((aslot + 1) * 2, 0);
                 /* High word is typically 0 for near pointers */
                 fprintf(outf, "\tlda.w #0\n");
-                fprintf(outf, "\tsta %d,s\n", (aslot + 1) * 2 + 2);
+                emit_stack_store((aslot + 1) * 2 + 2, 0);
             } else if (isvreg(r1)) {
                 fprintf(outf, "\tsta ($%02X)\n", regaddr(r1.val));
                 fprintf(outf, "\tlda.w #0\n");
@@ -2179,7 +2261,7 @@ emitins(Ins *i, Fn *fn)
             int aslot = getallocslot(r1, fn);
             if (aslot >= 0) {
                 /* Store to stack-allocated local variable */
-                fprintf(outf, "\tsta %d,s\n", (aslot + 1) * 2);
+                emit_stack_store((aslot + 1) * 2, 0);
             } else if (isvreg(r1)) {
                 fprintf(outf, "\tsta ($%02X)\n", regaddr(r1.val));
             } else if (rtype(r1) == RCon) {
@@ -2241,7 +2323,7 @@ emitins(Ins *i, Fn *fn)
             int aslot = getallocslot(r1, fn);
             if (aslot >= 0) {
                 /* Store to stack-allocated local variable */
-                fprintf(outf, "\tsta %d,s\n", (aslot + 1) * 2);
+                emit_stack_store((aslot + 1) * 2, 0);
             } else if (isvreg(r1)) {
                 fprintf(outf, "\tsta ($%02X)\n", regaddr(r1.val));
             } else if (rtype(r1) == RCon) {
@@ -2303,7 +2385,7 @@ emitins(Ins *i, Fn *fn)
             int aslot = getallocslot(r0, fn);
             if (aslot >= 0) {
                 /* Load from stack-allocated local variable */
-                fprintf(outf, "\tlda %d,s\n", (aslot + 1) * 2);
+                emit_stack_load((aslot + 1) * 2, 0);
             } else if (rtype(r0) == RSlot) {
                 /* Direct stack access (e.g., loading parameter) */
                 emitload(r0, fn);
@@ -2482,7 +2564,7 @@ emitins(Ins *i, Fn *fn)
                  * params; argbytes is 0 in the tail-call branch (we don't
                  * push) so the read is correct under either framesize. */
                 emitload(r0, fn);
-                fprintf(outf, "\tsta %d,s\n", tgt_off);
+                emit_stack_store(tgt_off, 0);
                 acache_invalidate();
             }
             tail_call_arg_idx++;
@@ -2675,27 +2757,27 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
                 if (rtype(p->arg[n]) == RCon) {
                     /* Constant: load and store to phi slot */
                     emitload(p->arg[n], fn);
-                    fprintf(outf, "\tsta %d,s\n", (dstslot + 1) * 2);
+                    emit_stack_store((dstslot + 1) * 2, 0);
                 } else if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
                     int idx = p->arg[n].val - Tmp0;
                     if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
                         /* Aliased to param slot — load from caller frame */
                         if (!acache_has(p->arg[n])) {
                             int neg_slot = temp_alias[idx];
-                            fprintf(outf, "\tlda %d,s\n", framesize + PARAM_OFFSET + (-neg_slot));
+                            emit_stack_load(framesize + PARAM_OFFSET + (-neg_slot), 0);
                             acache_set(p->arg[n]);
                         }
-                        fprintf(outf, "\tsta %d,s\n", (dstslot + 1) * 2);
+                        emit_stack_store((dstslot + 1) * 2, 0);
                     } else {
                         /* Temp: check if we need to copy */
                         int srcslot = fn->tmp[p->arg[n].val].slot;
                         if (srcslot >= 0 && srcslot != dstslot) {
                             /* Different slots - need to copy */
                             if (!acache_has(p->arg[n])) {
-                                fprintf(outf, "\tlda %d,s\n", (srcslot + 1) * 2);
+                                emit_stack_load((srcslot + 1) * 2, 0);
                                 acache_set(p->arg[n]);
                             }
-                            fprintf(outf, "\tsta %d,s\n", (dstslot + 1) * 2);
+                            emit_stack_store((dstslot + 1) * 2, 0);
                         }
                         /* If same slot, no copy needed (coalesced) */
                     }
@@ -2890,6 +2972,15 @@ w65816_emitfn(Fn *fn, FILE *f)
     if (leaf_opt && can_be_frameless(fn))
         framesize = 0;
 
+    /* Large-frame mode (chantier A6.8): if the function's frame plus
+     * worst-case param-access offset can exceed 255 bytes, switch to
+     * indirect addressing via tcc__fp. Threshold leaves headroom for
+     * argbytes growth during call setup. The threshold sits below 256
+     * so even with a few PHA pushes during arg setup the direct mode
+     * stays valid, and we only flip to indirect for genuinely large
+     * frames where the assembler would otherwise reject the emission. */
+    large_frame_mode = (framesize >= LARGE_FRAME_THRESHOLD);
+
     /* NOTE: temp_alias is NOT reset here. build_alias_table() already computed
      * correct aliases. The emission pass uses these aliases via emitload_adj()
      * and emitstore() to redirect param accesses to the caller's frame.
@@ -2951,6 +3042,17 @@ w65816_emitfn(Fn *fn, FILE *f)
         fprintf(outf, "\tsec\n");
         fprintf(outf, "\tsbc.w #%d\n", framesize);
         fprintf(outf, "\ttas\n");
+    }
+
+    /* Chantier A6.8: large-frame functions store SP into tcc__fp so
+     * stack accesses past the 255-byte direct-mode limit work via
+     * `lda [tcc__fp],y`. tcc__fp's bank byte at +2 is naturally zero
+     * from the boot WRAM zero-init (templates/crt0.asm:510-524) — the
+     * stack lives in bank $00, so [tcc__fp],y addresses bank-0
+     * regardless of DBR. */
+    if (large_frame_mode) {
+        fprintf(outf, "\ttsa\n");
+        fprintf(outf, "\tsta.b tcc__fp\n");
     }
 
     acache_invalidate();
