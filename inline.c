@@ -34,6 +34,23 @@
 #define INLINE_MAX_INSTR 8
 
 typedef struct InlRec InlRec;
+typedef struct InlBody InlBody;
+
+/* Saved body of an inline-eligible function. PHeap-backed so it survives
+ * freeall() between functions. Cons are deep-copied; sym.id values are
+ * interned-string handles that stay valid across functions. */
+struct InlBody {
+    Ref *params;          /* param Refs (RTmp) in declaration order */
+    int  nparams;
+    Ins *ins;             /* flat array of non-Opar body instructions */
+    int  nins;
+    Con *con;             /* copy of callee's fn->con */
+    int  ncon;
+    Ref  retval;          /* value passed to terminal Jret* */
+    int  cls;             /* return class (Kw, Kl, etc.) */
+    int  max_tmp;         /* highest RTmp val in ins/retval/params */
+};
+
 struct InlRec {
     char name[NString];
     char hint;            /* function had `inline` keyword */
@@ -44,10 +61,15 @@ struct InlRec {
     char has_cond;        /* any conditional jump (non-linear flow) */
     int  ins_count;       /* total instructions across all blocks */
     int  blk_count;       /* number of basic blocks */
+    InlBody *body;        /* deep-clone of body, or NULL if not eligible */
     InlRec *next;
 };
 
 static InlRec *inl_head;
+
+/* Forward declarations. */
+static InlBody *save_body(Fn *fn, int cls);
+static int      splice_at(Fn *caller, Blk *blk, int call_idx, InlBody *body);
 
 static int
 inline_max_instr(void)
@@ -80,6 +102,7 @@ inline_record(Fn *fn)
     r->has_allocs = 0;
     r->has_phis = 0;
     r->has_cond = 0;
+    r->body = NULL;
 
     for (b = fn->start; b; b = b->link) {
         r->blk_count++;
@@ -106,13 +129,22 @@ inline_record(Fn *fn)
         && !r->has_allocs
         && r->ins_count <= max;
 
+    /* Save body for splice if eligible. */
+    if (r->eligible)
+        r->body = save_body(fn, fn->retty);
+
     if (getenv("CC_TRACE_INLINE")) {
+        char *trace = getenv("CC_TRACE_INLINE");
         fprintf(stderr,
             "[inline] record %s: hint=%d blk=%d ins=%d phis=%d cond=%d "
             "calls=%d allocs=%d (max=%d) -> %s\n",
             r->name, r->hint, r->blk_count, r->ins_count,
             r->has_phis, r->has_cond, r->has_calls, r->has_allocs, max,
             r->eligible ? "ELIGIBLE" : "rejected");
+        if (r->eligible && atoi(trace) >= 2) {
+            fprintf(stderr, "[inline] body of %s:\n", r->name);
+            printfn(fn, stderr);
+        }
     }
 
     r->next = inl_head;
@@ -128,6 +160,189 @@ inline_lookup(char *name)
     return NULL;
 }
 
+/* Walk a Ref and update max_tmp if it's an RTmp with a higher index. */
+static void
+track_ref(Ref r, int *max)
+{
+    if (rtype(r) == RTmp && (int)r.val > *max)
+        *max = r.val;
+}
+
+/* Deep-copy an eligible function's body into a PHeap-backed InlBody.
+ * The body excludes Opar* (parameters are tracked separately); the
+ * caller will splice them by mapping to its own Oarg* values. */
+static InlBody *
+save_body(Fn *fn, int cls)
+{
+    InlBody *b;
+    Blk *blk;
+    Ins *i;
+    int nparams, n, j, idx;
+
+    nparams = 0;
+    n = 0;
+    for (blk = fn->start; blk; blk = blk->link) {
+        for (i = blk->ins; i < &blk->ins[blk->nins]; i++) {
+            if (ispar(i->op)) nparams++;
+            else              n++;
+        }
+    }
+
+    b = emalloc(sizeof *b);
+    b->nparams = 0;
+    b->nins = 0;
+    b->max_tmp = 0;
+    b->cls = cls;
+    b->retval = R;
+    b->params = nparams ? emalloc(nparams * sizeof(Ref)) : NULL;
+    b->ins = n ? emalloc(n * sizeof(Ins)) : NULL;
+    b->ncon = fn->ncon;
+    b->con = emalloc(fn->ncon * sizeof(Con));
+    memcpy(b->con, fn->con, fn->ncon * sizeof(Con));
+
+    for (blk = fn->start; blk; blk = blk->link) {
+        for (i = blk->ins; i < &blk->ins[blk->nins]; i++) {
+            if (ispar(i->op)) {
+                idx = b->nparams++;
+                b->params[idx] = i->to;
+                track_ref(i->to, &b->max_tmp);
+            } else {
+                b->ins[b->nins] = *i;
+                track_ref(i->to, &b->max_tmp);
+                for (j = 0; j < 2; j++)
+                    track_ref(i->arg[j], &b->max_tmp);
+                b->nins++;
+            }
+        }
+        if (isret(blk->jmp.type) && blk->jmp.type != Jret0) {
+            b->retval = blk->jmp.arg;
+            track_ref(b->retval, &b->max_tmp);
+        }
+    }
+
+    return b;
+}
+
+/* Copy callee's con into caller's con array (using the canonical newcon
+ * path, which dedupes if equivalent entry already exists), return ref. */
+static Ref
+remap_con(Fn *caller, InlBody *body, int callee_con_val)
+{
+    if (callee_con_val < 0 || callee_con_val >= body->ncon)
+        return CON(callee_con_val);
+    return newcon(&body->con[callee_con_val], caller);
+}
+
+/* Remap a Ref from callee numbering to caller numbering.
+ * - RTmp matching a param: replaced by the corresponding caller arg value
+ * - RTmp non-param: offset by tmp_offset
+ * - RCon: copied into caller's con array
+ * - Other (RSlot etc.): passed through. */
+static Ref
+remap_ref(Ref r, Fn *caller, InlBody *body, Ref *args, int tmp_offset)
+{
+    int j;
+    if (req(r, R))
+        return R;
+    switch (rtype(r)) {
+    case RTmp:
+        for (j = 0; j < body->nparams; j++) {
+            if (req(r, body->params[j]))
+                return args[j];
+        }
+        return TMP(r.val + tmp_offset);
+    case RCon:
+        return remap_con(caller, body, r.val);
+    default:
+        return r;
+    }
+}
+
+/* Try to inline `body` at the Ocall instruction `call_ins` within `blk`.
+ * Returns 1 on success (caller IR was rewritten), 0 if inlining declined
+ * (e.g. arg count mismatch — fall back to jsl). */
+static int
+splice_at(Fn *caller, Blk *blk, int call_idx, InlBody *body)
+{
+    Ins *old_ins, *ni, *new_ins;
+    Ins call_ins, *iarg;
+    int i, j, k, new_nins, new_cap, arg_start, tmp_offset;
+    Ref args[16];  /* up to 16 params — well above realistic inline cases */
+    Ref retval_remapped;
+    Ins copy_ins;
+
+    if (body->nparams > 16)
+        return 0;
+
+    /* Locate the preceding Oarg* (in source order, immediately before
+     * the call). Iterate the nparams instructions before call_idx. */
+    arg_start = call_idx - body->nparams;
+    if (arg_start < 0)
+        return 0;
+    iarg = &blk->ins[arg_start];
+    for (i = 0; i < body->nparams; i++) {
+        if (!isarg(iarg[i].op))
+            return 0;
+        args[i] = iarg[i].arg[0];
+    }
+
+    call_ins = blk->ins[call_idx];
+    /* Offset applied to remap callee non-param tmps to fresh caller tmps:
+     *   callee TMP(T) (T >= Tmp0) -> caller TMP(T + tmp_offset)
+     * with tmp_offset chosen so the remapped tmps are fresh in the caller. */
+    tmp_offset = (int)caller->ntmp - Tmp0;
+
+    /* Allocate fresh caller tmps to cover every callee tmp val up to
+     * body->max_tmp. Some of those tmps correspond to params (mapped to
+     * args at remap time, never actually used) but it's harmless to
+     * allocate them — costs a few unused Tmp slots. */
+    while ((int)caller->ntmp <= body->max_tmp + tmp_offset)
+        newtmp("inl", body->cls, caller);
+
+    /* Build the rewritten ins[] for this block:
+     * - copy ins[0 .. arg_start-1] as-is
+     * - emit remapped body ins
+     * - emit Ocopy of retval into call_ins.to (if non-void)
+     * - copy ins[call_idx+1 ..] as-is
+     *
+     * Important: blk->ins must remain a vec (allocated via vnew) so
+     * downstream passes that call vgrow on it (simpl, mem, etc.)
+     * see the expected magic-word header. */
+    new_cap = blk->nins + body->nins + 1;
+    new_ins = vnew(new_cap, sizeof(Ins), PFn);
+    new_nins = 0;
+    old_ins = blk->ins;
+
+    for (i = 0; i < arg_start; i++)
+        new_ins[new_nins++] = old_ins[i];
+
+    for (j = 0; j < body->nins; j++) {
+        ni = &new_ins[new_nins++];
+        *ni = body->ins[j];
+        ni->to = remap_ref(ni->to, caller, body, args, tmp_offset);
+        ni->arg[0] = remap_ref(ni->arg[0], caller, body, args, tmp_offset);
+        ni->arg[1] = remap_ref(ni->arg[1], caller, body, args, tmp_offset);
+    }
+
+    /* Wire the return value into the caller's call destination */
+    if (!req(call_ins.to, R) && !req(body->retval, R)) {
+        retval_remapped = remap_ref(body->retval, caller, body, args, tmp_offset);
+        copy_ins = (Ins){.op = Ocopy, .cls = call_ins.cls,
+                         .to = call_ins.to,
+                         .arg = {retval_remapped, R},
+                         .volat = 0};
+        new_ins[new_nins++] = copy_ins;
+    }
+
+    for (k = call_idx + 1; k < (int)blk->nins; k++)
+        new_ins[new_nins++] = old_ins[k];
+
+    blk->ins = new_ins;
+    blk->nins = new_nins;
+
+    return 1;
+}
+
 void
 inline_check(Fn *fn)
 {
@@ -136,27 +351,49 @@ inline_check(Fn *fn)
     Con *c;
     InlRec *rec;
     char *target;
+    char *trace;
+    int idx, ok;
 
-    if (!getenv("CC_TRACE_INLINE"))
-        return;
+    trace = getenv("CC_TRACE_INLINE");
 
+    /* Walk blocks. We restart per-block after each splice because
+     * blk->ins is rewritten. */
     for (b = fn->start; b; b = b->link) {
-        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+restart:
+        for (idx = 0, i = b->ins; i < &b->ins[b->nins]; i++, idx++) {
             if (i->op != Ocall) continue;
             if (rtype(i->arg[0]) != RCon) continue;
             c = &fn->con[i->arg[0].val];
             if (c->type != CAddr) continue;
             target = str(c->sym.id);
             rec = inline_lookup(target);
-            if (!rec) {
-                fprintf(stderr,
-                    "[inline] check %s -> %s: not in table (forward ref?)\n",
-                    fn->name, target);
+            if (!rec || !rec->eligible || !rec->body) {
+                if (trace) {
+                    fprintf(stderr,
+                        "[inline] check %s -> %s: %s\n",
+                        fn->name, target,
+                        rec ? (rec->eligible ? "no body saved"
+                                             : "ineligible")
+                            : "not in table (forward ref?)");
+                }
                 continue;
             }
-            fprintf(stderr, "[inline] check %s -> %s: %s\n",
-                    fn->name, rec->name,
-                    rec->eligible ? "WOULD INLINE" : "ineligible");
+            ok = splice_at(fn, b, idx, rec->body);
+            if (trace) {
+                fprintf(stderr,
+                    "[inline] splice %s -> %s @ blk %s idx %d: %s\n",
+                    fn->name, rec->name, b->name, idx,
+                    ok ? "INLINED" : "declined");
+                if (ok && atoi(trace) >= 2) {
+                    fprintf(stderr, "[inline] caller after splice:\n");
+                    printfn(fn, stderr);
+                }
+            }
+            if (ok) {
+                /* IR rewrote: re-scan this block from start (the
+                 * Ocall is gone, but new ins may exist). */
+                goto restart;
+            }
         }
     }
 }
