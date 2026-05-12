@@ -400,6 +400,10 @@ struct Lnk {
 	char thread;
 	char common;
 	char align;
+	char inline_hint;  /* OpenSNES (function inlining chantier): function
+	                    * carries `inline` keyword; eligible for inlining
+	                    * if heuristic permits (single-block, ≤ N instr,
+	                    * no calls, no allocs). */
 	char *sec;
 	char *secf;
 };

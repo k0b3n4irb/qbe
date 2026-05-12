@@ -59,6 +59,7 @@ enum Token {
 	Texport,
 	Tthread,
 	Tcommon,
+	Tinline,
 	Tfunc,
 	Ttype,
 	Tdata,
@@ -123,6 +124,7 @@ static char *kwmap[Ntok] = {
 	[Texport] = "export",
 	[Tthread] = "thread",
 	[Tcommon] = "common",
+	[Tinline] = "inline",
 	[Tfunc] = "function",
 	[Ttype] = "type",
 	[Tdata] = "data",
@@ -1215,6 +1217,11 @@ parselnk(Lnk *lnk)
 			break;
 		case Tcommon:
 			lnk->common = 1;
+			break;
+		case Tinline:
+			/* OpenSNES function inlining chantier: hint only — actual
+			 * inlining gated by qbe/inline.c heuristic. */
+			lnk->inline_hint = 1;
 			break;
 		case Tsection:
 			if (lnk->sec)
