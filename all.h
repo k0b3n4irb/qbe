@@ -578,6 +578,10 @@ int reachesnotvia(Fn *, Blk *, Blk *, Blk *);
 void promote(Fn *);
 void coalesce(Fn *);
 
+/* inline.c (OpenSNES function inlining chantier) */
+void inline_record(Fn *);
+void inline_check(Fn *);
+
 /* alias.c */
 void fillalias(Fn *);
 void getalias(Alias *, Ref, Fn *);

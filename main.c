@@ -83,6 +83,12 @@ func(Fn *fn)
 	gcm(fn);
 	filluse(fn);
 	ssacheck(fn);
+	/* OpenSNES function inlining (step 2.a): record this function's
+	 * inline eligibility on the post-SSA / post-GCM canonical IR. Step
+	 * 2.b will splice eligible callees at this caller's call sites
+	 * before T.abi1/isel transform the IR for the target. */
+	inline_record(fn);
+	inline_check(fn);
 	T.abi1(fn);
 	simpl(fn);
 	fillcfg(fn);
