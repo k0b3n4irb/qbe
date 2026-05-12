@@ -61,6 +61,17 @@ struct InlRec {
     char has_cond;        /* any conditional jump (non-linear flow) */
     int  ins_count;       /* total instructions across all blocks */
     int  blk_count;       /* number of basic blocks */
+    /* Consumption tracking (chantier extension: cproc emit suppression).
+     * For an inline-hint function to be "fully consumed" in this TU and
+     * thus safe to skip at final emit:
+     *   - at least one direct caller existed in this TU (n_direct > 0)
+     *   - every direct call site was successfully inlined (n_declined == 0)
+     *   - no indirect (function-pointer) reference appeared (n_indirect == 0)
+     * Otherwise we emit the standalone body to satisfy linker. */
+    int  n_direct;        /* direct Ocall references to this fn seen */
+    int  n_inlined;       /* of which were successfully spliced */
+    int  n_declined;      /* of which were declined (couldn't inline) */
+    int  n_indirect;      /* indirect references (function-ptr use) */
     InlBody *body;        /* deep-clone of body, or NULL if not eligible */
     InlRec *next;
 };
@@ -70,6 +81,7 @@ static InlRec *inl_head;
 /* Forward declarations. */
 static InlBody *save_body(Fn *fn, int cls);
 static int      splice_at(Fn *caller, Blk *blk, int call_idx, InlBody *body);
+static InlRec  *inline_lookup(char *name);
 
 static int
 inline_max_instr(void)
@@ -92,6 +104,13 @@ inline_record(Fn *fn)
     Ins *i;
     int max;
 
+    r = inline_lookup(fn->name);
+    if (r) {
+        /* Already recorded (a TU may emit a function's body and then
+         * have a redeclaration somewhere). Don't overwrite — keep the
+         * original record's consumption counters intact. */
+        return;
+    }
     r = emalloc(sizeof *r);
     strncpy(r->name, fn->name, NString-1);
     r->name[NString-1] = 0;
@@ -103,6 +122,10 @@ inline_record(Fn *fn)
     r->has_phis = 0;
     r->has_cond = 0;
     r->body = NULL;
+    r->n_direct = 0;
+    r->n_inlined = 0;
+    r->n_declined = 0;
+    r->n_indirect = 0;
 
     for (b = fn->start; b; b = b->link) {
         r->blk_count++;
@@ -343,6 +366,35 @@ splice_at(Fn *caller, Blk *blk, int call_idx, InlBody *body)
     return 1;
 }
 
+/* Count indirect (RTmp arg) references to inline-marked functions in
+ * the caller's IR. A function-pointer-store of $foo also counts: the
+ * symbol's address is being taken, so the standalone is needed. */
+static void
+count_indirect_refs(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    Con *c;
+    InlRec *rec;
+    int j;
+
+    for (b = fn->start; b; b = b->link) {
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            /* Walk both args for RCon CAddr references. Direct call
+             * targets (arg[0] of Ocall) are handled in inline_check. */
+            for (j = 0; j < 2; j++) {
+                if (rtype(i->arg[j]) != RCon) continue;
+                /* Skip Ocall arg[0] — handled in inline_check */
+                if (i->op == Ocall && j == 0) continue;
+                c = &fn->con[i->arg[j].val];
+                if (c->type != CAddr) continue;
+                rec = inline_lookup(str(c->sym.id));
+                if (rec && rec->hint) rec->n_indirect++;
+            }
+        }
+    }
+}
+
 void
 inline_check(Fn *fn)
 {
@@ -368,6 +420,12 @@ restart:
             target = str(c->sym.id);
             rec = inline_lookup(target);
             if (!rec || !rec->eligible || !rec->body) {
+                if (rec && rec->hint) {
+                    /* Inline-marked but not eligible (or body missing
+                     * post-clone) — counts as decline. */
+                    rec->n_direct++;
+                    rec->n_declined++;
+                }
                 if (trace) {
                     fprintf(stderr,
                         "[inline] check %s -> %s: %s\n",
@@ -378,7 +436,10 @@ restart:
                 }
                 continue;
             }
+            rec->n_direct++;
             ok = splice_at(fn, b, idx, rec->body);
+            if (ok) rec->n_inlined++;
+            else    rec->n_declined++;
             if (trace) {
                 fprintf(stderr,
                     "[inline] splice %s -> %s @ blk %s idx %d: %s\n",
@@ -396,4 +457,80 @@ restart:
             }
         }
     }
+
+    /* Track indirect references after splicing (any remaining CAddr ref
+     * to an inline-marked fn that's NOT an Ocall target means the
+     * symbol's address was taken; standalone must be emitted). */
+    count_indirect_refs(fn);
+}
+
+/* Record an indirect (data-section) reference to a symbol. Called from
+ * main.c's data callback when a Dat line references a symbol by name
+ * (e.g., `static void (*fp)(void) = foo;` emits `data $fp = { l $foo }`).
+ * A data-section reference is equivalent to taking the function's
+ * address and prevents standalone-emit suppression. */
+void
+inline_record_dat_ref(const char *name)
+{
+    InlRec *r;
+    for (r = inl_head; r; r = r->next) {
+        if (strcmp(r->name, name) == 0) {
+            r->n_indirect++;
+            if (getenv("CC_TRACE_INLINE")) {
+                fprintf(stderr,
+                    "[inline] dat ref to %s -> n_indirect=%d\n",
+                    name, r->n_indirect);
+            }
+            return;
+        }
+    }
+}
+
+/* Returns 1 if `name`'s standalone emission can be safely skipped in
+ * this TU. Two suppress conditions for an inline-hinted function:
+ *
+ *  (a) Fully consumed: at least one direct caller existed and every
+ *      direct call site was successfully inlined, no indirect refs.
+ *  (b) Header-only inclusion: the body was parsed (because the header
+ *      defining it was included) but this TU has neither a direct
+ *      caller nor an indirect reference. Emitting the standalone here
+ *      would create a duplicate symbol with whatever TU is the
+ *      canonical definition site for the symbol.
+ *
+ * The "canonical definition site" is signalled by an indirect
+ * reference: a TU that wants to provide the external standalone (e.g.,
+ * to satisfy a callback registration or a fallback for non-inlining
+ * TUs) takes the function's address — `void *p = (void *)fn;` — which
+ * increments n_indirect and prevents suppression. */
+int
+inline_fully_consumed(const char *name)
+{
+    InlRec *r;
+    for (r = inl_head; r; r = r->next) {
+        if (strcmp(r->name, name) == 0) {
+            if (!r->hint) return 0;
+            /* (b) Header-only inclusion */
+            if (r->n_direct == 0 && r->n_indirect == 0) {
+                if (getenv("CC_TRACE_INLINE")) {
+                    fprintf(stderr,
+                        "[inline] suppress emit of %s (unused in TU)\n",
+                        name);
+                }
+                return 1;
+            }
+            /* (a) Fully consumed */
+            if (r->n_direct > 0 && r->n_declined == 0
+                && r->n_indirect == 0) {
+                if (getenv("CC_TRACE_INLINE")) {
+                    fprintf(stderr,
+                        "[inline] suppress emit of %s: direct=%d "
+                        "inlined=%d (all consumed)\n",
+                        name, r->n_direct, r->n_inlined);
+                }
+                return 1;
+            }
+            return 0;
+        }
+    }
+    return 0;
 }

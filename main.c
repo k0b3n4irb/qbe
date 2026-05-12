@@ -1,9 +1,36 @@
+#define _POSIX_C_SOURCE 200809L  /* open_memstream */
 #include "all.h"
 #include "config.h"
 #include <ctype.h>
 #include <getopt.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 Target T;
+
+/* OpenSNES function inlining: pending function emissions.
+ *
+ * To honour C99 inline semantics (inline definition is not a standalone
+ * external definition) while still letting the inline pass see the
+ * body during its source TU, we defer asm emission of each function to
+ * a memory buffer. After all functions are parsed and processed, we
+ * decide which buffers to flush to outf:
+ *
+ *   - non-inline-hint fns: always flush
+ *   - inline-hint fns with at least one inlined caller AND no decline:
+ *     suppress (fully consumed)
+ *   - inline-hint fns with any decline or no callers: flush (safe default) */
+typedef struct PendingFn PendingFn;
+struct PendingFn {
+    char name[NString];
+    char *buf;
+    size_t len;
+    int inline_hint;
+    PendingFn *next;
+};
+static PendingFn *pending_head;
+static PendingFn *pending_tail;
 
 char debug['Z'+1] = {
 	['P'] = 0, /* parsing */
@@ -42,6 +69,13 @@ data(Dat *d)
 {
 	if (dbg)
 		return;
+	/* OpenSNES function inlining: data items that reference a symbol
+	 * (e.g., `static void (*fp)(void) = foo;` -> `data $fp = { l $foo }`)
+	 * count as indirect references to that symbol. Used by the inline
+	 * pass to decide whether the symbol's standalone body must still
+	 * be emitted. */
+	if (d->isref && d->u.ref.name)
+		inline_record_dat_ref(d->u.ref.name);
 	emitdat(d, outf);
 	if (d->type == DEnd) {
 		fputs("/* end data */\n\n", outf);
@@ -115,11 +149,47 @@ func(Fn *fn)
 		} else
 			fn->rpo[n]->link = fn->rpo[n+1];
 	if (!dbg) {
-		T.emitfn(fn, outf);
-		fprintf(outf, "/* end function %s */\n\n", fn->name);
+		/* OpenSNES function inlining: emit to a per-fn memory buffer so
+		 * we can suppress fully-inlined functions at the final flush. */
+		PendingFn *p = emalloc(sizeof *p);
+		strncpy(p->name, fn->name, NString-1);
+		p->name[NString-1] = 0;
+		p->inline_hint = fn->lnk.inline_hint;
+		p->buf = NULL;
+		p->len = 0;
+		p->next = NULL;
+		FILE *ms = open_memstream(&p->buf, &p->len);
+		if (!ms) {
+			fprintf(stderr, "open_memstream failed\n");
+			abort();
+		}
+		T.emitfn(fn, ms);
+		fprintf(ms, "/* end function %s */\n\n", fn->name);
+		fclose(ms);
+		if (pending_tail) pending_tail->next = p;
+		else              pending_head = p;
+		pending_tail = p;
 	} else
 		fprintf(stderr, "\n");
 	freeall();
+}
+
+/* OpenSNES function inlining: flush deferred function buffers to outf,
+ * skipping inline-hinted functions that were fully consumed by the
+ * inline pass (every direct caller in this TU inlined, no indirect
+ * references, at least one caller existed). */
+static void
+flush_pending(FILE *out)
+{
+    PendingFn *p, *next;
+    for (p = pending_head; p; p = next) {
+        next = p->next;
+        if (!(p->inline_hint && inline_fully_consumed(p->name)))
+            fwrite(p->buf, 1, p->len, out);
+        free(p->buf);
+        free(p);
+    }
+    pending_head = pending_tail = NULL;
 }
 
 static void
@@ -206,8 +276,10 @@ main(int ac, char *av[])
 		fclose(inf);
 	} while (++optind < ac);
 
-	if (!dbg)
+	if (!dbg) {
+		flush_pending(outf);
 		T.emitfin(outf);
+	}
 
 	exit(0);
 }
