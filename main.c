@@ -110,8 +110,19 @@ data(Dat *d)
 	 * (e.g., `static void (*fp)(void) = foo;` -> `data $fp = { l $foo }`)
 	 * count as indirect references to that symbol. Used by the inline
 	 * pass to decide whether the symbol's standalone body must still
-	 * be emitted. */
-	if (d->isref && d->u.ref.name)
+	 * be emitted.
+	 *
+	 * IMPORTANT — parsedat (parse.c) declares the local `Dat d` without
+	 * initialising it before the DStart callback fires, so `d->isref`
+	 * and `d->u.ref.name` carry stack garbage at that point. On Linux
+	 * the bytes happen to be zero often enough that the test below
+	 * fails; on macOS arm64 the stack is occasionally non-zero and the
+	 * garbage pointer survives both checks, dereferencing into invalid
+	 * memory and producing the SIGBUS hunted in chantier A6.11. Gate
+	 * the lookup on a payload-bearing data type so we never trust the
+	 * isref byte during the DStart/DEnd bookends. */
+	if (d->type != DStart && d->type != DEnd
+	&&  d->isref && d->u.ref.name)
 		inline_record_dat_ref(d->u.ref.name);
 	emitdat(d, outf);
 	if (d->type == DEnd) {
