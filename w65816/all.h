@@ -59,6 +59,10 @@ void w65816_abi(Fn *);
 extern int w65816_alloc_size[MAX_ALLOC_TEMPS];  /* size in words, 0 if not alloc */
 extern int w65816_alloc_slots;                   /* total slots reserved for allocs */
 
+/* Restore the per-fn alloc snapshot saved by abi0 into the globals above.
+ * Required for 2-pass parse mode (see abi.c "save_alloc_snap" comment). */
+void w65816_restore_alloc_state(Fn *);
+
 /* isel.c */
 void w65816_isel(Fn *);
 

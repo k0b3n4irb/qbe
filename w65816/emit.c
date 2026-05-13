@@ -2917,6 +2917,11 @@ w65816_emitfn(Fn *fn, FILE *f)
 
     outf = f;
 
+    /* 2-pass parse mode: every fn's abi0 has already run during pass 1,
+     * so the w65816_alloc_size[] / w65816_alloc_slots globals hold the
+     * LAST function's data. Restore this fn's snapshot before we read. */
+    w65816_restore_alloc_state(fn);
+
     /*
      * Compute allocslot[] offsets from w65816_alloc_size[] (set by abi0)
      * Alloc temps get stack slots first (lowest offsets from SP)

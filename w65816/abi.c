@@ -20,9 +20,59 @@
  *
  * w65816_alloc_size[idx] = size in words (2 bytes) for temp (Tmp0 + idx)
  * w65816_alloc_slots = total slots reserved for allocs
+ *
+ * Important — 2-pass parse mode:
+ *
+ *   OpenSNES qbe runs the per-function pipeline as a 2-pass loop over the
+ *   whole TU (see main.c emit_collected). abi0 runs for EVERY function in
+ *   pass 1, then emitfn runs for every function in pass 2. Without
+ *   snapshotting, every emitfn would read the LAST function's alloc data
+ *   from these globals (the last abi0 left its state there).
+ *
+ *   `save_alloc_snap` stashes the current globals under `fn` at the end of
+ *   scanallocations. `w65816_restore_alloc_state` (called from emitfn) looks
+ *   up the snapshot for `fn` and writes it back to the globals so the rest
+ *   of emit reads correct per-fn data. The snapshot list is a small linked
+ *   list (one node per fn in this TU); allocations are intentionally heap
+ *   (emalloc) so they survive freeall().
  */
 int w65816_alloc_size[MAX_ALLOC_TEMPS];
 int w65816_alloc_slots;
+
+typedef struct AllocSnap AllocSnap;
+struct AllocSnap {
+    Fn *fn;
+    int alloc_size[MAX_ALLOC_TEMPS];
+    int alloc_slots;
+    AllocSnap *next;
+};
+static AllocSnap *alloc_snap_head;
+
+static void
+save_alloc_snap(Fn *fn)
+{
+    AllocSnap *s = emalloc(sizeof *s);
+    s->fn = fn;
+    memcpy(s->alloc_size, w65816_alloc_size, sizeof(s->alloc_size));
+    s->alloc_slots = w65816_alloc_slots;
+    s->next = alloc_snap_head;
+    alloc_snap_head = s;
+}
+
+void
+w65816_restore_alloc_state(Fn *fn)
+{
+    AllocSnap *s;
+    for (s = alloc_snap_head; s; s = s->next) {
+        if (s->fn == fn) {
+            memcpy(w65816_alloc_size, s->alloc_size, sizeof(w65816_alloc_size));
+            w65816_alloc_slots = s->alloc_slots;
+            return;
+        }
+    }
+    /* No snapshot — fall through with whatever the globals currently hold.
+     * Happens in legacy (non-2-pass) mode or for synthetic emitfn calls. */
+}
 
 /*
  * Scan for alloc instructions and record them
@@ -67,6 +117,10 @@ scanallocations(Fn *fn)
     }
 
     w65816_alloc_slots = totalslots;
+
+    /* 2-pass mode: stash this fn's alloc state so emitfn can restore it
+     * even if subsequent functions overwrite the globals. */
+    save_alloc_snap(fn);
 
     if (debug['A']) {
         fprintf(stderr, "> Alloc scan for %s: %d total slots\n",

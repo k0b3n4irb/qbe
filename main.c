@@ -1,4 +1,3 @@
-#define _POSIX_C_SOURCE 200809L  /* open_memstream */
 #include "all.h"
 #include "config.h"
 #include <ctype.h>
@@ -9,28 +8,39 @@
 
 Target T;
 
-/* OpenSNES function inlining: pending function emissions.
+/* OpenSNES function inlining: 2-pass parse architecture.
  *
  * To honour C99 inline semantics (inline definition is not a standalone
- * external definition) while still letting the inline pass see the
- * body during its source TU, we defer asm emission of each function to
- * a memory buffer. After all functions are parsed and processed, we
- * decide which buffers to flush to outf:
+ * external definition) while still letting the inline pass see every
+ * body during its source TU, we split the per-function pipeline at the
+ * `inline_check` boundary:
  *
- *   - non-inline-hint fns: always flush
- *   - inline-hint fns with at least one inlined caller AND no decline:
- *     suppress (fully consumed)
- *   - inline-hint fns with any decline or no callers: flush (safe default) */
-typedef struct PendingFn PendingFn;
-struct PendingFn {
-    char name[NString];
-    char *buf;
-    size_t len;
-    int inline_hint;
-    PendingFn *next;
+ *   - Pass 1 (in the parse callback `func`): SSA cleanup + `inline_record`.
+ *     The Fn is then COLLECTED into the linked list below and `freeall()`
+ *     is NOT called, so its pool-allocated IR survives until pass 2.
+ *
+ *   - Pass 1.b (after `parse()` returns): a module-wide loop runs
+ *     `inline_check` on every collected Fn. This populates direct/inlined/
+ *     declined/indirect counters on every inline-marked callee, with full
+ *     TU visibility.
+ *
+ *   - Pass 2 (still after `parse()`): a second loop runs the rest of the
+ *     pipeline (gvn → isel → spill → rega) and emits each Fn, skipping
+ *     fully-consumed inline-hinted functions (see `inline_fully_consumed`).
+ *
+ * Memory cost is O(TU size): the per-function `alloc()` pool keeps growing
+ * during parse instead of being recycled between functions. For typical
+ * SNES SDK TUs (≤ a few dozen functions, < 1 MB total IR), this is
+ * negligible. The previous design used `open_memstream` to buffer each
+ * function's asm output; that was a POSIX-2008 dependency unavailable on
+ * Microsoft UCRT, which is why the design moved to in-place 2-pass. */
+typedef struct CollectedFn CollectedFn;
+struct CollectedFn {
+    Fn *fn;
+    CollectedFn *next;
 };
-static PendingFn *pending_head;
-static PendingFn *pending_tail;
+static CollectedFn *collected_head;
+static CollectedFn *collected_tail;
 
 char debug['Z'+1] = {
 	['P'] = 0, /* parsing */
@@ -79,42 +89,22 @@ data(Dat *d)
 	emitdat(d, outf);
 	if (d->type == DEnd) {
 		fputs("/* end data */\n\n", outf);
-		freeall();
+		/* NOTE: no freeall() here — collected functions need to survive
+		 * the rest of the parse. Pool is reclaimed in one shot by the
+		 * post-parse `emit_collected` path. */
 	}
 }
 
+/* OpenSNES function inlining: pass 2 — the rest of the per-function
+ * pipeline (gvn → simpl → isel → rega) plus the asm emit. Split out of
+ * `func()` so the post-parse `emit_collected` loop can run it on every
+ * function AFTER the module-wide `inline_check` phase has finalised
+ * consumption tallies. */
 static void
-func(Fn *fn)
+finalize_and_emit(Fn *fn, FILE *out)
 {
 	uint n;
 
-	if (dbg)
-		fprintf(stderr, "**** Function %s ****", fn->name);
-	if (debug['P']) {
-		fprintf(stderr, "\n> After parsing:\n");
-		printfn(fn, stderr);
-	}
-	T.abi0(fn);
-	fillcfg(fn);
-	filluse(fn);
-	promote(fn);
-	filluse(fn);
-	ssa(fn);
-	filluse(fn);
-	ssacheck(fn);
-	fillalias(fn);
-	loadopt(fn);
-	filluse(fn);
-	fillalias(fn);
-	coalesce(fn);
-	filluse(fn);
-	filldom(fn);
-	ssacheck(fn);
-	/* OpenSNES function inlining: hook after the SSA cleanup pipeline
-	 * (promote/ssa/loadopt/coalesce). At this point allocas are gone
-	 * and copies are dense; the heuristic measures canonical IR. */
-	inline_record(fn);
-	inline_check(fn);
 	gvn(fn);
 	fillcfg(fn);
 	filluse(fn);
@@ -148,48 +138,104 @@ func(Fn *fn)
 			break;
 		} else
 			fn->rpo[n]->link = fn->rpo[n+1];
-	if (!dbg) {
-		/* OpenSNES function inlining: emit to a per-fn memory buffer so
-		 * we can suppress fully-inlined functions at the final flush. */
-		PendingFn *p = emalloc(sizeof *p);
-		strncpy(p->name, fn->name, NString-1);
-		p->name[NString-1] = 0;
-		p->inline_hint = fn->lnk.inline_hint;
-		p->buf = NULL;
-		p->len = 0;
-		p->next = NULL;
-		FILE *ms = open_memstream(&p->buf, &p->len);
-		if (!ms) {
-			fprintf(stderr, "open_memstream failed\n");
-			abort();
-		}
-		T.emitfn(fn, ms);
-		fprintf(ms, "/* end function %s */\n\n", fn->name);
-		fclose(ms);
-		if (pending_tail) pending_tail->next = p;
-		else              pending_head = p;
-		pending_tail = p;
-	} else
-		fprintf(stderr, "\n");
-	freeall();
+	T.emitfn(fn, out);
+	fprintf(out, "/* end function %s */\n\n", fn->name);
 }
 
-/* OpenSNES function inlining: flush deferred function buffers to outf,
- * skipping inline-hinted functions that were fully consumed by the
- * inline pass (every direct caller in this TU inlined, no indirect
- * references, at least one caller existed). */
 static void
-flush_pending(FILE *out)
+func(Fn *fn)
 {
-    PendingFn *p, *next;
-    for (p = pending_head; p; p = next) {
-        next = p->next;
-        if (!(p->inline_hint && inline_fully_consumed(p->name)))
-            fwrite(p->buf, 1, p->len, out);
-        free(p->buf);
-        free(p);
-    }
-    pending_head = pending_tail = NULL;
+	CollectedFn *c;
+
+	if (dbg)
+		fprintf(stderr, "**** Function %s ****", fn->name);
+	if (debug['P']) {
+		fprintf(stderr, "\n> After parsing:\n");
+		printfn(fn, stderr);
+	}
+	T.abi0(fn);
+	fillcfg(fn);
+	filluse(fn);
+	promote(fn);
+	filluse(fn);
+	ssa(fn);
+	filluse(fn);
+	ssacheck(fn);
+	fillalias(fn);
+	loadopt(fn);
+	filluse(fn);
+	fillalias(fn);
+	coalesce(fn);
+	filluse(fn);
+	filldom(fn);
+	ssacheck(fn);
+	/* OpenSNES function inlining: hook after the SSA cleanup pipeline
+	 * (promote/ssa/loadopt/coalesce). At this point allocas are gone
+	 * and copies are dense; the heuristic measures canonical IR. */
+	inline_record(fn);
+
+	if (dbg) {
+		/* Debug mode: run the rest of the pipeline immediately so the
+		 * per-pass `debug[...]` traces fire in their natural order. No
+		 * asm output is expected. */
+		inline_check(fn);
+		gvn(fn);
+		fillcfg(fn); filluse(fn); filldom(fn); gcm(fn);
+		filluse(fn); ssacheck(fn);
+		T.abi1(fn); simpl(fn);
+		fillcfg(fn); filluse(fn);
+		T.isel(fn);
+		fillcfg(fn); filllive(fn); fillloop(fn); fillcost(fn);
+		if (!T.skiprega) {
+			spill(fn); rega(fn);
+			fillcfg(fn); simpljmp(fn);
+		}
+		fillcfg(fn);
+		fprintf(stderr, "\n");
+		freeall();
+		return;
+	}
+
+	/* Normal mode: collect the Fn for the post-parse 2-pass emit. The
+	 * Fn's pool memory must survive until pass 2 runs, so NO freeall()
+	 * happens here. */
+	c = emalloc(sizeof *c);
+	c->fn = fn;
+	c->next = NULL;
+	if (collected_tail) collected_tail->next = c;
+	else                collected_head = c;
+	collected_tail = c;
+}
+
+/* OpenSNES function inlining: post-parse 2-pass emit.
+ *
+ * Pass 1.b: run `inline_check` on every collected Fn so each callee's
+ *           consumption counters reflect every TU caller.
+ * Pass 2:   run the rest of the per-function pipeline and emit asm,
+ *           skipping inline-hinted functions that are fully consumed
+ *           (see `inline_fully_consumed`).
+ *
+ * One module-wide `freeall()` at the end reclaims the pool that grew
+ * across every parsed function. */
+static void
+emit_collected(FILE *out)
+{
+	CollectedFn *c;
+
+	/* Pass 1.b: module-wide inline_check phase */
+	for (c = collected_head; c; c = c->next)
+		inline_check(c->fn);
+
+	/* Pass 2: finalize + emit, skipping fully-consumed inline bodies */
+	for (c = collected_head; c; c = c->next) {
+		Fn *fn = c->fn;
+		if (fn->lnk.inline_hint && inline_fully_consumed(fn->name))
+			continue;
+		finalize_and_emit(fn, out);
+	}
+
+	freeall();
+	collected_head = collected_tail = NULL;
 }
 
 static void
@@ -277,7 +323,7 @@ main(int ac, char *av[])
 	} while (++optind < ac);
 
 	if (!dbg) {
-		flush_pending(outf);
+		emit_collected(outf);
 		T.emitfin(outf);
 	}
 
