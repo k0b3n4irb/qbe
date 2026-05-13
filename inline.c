@@ -31,7 +31,10 @@
 #include "all.h"
 #include <stdlib.h>
 
-#define INLINE_MAX_INSTR 8
+#define INLINE_MAX_INSTR 16  /* bumped from 8 in wave 4 retrofit (2026-05-13);
+                              * lets ~10-15 IR-instr lib helpers (textSetPos,
+                              * fixCos, colorMathEnable) inline. CC_INLINE_MAX_INSTR=N
+                              * overrides per build. */
 
 typedef struct InlRec InlRec;
 typedef struct InlBody InlBody;
