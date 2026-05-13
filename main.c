@@ -1,22 +1,30 @@
 #include "all.h"
 #include "config.h"
 #include <ctype.h>
-#include <execinfo.h>
 #include <getopt.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* MSYS2 / MinGW does not ship <execinfo.h>; backtrace() is glibc + Apple
+ * libsystem only. Compile out the diagnostic handler on platforms that
+ * lack it — Windows crashes are diagnosed via msys2_cproc_diagnostic.yml
+ * + the retry loop in opensnes_build.yml instead. */
+#if __has_include(<execinfo.h>)
+#include <execinfo.h>
 #include <unistd.h>
+#define HAS_BACKTRACE 1
+#endif
 
 Target T;
 
+#ifdef HAS_BACKTRACE
 /* Diagnostic signal handler: when QBE crashes on a host where reproducing
- * the failure locally is hard (macOS arm64 strict alignment, MSYS2
- * non-determinism), we want a stack trace in CI logs instead of a bare
- * "Bus error 10". backtrace_symbols_fd() works on both Linux and macOS
- * (Apple ships it in libsystem). On macOS it gives addresses; pair with
- * `atos` against the binary in build artifacts to resolve to source. */
+ * the failure locally is hard (macOS arm64 strict alignment), we want a
+ * stack trace in CI logs instead of a bare "Bus error 10". Pair the
+ * addresses with `atos` (macOS) / `addr2line` (Linux) against the build
+ * artefact to resolve to source. */
 static void
 crash_handler(int sig)
 {
@@ -34,6 +42,7 @@ crash_handler(int sig)
 	signal(sig, SIG_DFL);
 	raise(sig);
 }
+#endif
 
 /* OpenSNES function inlining: 2-pass parse architecture.
  *
@@ -290,8 +299,10 @@ main(int ac, char *av[])
 	char *f, *sep;
 	int c;
 
+#ifdef HAS_BACKTRACE
 	signal(SIGBUS,  crash_handler);
 	signal(SIGSEGV, crash_handler);
+#endif
 
 	T = Deftgt;
 	outf = stdout;
