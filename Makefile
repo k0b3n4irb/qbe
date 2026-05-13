@@ -25,7 +25,7 @@ CFLAGS   = -std=c99 -g -Wall -Wextra -Wpedantic -Wno-missing-field-initializers
 # Designated initialisers `{.op = ..., ...}` already work without it.
 
 qbe: $(OBJ)
-	$(CC) $(LDFLAGS) $(OBJ) -o $@
+	$(CC) $(LDFLAGS) -rdynamic $(OBJ) -o $@
 
 .c.o:
 	$(CC) $(CFLAGS) -c $< -o $@

@@ -1,12 +1,39 @@
 #include "all.h"
 #include "config.h"
 #include <ctype.h>
+#include <execinfo.h>
 #include <getopt.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 Target T;
+
+/* Diagnostic signal handler: when QBE crashes on a host where reproducing
+ * the failure locally is hard (macOS arm64 strict alignment, MSYS2
+ * non-determinism), we want a stack trace in CI logs instead of a bare
+ * "Bus error 10". backtrace_symbols_fd() works on both Linux and macOS
+ * (Apple ships it in libsystem). On macOS it gives addresses; pair with
+ * `atos` against the binary in build artifacts to resolve to source. */
+static void
+crash_handler(int sig)
+{
+	void *frames[32];
+	int n;
+	const char *name =
+		sig == SIGBUS  ? "SIGBUS"  :
+		sig == SIGSEGV ? "SIGSEGV" :
+		sig == SIGABRT ? "SIGABRT" :
+		"signal";
+	fprintf(stderr, "\n=== qbe: caught %s (signal %d) ===\n", name, sig);
+	n = backtrace(frames, 32);
+	backtrace_symbols_fd(frames, n, STDERR_FILENO);
+	fputs("=== end backtrace ===\n", stderr);
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
 
 /* OpenSNES function inlining: 2-pass parse architecture.
  *
@@ -251,6 +278,9 @@ main(int ac, char *av[])
 	FILE *inf, *hf;
 	char *f, *sep;
 	int c;
+
+	signal(SIGBUS,  crash_handler);
+	signal(SIGSEGV, crash_handler);
 
 	T = Deftgt;
 	outf = stdout;
