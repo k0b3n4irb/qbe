@@ -801,8 +801,17 @@ can_be_frameless(Fn *fn)
             /* Skip aliased temps (param copies / copy chains) */
             if (temp_alias[idx] != 0) continue;
 
-            /* Skip dead store temps (slot never read, A-cache serves value) */
-            if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_is_dead_store[idx]) continue;
+            /* Skip dead store temps (slot never read, A-cache serves value).
+             * Disabled for Kl — emitstore() does NOT honor temp_is_dead_store
+             * for Kl temps (it stores both halves; A is clobbered between low
+             * and high), so a Kl temp marked dead-store STILL writes to its
+             * slot. Treating it as "absent" here makes can_be_frameless wrongly
+             * return true and the slot ends up in caller's frame, where the
+             * leaf's write clobbers the caller's locals (chantier A6+A7
+             * rectInit/rectSetPos residuals — see
+             * .claude/notes/chantiers/a6_a7_leaf_opt_slot_overlap.md). */
+            if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_is_dead_store[idx]
+                && fn->tmp[i->to.val].cls != Kl) continue;
 
             /* Skip dead return stores */
             if (is_ret_block && i == last && req(i->to, b->jmp.arg)
