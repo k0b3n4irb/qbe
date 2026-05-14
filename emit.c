@@ -48,7 +48,7 @@ static int dtype_size[] = {
 	[DB] = 1,
 	[DH] = 2,
 	[DW] = 4,
-	[DL] = 8
+	[DL] = 4
 };
 
 /* Emit a string with proper handling of null terminators for WLA-DX.
