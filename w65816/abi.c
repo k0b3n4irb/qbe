@@ -214,15 +214,17 @@ w65816_abi(Fn *fn)
 {
     Blk *b;
     Ins *i;
-    int paroff;  /* parameter offset from return address */
+    int paroff;  /* parameter offset from return address (byte accumulator) */
     int npars;   /* number of parameters */
-    int parn;    /* current parameter number (0 = first) */
+    int parn;    /* current parameter number (0 = first) — kept for debug */
 
     for (b = fn->start; b; b = b->link) {
         curi = &insb[NIns];
         npars = countpars(b);
         (void)npars;
         parn = 0;
+        (void)parn;  /* parn is incremented for debug clarity only */
+        paroff = 0;  /* === A6.10: byte accumulator for class-mixed param sizes === */
 
         for (i = &b->ins[b->nins]; i > b->ins;) {
             i--;
@@ -233,13 +235,22 @@ w65816_abi(Fn *fn)
             case Oparub:
             case Oparsh:
             case Oparuh:
-                /* Parameter: load from stack */
-                /* Encode byte offset above return address as negative slot */
-                /* Iterating backwards: first encountered = last declared param */
-                /* Last param is at lowest offset (closest to ret addr) */
-                /* slot = -(parn + 1) * 2 encodes byte offset from ret addr */
-                paroff = (parn + 1) * 2;  /* 2, 4, 6, ... */
-                emit(Oloadsw, Kw, i->to, SLOT(-paroff), R);
+                /* Parameter: load from stack.
+                 * paroff accumulates byte size of params already processed
+                 * (backwards order, so last-declared is processed first and
+                 * lives at the LOWEST offset above the return address).
+                 *
+                 * Kl params occupy 4 bytes (low 16 + high 16), Kw and the
+                 * other narrow classes occupy 2 bytes. SLOT(-paroff) addresses
+                 * the LOW half of the current param; the Oload Kl emitter
+                 * loads the high half from SLOT(-paroff)+2 byte offset. */
+                paroff += 2;
+                if (i->cls == Kl) {
+                    emit(Oload, Kl, i->to, SLOT(-paroff), R);
+                    paroff += 2;  /* consume high half byte budget */
+                } else {
+                    emit(Oloadsw, Kw, i->to, SLOT(-paroff), R);
+                }
                 parn++;
                 break;
 
