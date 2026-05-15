@@ -762,9 +762,19 @@ can_be_frameless(Fn *fn)
 {
     Blk *b;
     Ins *i;
-    int a, idx;
+    int a, idx, t;
 
     if (fn->dynalloc) return 0;
+
+    /* A1-followup: any Kl temp forces a real frame. Kl needs 4 bytes per
+     * slot and the param-shadow / dead-store / dead-retval shortcuts that
+     * keep leaf_opt frameless were all designed for 2-byte Kw values —
+     * they can't represent a Kl pair, so the high half would land in the
+     * caller's JSL return address. Bail before the per-temp walk. */
+    for (t = Tmp0; t < fn->ntmp; t++) {
+        if (fn->tmp[t].cls == Kl)
+            return 0;
+    }
 
     /* Check alloc slots: allow param-shadow allocs (fully optimized away),
      * but reject allocs used for other purposes */
