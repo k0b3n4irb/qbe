@@ -1740,6 +1740,42 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Omul:
+        /* === Kl: 32-bit multiply via __mul32 runtime helper ===
+         * For two's-complement, low N bits of a*b are identical for signed
+         * and unsigned interpretation, so the truncated 32-bit result is
+         * the same regardless of class signedness.
+         *
+         * ABI matches __mul16 (right-to-left for the binary op):
+         *   - push r1 first (high then low, per Kl arg convention)
+         *   - push r0 second (high then low)
+         *   - jsl __mul32
+         *   - cleanup 8 bytes
+         *   - A holds result low 16; mul32_hi holds result high 16
+         * No constant-multiply specialisation for Kl yet — every Kl
+         * multiply goes through __mul32. */
+        if (i->cls == Kl) {
+            emit_load_high(r1, fn, 0);
+            fprintf(outf, "\tpha\n");
+            emitload_adj(r1, fn, 2);
+            fprintf(outf, "\tpha\n");
+            emit_load_high(r0, fn, 4);
+            fprintf(outf, "\tpha\n");
+            emitload_adj(r0, fn, 6);
+            fprintf(outf, "\tpha\n");
+            fprintf(outf, "\tjsl __mul32\n");
+            /* Cleanup 8 bytes via arithmetic (faster than 4×plx, preserves A via X). */
+            fprintf(outf, "\ttax\n");
+            fprintf(outf, "\ttsa\n");
+            fprintf(outf, "\tclc\n");
+            fprintf(outf, "\tadc.w #8\n");
+            fprintf(outf, "\ttas\n");
+            fprintf(outf, "\ttxa\n");
+            emitstore(i->to, fn);
+            fprintf(outf, "\tlda.l mul32_hi\n");
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         /* 65816 has no MUL instruction - need to use a loop or library call */
         /* For now, emit a simple shift-add loop for small constants */
         if (rtype(r1) == RCon) {
