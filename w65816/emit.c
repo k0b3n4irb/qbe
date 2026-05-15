@@ -1712,6 +1712,26 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Oneg:
+        /* === Kl (32-bit) negate: two's complement on 32 bits ===
+         * low_result  = ~low(x) + 1  (carry out if low(x) was 0)
+         * high_result = ~high(x) + carry_from_low
+         * Uses ADC (not INC) so the carry from the low half propagates
+         * cleanly into the high half. `lda` and `sta` instructions
+         * preserve C, so the carry chain is intact between the two
+         * halves' operations. */
+        if (i->cls == Kl) {
+            emitload(r0, fn);
+            fprintf(outf, "\teor.w #$FFFF\n");
+            fprintf(outf, "\tclc\n");
+            fprintf(outf, "\tadc.w #1\n");
+            emitstore(i->to, fn);
+            emit_load_high(r0, fn, 0);
+            fprintf(outf, "\teor.w #$FFFF\n");
+            fprintf(outf, "\tadc.w #0\n");
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         /* Negate: result = -value = ~value + 1 (two's complement) */
         emitload(r0, fn);
         fprintf(outf, "\teor.w #$FFFF\n");
@@ -2054,6 +2074,20 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Oand:
+        /* === Kl (32-bit) bitwise AND — independent halves, no carry ===
+         * Each half is and'd against the matching half of the other operand.
+         * A-cache swap optimisation skipped for the Kl path (rarely
+         * profitable when both halves must be touched). */
+        if (i->cls == Kl) {
+            emitload(r0, fn);
+            emitop2("and", r1, fn);
+            emitstore(i->to, fn);
+            emit_load_high(r0, fn, 0);
+            emitop2_high("and", r1, fn);
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         if (acache_has(r1) && !acache_has(r0)) {
             emitload(r1, fn);
             emitop2("and", r0, fn);
@@ -2065,6 +2099,16 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Oor:
+        if (i->cls == Kl) {
+            emitload(r0, fn);
+            emitop2("ora", r1, fn);
+            emitstore(i->to, fn);
+            emit_load_high(r0, fn, 0);
+            emitop2_high("ora", r1, fn);
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         if (acache_has(r1) && !acache_has(r0)) {
             emitload(r1, fn);
             emitop2("ora", r0, fn);
@@ -2076,6 +2120,16 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Oxor:
+        if (i->cls == Kl) {
+            emitload(r0, fn);
+            emitop2("eor", r1, fn);
+            emitstore(i->to, fn);
+            emit_load_high(r0, fn, 0);
+            emitop2_high("eor", r1, fn);
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         if (acache_has(r1) && !acache_has(r0)) {
             emitload(r1, fn);
             emitop2("eor", r0, fn);
