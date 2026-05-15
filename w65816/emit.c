@@ -2141,6 +2141,64 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Oshl:
+        /* === Kl: 32-bit pair left shift (A1-followup chantier) ===
+         * Constant-count cases are handled inline. Variable-count Kl
+         * shifts fall through to the Kw path (which truncates) — no
+         * shipping code currently produces them; covered when cproc
+         * starts emitting Kl for `long` (Session 7). */
+        if (i->cls == Kl && rtype(r1) == RCon) {
+            c = &fn->con[r1.val];
+            int cnt = (int)c->bits.i;
+            if (cnt == 0) {
+                emitload(r0, fn);
+                emitstore(i->to, fn);
+                emit_load_high(r0, fn, 0);
+                emit_store_high(i->to, fn);
+                acache_invalidate();
+                break;
+            }
+            if (cnt >= 32) {
+                fprintf(outf, "\tlda.w #0\n");
+                emitstore(i->to, fn);
+                emit_store_high(i->to, fn);
+                acache_invalidate();
+                break;
+            }
+            if (cnt >= 16) {
+                /* high = low_orig << (cnt-16); low = 0 */
+                int extra = cnt - 16;
+                emitload(r0, fn);
+                if (extra >= 8) {
+                    fprintf(outf, "\txba\n");
+                    fprintf(outf, "\tand.w #$FF00\n");
+                    for (int j = 0; j < extra - 8; j++)
+                        fprintf(outf, "\tasl a\n");
+                } else {
+                    for (int j = 0; j < extra; j++)
+                        fprintf(outf, "\tasl a\n");
+                }
+                emit_store_high(i->to, fn);
+                fprintf(outf, "\tlda.w #0\n");
+                emitstore(i->to, fn);
+                acache_invalidate();
+                break;
+            }
+            /* 0 < cnt < 16: cross-half via per-bit asl(low) / rol(high) */
+            emitload(r0, fn);
+            emitstore(i->to, fn);
+            emit_load_high(r0, fn, 0);
+            emit_store_high(i->to, fn);
+            for (int j = 0; j < cnt; j++) {
+                emitload(i->to, fn);
+                fprintf(outf, "\tasl a\n");
+                emitstore(i->to, fn);
+                emit_load_high(i->to, fn, 0);
+                fprintf(outf, "\trol a\n");
+                emit_store_high(i->to, fn);
+            }
+            acache_invalidate();
+            break;
+        }
         emitload(r0, fn);
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
@@ -2175,6 +2233,73 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Osar:
+        /* === Kl: 32-bit pair arithmetic right shift (A1-followup chantier) ===
+         * Constant-count cases handled inline. Variable count not yet
+         * implemented. Sign extension uses the standard `cmp #$8000 ; ror a`
+         * pattern from the Kw path, applied to the high half first so the
+         * sign bit propagates down via the C flag. */
+        if (i->cls == Kl && rtype(r1) == RCon) {
+            c = &fn->con[r1.val];
+            int cnt = (int)c->bits.i;
+            if (cnt == 0) {
+                emitload(r0, fn);
+                emitstore(i->to, fn);
+                emit_load_high(r0, fn, 0);
+                emit_store_high(i->to, fn);
+                acache_invalidate();
+                break;
+            }
+            if (cnt >= 32) {
+                /* Saturate to sign of high_orig: $0000 or $FFFF in both halves. */
+                emit_load_high(r0, fn, 0);
+                fprintf(outf, "\tcmp.w #$8000\n");
+                fprintf(outf, "\tlda.w #0\n");
+                fprintf(outf, "\tbcc +\n");
+                fprintf(outf, "\tdec a\n");
+                fprintf(outf, "+\n");
+                emitstore(i->to, fn);
+                emit_store_high(i->to, fn);
+                acache_invalidate();
+                break;
+            }
+            if (cnt >= 16) {
+                /* low = high_orig sar (cnt-16); high = sign_ext(high_orig). */
+                int extra = cnt - 16;
+                /* dest high = sign extension of high_orig (independent of extra). */
+                emit_load_high(r0, fn, 0);
+                fprintf(outf, "\tcmp.w #$8000\n");
+                fprintf(outf, "\tlda.w #0\n");
+                fprintf(outf, "\tbcc +\n");
+                fprintf(outf, "\tdec a\n");
+                fprintf(outf, "+\n");
+                emit_store_high(i->to, fn);
+                /* dest low = high_orig sar extra. */
+                emit_load_high(r0, fn, 0);
+                for (int j = 0; j < extra; j++) {
+                    fprintf(outf, "\tcmp.w #$8000\n");
+                    fprintf(outf, "\tror a\n");
+                }
+                emitstore(i->to, fn);
+                acache_invalidate();
+                break;
+            }
+            /* 0 < cnt < 16: cross-half via per-bit sar(high) / ror(low). */
+            emitload(r0, fn);
+            emitstore(i->to, fn);
+            emit_load_high(r0, fn, 0);
+            emit_store_high(i->to, fn);
+            for (int j = 0; j < cnt; j++) {
+                emit_load_high(i->to, fn, 0);
+                fprintf(outf, "\tcmp.w #$8000\n");
+                fprintf(outf, "\tror a\n");
+                emit_store_high(i->to, fn);
+                emitload(i->to, fn);
+                fprintf(outf, "\tror a\n");
+                emitstore(i->to, fn);
+            }
+            acache_invalidate();
+            break;
+        }
         /* Arithmetic shift right: preserves sign for negative values. */
         emitload(r0, fn);
         if (rtype(r1) == RCon) {
@@ -2223,6 +2348,62 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Oshr:
+        /* === Kl: 32-bit pair logical right shift (A1-followup chantier) ===
+         * Constant-count cases handled inline. Variable count not yet
+         * implemented. */
+        if (i->cls == Kl && rtype(r1) == RCon) {
+            c = &fn->con[r1.val];
+            int cnt = (int)c->bits.i;
+            if (cnt == 0) {
+                emitload(r0, fn);
+                emitstore(i->to, fn);
+                emit_load_high(r0, fn, 0);
+                emit_store_high(i->to, fn);
+                acache_invalidate();
+                break;
+            }
+            if (cnt >= 32) {
+                fprintf(outf, "\tlda.w #0\n");
+                emitstore(i->to, fn);
+                emit_store_high(i->to, fn);
+                acache_invalidate();
+                break;
+            }
+            if (cnt >= 16) {
+                /* low = high_orig >> (cnt-16); high = 0 */
+                int extra = cnt - 16;
+                emit_load_high(r0, fn, 0);
+                if (extra >= 8) {
+                    fprintf(outf, "\txba\n");
+                    fprintf(outf, "\tand.w #$00FF\n");
+                    for (int j = 0; j < extra - 8; j++)
+                        fprintf(outf, "\tlsr a\n");
+                } else {
+                    for (int j = 0; j < extra; j++)
+                        fprintf(outf, "\tlsr a\n");
+                }
+                emitstore(i->to, fn);
+                fprintf(outf, "\tlda.w #0\n");
+                emit_store_high(i->to, fn);
+                acache_invalidate();
+                break;
+            }
+            /* 0 < cnt < 16: cross-half via per-bit lsr(high) / ror(low). */
+            emitload(r0, fn);
+            emitstore(i->to, fn);
+            emit_load_high(r0, fn, 0);
+            emit_store_high(i->to, fn);
+            for (int j = 0; j < cnt; j++) {
+                emit_load_high(i->to, fn, 0);
+                fprintf(outf, "\tlsr a\n");
+                emit_store_high(i->to, fn);
+                emitload(i->to, fn);
+                fprintf(outf, "\tror a\n");
+                emitstore(i->to, fn);
+            }
+            acache_invalidate();
+            break;
+        }
         emitload(r0, fn);
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
