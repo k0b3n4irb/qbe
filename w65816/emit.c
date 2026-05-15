@@ -2490,9 +2490,22 @@ emitins(Ins *i, Fn *fn)
         }
         break;
 
-    /* Comparison operations - produce 0 or 1 */
+    /* Comparison operations - produce 0 or 1.
+     *
+     * Kl variants (Oc*l) cascade high → low: compare high halves first,
+     * fall through to low-half compare only when high halves are equal.
+     * The high-half test uses the same signed/unsigned branch as the Kw
+     * path; the low-half test is ALWAYS unsigned (bcc) because the low
+     * half is the less-significant unsigned chunk of a two's-complement
+     * value once the high half has decided the sign.
+     *
+     * Label scheme for the 10 ordered Kl compares: 4 forward labels.
+     *   +     "high halves equal — go compare low"
+     *   ++    "set result to 1 (true) and jump to end"
+     *   +++   "set result to 0 (false) and jump to end"
+     *   ++++  "end"
+     */
     case Oceqw:
-    case Oceql:
         emitload(r0, fn);
         emitop2("cmp", r1, fn);
         fprintf(outf, "\tbeq +\n");
@@ -2503,8 +2516,35 @@ emitins(Ins *i, Fn *fn)
         emitstore(i->to, fn);
         break;
 
+    case Oceql:
+        emit_load_high(r0, fn, 0);
+        emitop2_high("cmp", r1, fn);
+        fprintf(outf, "\tbne +\n");
+        emitload(r0, fn);
+        emitop2("cmp", r1, fn);
+        fprintf(outf, "\tbne +\n");
+        fprintf(outf, "\tlda.w #1\n");
+        fprintf(outf, "\tbra ++\n");
+        fprintf(outf, "+\tlda.w #0\n");
+        fprintf(outf, "++\n");
+        emitstore(i->to, fn);
+        break;
+
     case Ocnew:
+        emitload(r0, fn);
+        emitop2("cmp", r1, fn);
+        fprintf(outf, "\tbne +\n");
+        fprintf(outf, "\tlda.w #0\n");
+        fprintf(outf, "\tbra ++\n");
+        fprintf(outf, "+\tlda.w #1\n");
+        fprintf(outf, "++\n");
+        emitstore(i->to, fn);
+        break;
+
     case Ocnel:
+        emit_load_high(r0, fn, 0);
+        emitop2_high("cmp", r1, fn);
+        fprintf(outf, "\tbne +\n");
         emitload(r0, fn);
         emitop2("cmp", r1, fn);
         fprintf(outf, "\tbne +\n");
@@ -2516,7 +2556,6 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Ocsltw:
-    case Ocsltl:
         /* Signed less than */
         emitload(r0, fn);
         emitop2("cmp", r1, fn);
@@ -2528,8 +2567,26 @@ emitins(Ins *i, Fn *fn)
         emitstore(i->to, fn);
         break;
 
+    case Ocsltl:
+        /* Signed less than (32-bit): cascade high → low. */
+        emit_load_high(r0, fn, 0);
+        emitop2_high("cmp", r1, fn);
+        fprintf(outf, "\tbeq +\n");
+        fprintf(outf, "\tbmi ++\n");
+        fprintf(outf, "\tbra +++\n");
+        fprintf(outf, "+\n");
+        emitload(r0, fn);
+        emitop2("cmp", r1, fn);
+        fprintf(outf, "\tbcc ++\n");
+        fprintf(outf, "\tbra +++\n");
+        fprintf(outf, "++\tlda.w #1\n");
+        fprintf(outf, "\tbra ++++\n");
+        fprintf(outf, "+++\tlda.w #0\n");
+        fprintf(outf, "++++\n");
+        emitstore(i->to, fn);
+        break;
+
     case Ocsgtw:
-    case Ocsgtl:
         /* Signed greater than: swap operands and use less than */
         emitload(r1, fn);
         emitop2("cmp", r0, fn);
@@ -2541,8 +2598,26 @@ emitins(Ins *i, Fn *fn)
         emitstore(i->to, fn);
         break;
 
+    case Ocsgtl:
+        /* Signed greater than (32-bit): test r1 < r0. */
+        emit_load_high(r1, fn, 0);
+        emitop2_high("cmp", r0, fn);
+        fprintf(outf, "\tbeq +\n");
+        fprintf(outf, "\tbmi ++\n");
+        fprintf(outf, "\tbra +++\n");
+        fprintf(outf, "+\n");
+        emitload(r1, fn);
+        emitop2("cmp", r0, fn);
+        fprintf(outf, "\tbcc ++\n");
+        fprintf(outf, "\tbra +++\n");
+        fprintf(outf, "++\tlda.w #1\n");
+        fprintf(outf, "\tbra ++++\n");
+        fprintf(outf, "+++\tlda.w #0\n");
+        fprintf(outf, "++++\n");
+        emitstore(i->to, fn);
+        break;
+
     case Ocslew:
-    case Ocslel:
         /* Signed less or equal: !(a > b) */
         emitload(r1, fn);
         emitop2("cmp", r0, fn);
@@ -2554,8 +2629,26 @@ emitins(Ins *i, Fn *fn)
         emitstore(i->to, fn);
         break;
 
+    case Ocslel:
+        /* Signed <= (32-bit): NOT (r1 < r0). */
+        emit_load_high(r1, fn, 0);
+        emitop2_high("cmp", r0, fn);
+        fprintf(outf, "\tbeq +\n");
+        fprintf(outf, "\tbmi +++\n");
+        fprintf(outf, "\tbra ++\n");
+        fprintf(outf, "+\n");
+        emitload(r1, fn);
+        emitop2("cmp", r0, fn);
+        fprintf(outf, "\tbcc +++\n");
+        fprintf(outf, "\tbra ++\n");
+        fprintf(outf, "++\tlda.w #1\n");
+        fprintf(outf, "\tbra ++++\n");
+        fprintf(outf, "+++\tlda.w #0\n");
+        fprintf(outf, "++++\n");
+        emitstore(i->to, fn);
+        break;
+
     case Ocsgew:
-    case Ocsgel:
         /* Signed greater or equal: !(a < b) */
         emitload(r0, fn);
         emitop2("cmp", r1, fn);
@@ -2567,8 +2660,26 @@ emitins(Ins *i, Fn *fn)
         emitstore(i->to, fn);
         break;
 
+    case Ocsgel:
+        /* Signed >= (32-bit): NOT (r0 < r1). */
+        emit_load_high(r0, fn, 0);
+        emitop2_high("cmp", r1, fn);
+        fprintf(outf, "\tbeq +\n");
+        fprintf(outf, "\tbmi +++\n");
+        fprintf(outf, "\tbra ++\n");
+        fprintf(outf, "+\n");
+        emitload(r0, fn);
+        emitop2("cmp", r1, fn);
+        fprintf(outf, "\tbcc +++\n");
+        fprintf(outf, "\tbra ++\n");
+        fprintf(outf, "++\tlda.w #1\n");
+        fprintf(outf, "\tbra ++++\n");
+        fprintf(outf, "+++\tlda.w #0\n");
+        fprintf(outf, "++++\n");
+        emitstore(i->to, fn);
+        break;
+
     case Ocultw:
-    case Ocultl:
         /* Unsigned less than */
         emitload(r0, fn);
         emitop2("cmp", r1, fn);
@@ -2580,8 +2691,26 @@ emitins(Ins *i, Fn *fn)
         emitstore(i->to, fn);
         break;
 
+    case Ocultl:
+        /* Unsigned < (32-bit): both halves use bcc. */
+        emit_load_high(r0, fn, 0);
+        emitop2_high("cmp", r1, fn);
+        fprintf(outf, "\tbeq +\n");
+        fprintf(outf, "\tbcc ++\n");
+        fprintf(outf, "\tbra +++\n");
+        fprintf(outf, "+\n");
+        emitload(r0, fn);
+        emitop2("cmp", r1, fn);
+        fprintf(outf, "\tbcc ++\n");
+        fprintf(outf, "\tbra +++\n");
+        fprintf(outf, "++\tlda.w #1\n");
+        fprintf(outf, "\tbra ++++\n");
+        fprintf(outf, "+++\tlda.w #0\n");
+        fprintf(outf, "++++\n");
+        emitstore(i->to, fn);
+        break;
+
     case Ocugtw:
-    case Ocugtl:
         /* Unsigned greater than */
         emitload(r1, fn);
         emitop2("cmp", r0, fn);
@@ -2593,8 +2722,26 @@ emitins(Ins *i, Fn *fn)
         emitstore(i->to, fn);
         break;
 
+    case Ocugtl:
+        /* Unsigned > (32-bit): test r1 < r0. */
+        emit_load_high(r1, fn, 0);
+        emitop2_high("cmp", r0, fn);
+        fprintf(outf, "\tbeq +\n");
+        fprintf(outf, "\tbcc ++\n");
+        fprintf(outf, "\tbra +++\n");
+        fprintf(outf, "+\n");
+        emitload(r1, fn);
+        emitop2("cmp", r0, fn);
+        fprintf(outf, "\tbcc ++\n");
+        fprintf(outf, "\tbra +++\n");
+        fprintf(outf, "++\tlda.w #1\n");
+        fprintf(outf, "\tbra ++++\n");
+        fprintf(outf, "+++\tlda.w #0\n");
+        fprintf(outf, "++++\n");
+        emitstore(i->to, fn);
+        break;
+
     case Oculew:
-    case Oculel:
         /* Unsigned less or equal */
         emitload(r1, fn);
         emitop2("cmp", r0, fn);
@@ -2606,8 +2753,26 @@ emitins(Ins *i, Fn *fn)
         emitstore(i->to, fn);
         break;
 
+    case Oculel:
+        /* Unsigned <= (32-bit): NOT (r1 < r0). */
+        emit_load_high(r1, fn, 0);
+        emitop2_high("cmp", r0, fn);
+        fprintf(outf, "\tbeq +\n");
+        fprintf(outf, "\tbcc +++\n");
+        fprintf(outf, "\tbra ++\n");
+        fprintf(outf, "+\n");
+        emitload(r1, fn);
+        emitop2("cmp", r0, fn);
+        fprintf(outf, "\tbcc +++\n");
+        fprintf(outf, "\tbra ++\n");
+        fprintf(outf, "++\tlda.w #1\n");
+        fprintf(outf, "\tbra ++++\n");
+        fprintf(outf, "+++\tlda.w #0\n");
+        fprintf(outf, "++++\n");
+        emitstore(i->to, fn);
+        break;
+
     case Ocugew:
-    case Ocugel:
         /* Unsigned greater or equal */
         emitload(r0, fn);
         emitop2("cmp", r1, fn);
@@ -2616,6 +2781,25 @@ emitins(Ins *i, Fn *fn)
         fprintf(outf, "\tbra ++\n");
         fprintf(outf, "+\tlda.w #0\n");
         fprintf(outf, "++\n");
+        emitstore(i->to, fn);
+        break;
+
+    case Ocugel:
+        /* Unsigned >= (32-bit): NOT (r0 < r1). */
+        emit_load_high(r0, fn, 0);
+        emitop2_high("cmp", r1, fn);
+        fprintf(outf, "\tbeq +\n");
+        fprintf(outf, "\tbcc +++\n");
+        fprintf(outf, "\tbra ++\n");
+        fprintf(outf, "+\n");
+        emitload(r0, fn);
+        emitop2("cmp", r1, fn);
+        fprintf(outf, "\tbcc +++\n");
+        fprintf(outf, "\tbra ++\n");
+        fprintf(outf, "++\tlda.w #1\n");
+        fprintf(outf, "\tbra ++++\n");
+        fprintf(outf, "+++\tlda.w #0\n");
+        fprintf(outf, "++++\n");
         emitstore(i->to, fn);
         break;
 
