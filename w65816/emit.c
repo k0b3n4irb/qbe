@@ -1963,6 +1963,32 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Oudiv:
+        /* === Kl: 32-bit unsigned divide via __udivmod32 ===
+         * Push both Kl args right-to-left, call the helper, cleanup
+         * 8 bytes. Helper leaves A = quotient low, div32_qh = quotient
+         * high (plus div32_rl/rh for the matching modulo, unused here). */
+        if (i->cls == Kl) {
+            emit_load_high(r1, fn, 0);
+            fprintf(outf, "\tpha\n");
+            emitload_adj(r1, fn, 2);
+            fprintf(outf, "\tpha\n");
+            emit_load_high(r0, fn, 4);
+            fprintf(outf, "\tpha\n");
+            emitload_adj(r0, fn, 6);
+            fprintf(outf, "\tpha\n");
+            fprintf(outf, "\tjsl __udivmod32\n");
+            fprintf(outf, "\ttax\n");
+            fprintf(outf, "\ttsa\n");
+            fprintf(outf, "\tclc\n");
+            fprintf(outf, "\tadc.w #8\n");
+            fprintf(outf, "\ttas\n");
+            fprintf(outf, "\ttxa\n");
+            emitstore(i->to, fn);
+            fprintf(outf, "\tlda.l div32_qh\n");
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         /* Unsigned division - use shifts for powers of 2, __div16 otherwise */
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
@@ -2018,6 +2044,29 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Odiv:
+        /* === Kl: 32-bit signed divide via __sdivmod32 === */
+        if (i->cls == Kl) {
+            emit_load_high(r1, fn, 0);
+            fprintf(outf, "\tpha\n");
+            emitload_adj(r1, fn, 2);
+            fprintf(outf, "\tpha\n");
+            emit_load_high(r0, fn, 4);
+            fprintf(outf, "\tpha\n");
+            emitload_adj(r0, fn, 6);
+            fprintf(outf, "\tpha\n");
+            fprintf(outf, "\tjsl __sdivmod32\n");
+            fprintf(outf, "\ttax\n");
+            fprintf(outf, "\ttsa\n");
+            fprintf(outf, "\tclc\n");
+            fprintf(outf, "\tadc.w #8\n");
+            fprintf(outf, "\ttas\n");
+            fprintf(outf, "\ttxa\n");
+            emitstore(i->to, fn);
+            fprintf(outf, "\tlda.l div32_qh\n");
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         /* Signed division - call __sdiv16 */
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
@@ -2042,6 +2091,30 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Ourem:
+        /* === Kl: 32-bit unsigned modulo via __udivmod32 ===
+         * Same helper as Oudiv; just read the remainder slots after. */
+        if (i->cls == Kl) {
+            emit_load_high(r1, fn, 0);
+            fprintf(outf, "\tpha\n");
+            emitload_adj(r1, fn, 2);
+            fprintf(outf, "\tpha\n");
+            emit_load_high(r0, fn, 4);
+            fprintf(outf, "\tpha\n");
+            emitload_adj(r0, fn, 6);
+            fprintf(outf, "\tpha\n");
+            fprintf(outf, "\tjsl __udivmod32\n");
+            /* Stack cleanup: A retval is unused, simple TSA/CLC/ADC/TAS */
+            fprintf(outf, "\ttsa\n");
+            fprintf(outf, "\tclc\n");
+            fprintf(outf, "\tadc.w #8\n");
+            fprintf(outf, "\ttas\n");
+            fprintf(outf, "\tlda.l div32_rl\n");
+            emitstore(i->to, fn);
+            fprintf(outf, "\tlda.l div32_rh\n");
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         /* Unsigned modulo - use AND for powers of 2, __mod16 otherwise */
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
@@ -2085,6 +2158,28 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Orem:
+        /* === Kl: 32-bit signed modulo via __sdivmod32 === */
+        if (i->cls == Kl) {
+            emit_load_high(r1, fn, 0);
+            fprintf(outf, "\tpha\n");
+            emitload_adj(r1, fn, 2);
+            fprintf(outf, "\tpha\n");
+            emit_load_high(r0, fn, 4);
+            fprintf(outf, "\tpha\n");
+            emitload_adj(r0, fn, 6);
+            fprintf(outf, "\tpha\n");
+            fprintf(outf, "\tjsl __sdivmod32\n");
+            fprintf(outf, "\ttsa\n");
+            fprintf(outf, "\tclc\n");
+            fprintf(outf, "\tadc.w #8\n");
+            fprintf(outf, "\ttas\n");
+            fprintf(outf, "\tlda.l div32_rl\n");
+            emitstore(i->to, fn);
+            fprintf(outf, "\tlda.l div32_rh\n");
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         /* Signed modulo - call __smod16 */
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
