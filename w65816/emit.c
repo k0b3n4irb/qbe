@@ -2212,7 +2212,12 @@ emitins(Ins *i, Fn *fn)
             fprintf(outf, "\tpha\n");
             emitload_adj(r0, fn, 6);
             fprintf(outf, "\tpha\n");
-            fprintf(outf, "\tjsl __mul32\n");
+            /* Use tcc_mul32 (not __mul32) — __mul32 was a `.DEFINE` alias
+             * that dropped the bank byte at link time, resolving to $00:8000
+             * which collides with tcc_mul16's address. Calling __mul32 jumped
+             * to mul16 instead, returning the wrong result. tcc_mul32 is the
+             * real label and exports the full 24-bit address (bank 7). */
+            fprintf(outf, "\tjsl tcc_mul32\n");
             /* Cleanup 8 bytes via arithmetic (faster than 4×plx, preserves A via X). */
             fprintf(outf, "\ttax\n");
             fprintf(outf, "\ttsa\n");
