@@ -1761,8 +1761,76 @@ emitins(Ins *i, Fn *fn)
          *   - jsl __mul32
          *   - cleanup 8 bytes
          *   - A holds result low 16; mul32_hi holds result high 16
-         * No constant-multiply specialisation for Kl yet — every Kl
-         * multiply goes through __mul32. */
+         *
+         * Constant fast paths: x*0, x*1, x*pow2. cproc emits a Kl mul
+         * for every array index post-A1-followup-flip (the index is
+         * widened to Kl then multiplied by sizeof(elem) for the
+         * pointer math), and the most common case is *2 / *4 / *8 for
+         * u16 / u32 / u64 element types — these MUST fold to shifts
+         * or we pay ~250 cycles per array access. */
+        if (i->cls == Kl && rtype(r1) == RCon
+            && fn->con[r1.val].type == CBits) {
+            int64_t val = fn->con[r1.val].bits.i;
+            if (val == 0) {
+                fprintf(outf, "\tlda.w #0\n");
+                emitstore(i->to, fn);
+                emit_store_high(i->to, fn);
+                acache_invalidate();
+                break;
+            }
+            if (val == 1) {
+                emitload(r0, fn);
+                emitstore(i->to, fn);
+                emit_load_high(r0, fn, 0);
+                emit_store_high(i->to, fn);
+                acache_invalidate();
+                break;
+            }
+            /* Power-of-2: emit Oshl Kl by log2(val). Reuses the
+             * cross-half asl/rol path from the Oshl Kl handler. */
+            if (val > 0 && val < (1LL << 31) && (val & (val - 1)) == 0) {
+                int cnt = 0;
+                int64_t v = val;
+                while (v > 1) { v >>= 1; cnt++; }
+                if (cnt >= 32) {
+                    fprintf(outf, "\tlda.w #0\n");
+                    emitstore(i->to, fn);
+                    emit_store_high(i->to, fn);
+                } else if (cnt >= 16) {
+                    /* high = low_orig << (cnt-16), low = 0 */
+                    int extra = cnt - 16;
+                    emitload(r0, fn);
+                    if (extra >= 8) {
+                        fprintf(outf, "\txba\n");
+                        fprintf(outf, "\tand.w #$FF00\n");
+                        for (int j = 0; j < extra - 8; j++)
+                            fprintf(outf, "\tasl a\n");
+                    } else {
+                        for (int j = 0; j < extra; j++)
+                            fprintf(outf, "\tasl a\n");
+                    }
+                    emit_store_high(i->to, fn);
+                    fprintf(outf, "\tlda.w #0\n");
+                    emitstore(i->to, fn);
+                } else {
+                    /* 0 < cnt < 16: cross-half asl(low) + rol(high) */
+                    emitload(r0, fn);
+                    emitstore(i->to, fn);
+                    emit_load_high(r0, fn, 0);
+                    emit_store_high(i->to, fn);
+                    for (int j = 0; j < cnt; j++) {
+                        emitload(i->to, fn);
+                        fprintf(outf, "\tasl a\n");
+                        emitstore(i->to, fn);
+                        emit_load_high(i->to, fn, 0);
+                        fprintf(outf, "\trol a\n");
+                        emit_store_high(i->to, fn);
+                    }
+                }
+                acache_invalidate();
+                break;
+            }
+        }
         if (i->cls == Kl) {
             emit_load_high(r1, fn, 0);
             fprintf(outf, "\tpha\n");
