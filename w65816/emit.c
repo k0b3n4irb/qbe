@@ -2443,7 +2443,7 @@ emitins(Ins *i, Fn *fn)
             fprintf(outf, "\tpha\n");
             emitload_adj(r0, fn, 6);
             fprintf(outf, "\tpha\n");
-            fprintf(outf, "\tjsl __udivmod32\n");
+            fprintf(outf, "\tjsl tcc_udivmod32\n");
             fprintf(outf, "\ttax\n");
             fprintf(outf, "\ttsa\n");
             fprintf(outf, "\tclc\n");
@@ -2532,7 +2532,7 @@ emitins(Ins *i, Fn *fn)
             fprintf(outf, "\tpha\n");
             emitload_adj(r0, fn, 6);
             fprintf(outf, "\tpha\n");
-            fprintf(outf, "\tjsl __sdivmod32\n");
+            fprintf(outf, "\tjsl tcc_sdivmod32\n");
             fprintf(outf, "\ttax\n");
             fprintf(outf, "\ttsa\n");
             fprintf(outf, "\tclc\n");
@@ -2590,7 +2590,7 @@ emitins(Ins *i, Fn *fn)
             fprintf(outf, "\tpha\n");
             emitload_adj(r0, fn, 6);
             fprintf(outf, "\tpha\n");
-            fprintf(outf, "\tjsl __udivmod32\n");
+            fprintf(outf, "\tjsl tcc_udivmod32\n");
             /* Stack cleanup: A retval is unused, simple TSA/CLC/ADC/TAS */
             fprintf(outf, "\ttsa\n");
             fprintf(outf, "\tclc\n");
@@ -2666,7 +2666,7 @@ emitins(Ins *i, Fn *fn)
             fprintf(outf, "\tpha\n");
             emitload_adj(r0, fn, 6);
             fprintf(outf, "\tpha\n");
-            fprintf(outf, "\tjsl __sdivmod32\n");
+            fprintf(outf, "\tjsl tcc_sdivmod32\n");
             fprintf(outf, "\ttsa\n");
             fprintf(outf, "\tclc\n");
             fprintf(outf, "\tadc.w #8\n");
