@@ -1977,6 +1977,18 @@ emitins(Ins *i, Fn *fn)
          * Push both Kl args right-to-left, call the helper, cleanup
          * 8 bytes. Helper leaves A = quotient low, div32_qh = quotient
          * high (plus div32_rl/rh for the matching modulo, unused here). */
+        if (i->cls == Kl && rtype(r1) == RCon
+            && fn->con[r1.val].type == CBits
+            && fn->con[r1.val].bits.i == 1) {
+            /* x / 1 = x — cproc emits this for u8* ptrdiff (sizeof(u8)=1).
+             * Bypass __udivmod32 (~1500 cycles) entirely. */
+            emitload(r0, fn);
+            emitstore(i->to, fn);
+            emit_load_high(r0, fn, 0);
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         if (i->cls == Kl) {
             emit_load_high(r1, fn, 0);
             fprintf(outf, "\tpha\n");
@@ -2055,6 +2067,17 @@ emitins(Ins *i, Fn *fn)
 
     case Odiv:
         /* === Kl: 32-bit signed divide via __sdivmod32 === */
+        if (i->cls == Kl && rtype(r1) == RCon
+            && fn->con[r1.val].type == CBits
+            && fn->con[r1.val].bits.i == 1) {
+            /* x / 1 = x (signed) */
+            emitload(r0, fn);
+            emitstore(i->to, fn);
+            emit_load_high(r0, fn, 0);
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         if (i->cls == Kl) {
             emit_load_high(r1, fn, 0);
             fprintf(outf, "\tpha\n");
@@ -2103,6 +2126,16 @@ emitins(Ins *i, Fn *fn)
     case Ourem:
         /* === Kl: 32-bit unsigned modulo via __udivmod32 ===
          * Same helper as Oudiv; just read the remainder slots after. */
+        if (i->cls == Kl && rtype(r1) == RCon
+            && fn->con[r1.val].type == CBits
+            && fn->con[r1.val].bits.i == 1) {
+            /* x % 1 = 0 — common after cproc's u8* ptrdiff lowering. */
+            fprintf(outf, "\tlda.w #0\n");
+            emitstore(i->to, fn);
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         if (i->cls == Kl) {
             emit_load_high(r1, fn, 0);
             fprintf(outf, "\tpha\n");
@@ -2169,6 +2202,16 @@ emitins(Ins *i, Fn *fn)
 
     case Orem:
         /* === Kl: 32-bit signed modulo via __sdivmod32 === */
+        if (i->cls == Kl && rtype(r1) == RCon
+            && fn->con[r1.val].type == CBits
+            && fn->con[r1.val].bits.i == 1) {
+            /* x % 1 = 0 (signed) */
+            fprintf(outf, "\tlda.w #0\n");
+            emitstore(i->to, fn);
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            break;
+        }
         if (i->cls == Kl) {
             emit_load_high(r1, fn, 0);
             fprintf(outf, "\tpha\n");
