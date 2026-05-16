@@ -360,6 +360,23 @@ static int skip_dead_retstore_temp;  /* temp index to skip store, or -1 */
 /* Dead store elimination: temps whose stack slot stores can be skipped */
 static int temp_is_dead_store[MAX_ALIAS_TEMPS];
 
+/* Kl temps whose high half is statically zero. Set when the temp's
+ * defining instruction is Oextuw (zero-extend word to long): cproc
+ * emits this for every `arr[idx]` where idx is u8/u16/int, so the
+ * Omul Kl pow2 / Oshl Kl paths can skip the cross-half asl+rol pattern
+ * and use a narrower "shift low + carry into high" sequence instead. */
+static int temp_high_zero[MAX_ALIAS_TEMPS];
+
+/* Kl temps whose high half is never read by a consumer that cares about
+ * the bank byte. Set by mark_addr_only_kl when ALL uses of the temp are
+ * arg[0] of Oload{w,sh,uh,sb,ub} or arg[1] of Ostore{b,h,w} — all of
+ * which currently codegen as `lda.l $0000,x` (bank-0-hardcoded), so the
+ * temp's bank byte is dead at every consumer.
+ *
+ * When set, Oadd Kl / Omul Kl pow2 emitting this temp skip the high-half
+ * computation entirely — saving ~25 cycles per array indexing site. */
+static int temp_addr_only[MAX_ALIAS_TEMPS];
+
 /* Comparison+branch fusion state:
  * When a comparison instruction's result is used only by the block's jnz,
  * we skip boolean materialization (0/1) and emit a direct compare+branch.
@@ -412,6 +429,278 @@ count_temp_uses(Fn *fn)
                     if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
                         temp_use_count[idx]++;
                 }
+    }
+}
+
+/* Pre-pass: mark Kl temps whose high half is statically zero.
+ *
+ * Currently the only origin tracked is Oextuw (zero-extend word to long) —
+ * that's the dominant pattern cproc emits for array indexing (`arr[i]`
+ * lowers to `i =l extuw <i_kw>; offset =l mul i, sizeof(elem); ...`).
+ *
+ * The Oshl Kl handler reads this flag to emit a narrower codegen when
+ * shifting a high-zero source by 1: instead of the cross-half asl+rol
+ * bit-by-bit pattern (~36 cycles), we emit "asl <low>; lda #0; rol a"
+ * (~18 cycles) — the high half just receives the carry-out from the low
+ * shift, which is exactly what was discarded in the full Kl form too
+ * (since the eventual deref via `lda.l \$0000,x` only uses the low 16
+ * of the address anyway, in the typical bank-0 array case).
+ *
+ * No propagation through Ocopy / Ophi for the MVP — the pattern of
+ * interest (Oextuw immediately consumed by Omul Kl pow2) doesn't pass
+ * through copies. */
+static void
+mark_high_zero(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    int idx;
+
+    memset(temp_high_zero, 0, sizeof(temp_high_zero));
+    for (b = fn->start; b; b = b->link) {
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (i->op != Oextuw) continue;
+            if (i->cls != Kl) continue;
+            if (rtype(i->to) != RTmp || i->to.val < Tmp0) continue;
+            idx = i->to.val - Tmp0;
+            if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+                temp_high_zero[idx] = 1;
+        }
+    }
+}
+
+/* Test whether a Ref's high half (when read in Kl context) is statically
+ * known to be zero. Three sources qualify:
+ *   1. RCon with high 16 bits == 0.
+ *   2. RTmp whose underlying QBE class is Kw — by convention a Kw temp
+ *      used as a Kl operand is zero-extended. Covers the dominant case
+ *      cproc emits for `arr[i]`: `%.7 =w extuh %.6 ; %.8 =l mul %.7, 2`.
+ *   3. RTmp marked by mark_high_zero (Kl temp defined by Oextuw).
+ * Used by Oshl Kl / Omul Kl shortcuts. */
+static int
+ref_is_high_zero(Ref r, Fn *fn)
+{
+    int idx;
+    if (rtype(r) == RCon) {
+        Con *c = &fn->con[r.val];
+        if (c->type == CBits)
+            return ((c->bits.i >> 16) & 0xFFFF) == 0;
+        return 0;
+    }
+    if (rtype(r) != RTmp || r.val < Tmp0)
+        return 0;
+    /* Kw class → high half is zero by Kl-widening convention. */
+    if (fn->tmp[r.val].cls == Kw)
+        return 1;
+    idx = r.val - Tmp0;
+    if (idx < 0 || idx >= MAX_ALIAS_TEMPS)
+        return 0;
+    return temp_high_zero[idx];
+}
+
+/* Test whether `ref` is a temp marked addr_only — i.e. its defining op
+ * (typically Oadd Kl for a + offset) can skip the high-half computation
+ * because every consumer is a bank-discarding load/store. */
+static int
+ref_to_is_addr_only(Ref r)
+{
+    int idx;
+    if (rtype(r) != RTmp || r.val < Tmp0)
+        return 0;
+    idx = r.val - Tmp0;
+    if (idx < 0 || idx >= MAX_ALIAS_TEMPS)
+        return 0;
+    return temp_addr_only[idx];
+}
+
+/* Pre-pass: mark Kl temps whose every use is the address operand of a
+ * bank-discarding load/store opcode. In that case, the temp's high half
+ * (bank byte, in post-A6+A7 Kl pointer storage) never reaches a consumer
+ * that uses it — current load/store codegen hardcodes `lda.l $0000,x` /
+ * `sta.l $0000,x` and ignores the bank byte of the address — so we can
+ * skip computing it at the def site.
+ *
+ * Bank-discarding opcodes (per emit.c codegen as of 2026-05-18):
+ *   - Oload{sb, ub, sh, uh}   always (16-bit result, address from temp
+ *     uses `emitload; tax; lda.l \$0000,x`)
+ *   - Oload{sw, uw}, Oload    when cls != Kl (the 16-bit-result variant
+ *     on w65816; the Kl variant DOES use the bank byte for the second
+ *     half of the 32-bit load and is excluded)
+ *   - Ostore{b, h, w}         always (16-bit value, `sta.l \$0000,x`)
+ *   - Ostorel                 always (32-bit value; the high half also
+ *     uses `sta.l \$0002,x` with bank \$00 hardcoded)
+ *
+ * NOT included:
+ *   - Phi args, ret arg, jnz arg, call args — these may consume the full
+ *     Kl value including the bank byte.
+ *   - Oadd/Osub Kl operands — these read both halves to compute the
+ *     result; only addr_only's *result* skips its high half, not its
+ *     operands' high halves. */
+/* An op `i` whose dest is high_dead also has its operands' high halves
+ * dead — for the binary ops that compute high = high(a) op high(b) + carry,
+ * and the unary ops that compute high = f(high(a)). When the dest's high
+ * is skipped, neither operand's high is needed. */
+static int
+is_high_dead_propagating(int op)
+{
+    switch (op) {
+    case Oadd: case Osub:
+    case Oand: case Oor:  case Oxor:
+    case Oneg: case Ocopy:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void
+mark_addr_only_kl(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    Phi *p;
+    int idx, a, n, t;
+    /* Per-temp use classification:
+     *   addr_use[]  : count of direct bank-discarding load/store uses
+     *   block_use[] : count of uses that DEFINITELY read the high half
+     *                 (phi, ret, jnz, call args, Ostore* arg[0] value,
+     *                  Oadd-on-non-addr-only-dest, etc.)
+     *   prop_use[]  : count of uses that propagate (operand of a high-
+     *                 dead-propagating op, e.g. Oadd Kl). These are
+     *                 only "high-dead" if the propagating op's dest is
+     *                 itself marked addr_only.
+     *   prop_to_addr_only[] : count of prop uses where the dest IS
+     *                 currently marked addr_only. Recomputed every
+     *                 iteration of the fixed-point loop.
+     *
+     * A temp is addr_only iff: block_use == 0 AND prop_to_addr_only ==
+     * prop_use AND (addr_use > 0 OR prop_use > 0). */
+    static int addr_use[MAX_ALIAS_TEMPS];
+    static int block_use[MAX_ALIAS_TEMPS];
+    static int prop_use[MAX_ALIAS_TEMPS];
+    static int prop_to_addr_only[MAX_ALIAS_TEMPS];
+
+    memset(temp_addr_only, 0, sizeof(temp_addr_only));
+    memset(addr_use, 0, sizeof(addr_use));
+    memset(block_use, 0, sizeof(block_use));
+    memset(prop_use, 0, sizeof(prop_use));
+
+    /* Classify every operand use. */
+    for (b = fn->start; b; b = b->link) {
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            for (a = 0; a < 2; a++) {
+                Ref r = i->arg[a];
+                if (rtype(r) != RTmp || r.val < Tmp0) continue;
+                idx = r.val - Tmp0;
+                if (idx < 0 || idx >= MAX_ALIAS_TEMPS) continue;
+
+                /* Direct address use OR auto-high-dead consumer (Oextuw /
+                 * Oextsw reads only the operand's low half — so the
+                 * operand's high half is unconditionally dead at this site,
+                 * independent of the consumer's own status). */
+                int is_addr_use = 0;
+                if (a == 0) {
+                    switch (i->op) {
+                    case Oloadsb: case Oloadub:
+                    case Oloadsh: case Oloaduh:
+                        is_addr_use = 1; break;
+                    case Oloadsw: case Oloaduw: case Oload:
+                        if (i->cls != Kl)
+                            is_addr_use = 1;
+                        break;
+                    case Oextuw: case Oextsw:
+                        /* high half of operand is never read */
+                        is_addr_use = 1; break;
+                    default: break;
+                    }
+                } else {
+                    switch (i->op) {
+                    case Ostoreb: case Ostoreh: case Ostorew:
+                    case Ostorel:
+                        is_addr_use = 1; break;
+                    default: break;
+                    }
+                }
+                if (is_addr_use) {
+                    addr_use[idx]++;
+                    continue;
+                }
+
+                /* Propagating use? Op is one of the high-dead-propagating
+                 * binary/unary ops AND the op produces Kl. */
+                if (i->cls == Kl && is_high_dead_propagating(i->op)) {
+                    prop_use[idx]++;
+                    continue;
+                }
+
+                /* Otherwise: this use definitely reads the high half. */
+                block_use[idx]++;
+            }
+        }
+        /* Ret/jnz/phi args are blocking uses. */
+        if (isret(b->jmp.type) && rtype(b->jmp.arg) == RTmp
+            && b->jmp.arg.val >= Tmp0) {
+            idx = b->jmp.arg.val - Tmp0;
+            if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+                block_use[idx]++;
+        }
+        if (b->jmp.type == Jjnz && rtype(b->jmp.arg) == RTmp
+            && b->jmp.arg.val >= Tmp0) {
+            idx = b->jmp.arg.val - Tmp0;
+            if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+                block_use[idx]++;
+        }
+        for (p = b->phi; p; p = p->link)
+            for (n = 0; n < (int)p->narg; n++)
+                if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
+                    idx = p->arg[n].val - Tmp0;
+                    if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+                        block_use[idx]++;
+                }
+    }
+
+    /* Fixed-point iteration: a temp qualifies once all its prop_uses
+     * are to addr_only-tagged dest temps. Each iteration may unlock
+     * more temps which in turn unlock more — typical chain depth in
+     * cproc IR is 3-4 (mul → extuw → add → loadw). */
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        memset(prop_to_addr_only, 0, sizeof(prop_to_addr_only));
+
+        for (b = fn->start; b; b = b->link) {
+            for (i = b->ins; i < &b->ins[b->nins]; i++) {
+                if (i->cls != Kl) continue;
+                if (!is_high_dead_propagating(i->op)) continue;
+                if (rtype(i->to) != RTmp || i->to.val < Tmp0) continue;
+                int dst_idx = i->to.val - Tmp0;
+                if (dst_idx < 0 || dst_idx >= MAX_ALIAS_TEMPS) continue;
+                if (!temp_addr_only[dst_idx]) continue;
+                /* dst is addr_only — its prop operands count toward
+                 * prop_to_addr_only of their own indices. */
+                for (a = 0; a < 2; a++) {
+                    Ref r = i->arg[a];
+                    if (rtype(r) != RTmp || r.val < Tmp0) continue;
+                    int op_idx = r.val - Tmp0;
+                    if (op_idx < 0 || op_idx >= MAX_ALIAS_TEMPS) continue;
+                    prop_to_addr_only[op_idx]++;
+                }
+            }
+        }
+
+        /* New temps qualify? */
+        for (t = Tmp0; t < fn->ntmp; t++) {
+            idx = t - Tmp0;
+            if (idx < 0 || idx >= MAX_ALIAS_TEMPS) continue;
+            if (fn->tmp[t].cls != Kl) continue;
+            if (temp_addr_only[idx]) continue;
+            if (block_use[idx]) continue;
+            if (addr_use[idx] == 0 && prop_use[idx] == 0) continue;
+            /* Every prop_use must be to an addr_only dest. */
+            if (prop_to_addr_only[idx] != prop_use[idx]) continue;
+            temp_addr_only[idx] = 1;
+            changed = 1;
+        }
     }
 }
 
@@ -1649,15 +1938,22 @@ emitins(Ins *i, Fn *fn)
 
     switch (i->op) {
     case Oadd:
-        /* === A7.5: Kl pair add with carry propagation === */
+        /* === A7.5: Kl pair add with carry propagation ===
+         *
+         * Narrowing fast path: when the result temp is addr_only (used
+         * exclusively as the address operand of bank-discarding loads or
+         * stores), the high half is dead at every consumer — skip it. */
         if (i->cls == Kl) {
+            int skip_high = ref_to_is_addr_only(i->to);
             emitload(r0, fn);
             fprintf(outf, "\tclc\n");
             emitop2("adc", r1, fn);
             emitstore(i->to, fn);
-            emit_load_high(r0, fn, 0);
-            emitop2_high("adc", r1, fn);  /* no clc — carry from low half */
-            emit_store_high(i->to, fn);
+            if (!skip_high) {
+                emit_load_high(r0, fn, 0);
+                emitop2_high("adc", r1, fn);  /* no clc — carry from low half */
+                emit_store_high(i->to, fn);
+            }
             acache_invalidate();
             break;
         }
@@ -1694,13 +1990,16 @@ emitins(Ins *i, Fn *fn)
     case Osub:
         /* === A7.5: Kl pair sub with borrow propagation === */
         if (i->cls == Kl) {
+            int skip_high = ref_to_is_addr_only(i->to);
             emitload(r0, fn);
             fprintf(outf, "\tsec\n");
             emitop2("sbc", r1, fn);
             emitstore(i->to, fn);
-            emit_load_high(r0, fn, 0);
-            emitop2_high("sbc", r1, fn);  /* no sec — borrow from low half */
-            emit_store_high(i->to, fn);
+            if (!skip_high) {
+                emit_load_high(r0, fn, 0);
+                emitop2_high("sbc", r1, fn);  /* no sec — borrow from low half */
+                emit_store_high(i->to, fn);
+            }
             acache_invalidate();
             break;
         }
@@ -1792,6 +2091,24 @@ emitins(Ins *i, Fn *fn)
                 int cnt = 0;
                 int64_t v = val;
                 while (v > 1) { v >>= 1; cnt++; }
+                int skip_high = ref_to_is_addr_only(i->to);
+                if (skip_high) {
+                    /* addr_only narrowing: dest's high half is dead at every
+                     * consumer (bank-discarding load/store). Emit only the
+                     * low-half computation; no high-half store, no cross-half
+                     * carry chain. Covers `arr[i]` for any element size and
+                     * any consumer kind, regardless of high_zero status. */
+                    if (cnt >= 16) {
+                        fprintf(outf, "\tlda.w #0\n");
+                    } else {
+                        emitload(r0, fn);
+                        for (int j = 0; j < cnt; j++)
+                            fprintf(outf, "\tasl a\n");
+                    }
+                    emitstore(i->to, fn);
+                    acache_invalidate();
+                    break;
+                }
                 if (cnt >= 32) {
                     fprintf(outf, "\tlda.w #0\n");
                     emitstore(i->to, fn);
@@ -1812,8 +2129,25 @@ emitins(Ins *i, Fn *fn)
                     emit_store_high(i->to, fn);
                     fprintf(outf, "\tlda.w #0\n");
                     emitstore(i->to, fn);
+                } else if (ref_is_high_zero(r0, fn) && cnt >= 1 && cnt <= 8) {
+                    /* 0 < cnt ≤ 8, high-zero source: cproc-emitted `arr[i]`
+                     * widens i (u8/u16) into Kl context; the multiply-by-
+                     * sizeof(elem) lands here. Skip the cross-half pattern
+                     * and emit narrowed codegen — same shape as the matching
+                     * branch in case Oshl: asl × cnt on low, then xba+and+
+                     * lsr × (8-cnt) for the high half (= low_orig >> (16-cnt)). */
+                    emitload(r0, fn);
+                    for (int j = 0; j < cnt; j++)
+                        fprintf(outf, "\tasl a\n");
+                    emitstore(i->to, fn);
+                    emitload(r0, fn);
+                    fprintf(outf, "\txba\n");
+                    fprintf(outf, "\tand.w #$00FF\n");
+                    for (int j = 0; j < 8 - cnt; j++)
+                        fprintf(outf, "\tlsr a\n");
+                    emit_store_high(i->to, fn);
                 } else {
-                    /* 0 < cnt < 16: cross-half asl(low) + rol(high) */
+                    /* 0 < cnt < 16 (general): cross-half asl(low) + rol(high) */
                     emitload(r0, fn);
                     emitstore(i->to, fn);
                     emit_load_high(r0, fn, 0);
@@ -2435,7 +2769,38 @@ emitins(Ins *i, Fn *fn)
                 acache_invalidate();
                 break;
             }
-            /* 0 < cnt < 16: cross-half via per-bit asl(low) / rol(high) */
+            /* 0 < cnt < 16 — two paths depending on whether r0's high half
+             * is statically zero (typical for `arr[idx]` where idx is u8/u16
+             * widened via Oextuw).
+             *
+             * High-zero fast path (mark_high_zero): result_high = (low_orig
+             * shifted out of low_orig's top, accumulated over cnt steps).
+             * Computed as `low_orig >> (16-cnt)` — Kw lsr × (16-cnt) on a
+             * copy. Cuts ~3 stack accesses per iteration of the shift.
+             *
+             * General path: cross-half asl(low) + rol(high) bit-by-bit. */
+            if (ref_is_high_zero(r0, fn) && cnt >= 1 && cnt <= 8) {
+                /* new_low = low_orig << cnt   (Kw asl × cnt, in A) */
+                emitload(r0, fn);
+                for (int j = 0; j < cnt; j++)
+                    fprintf(outf, "\tasl a\n");
+                emitstore(i->to, fn);
+                /* new_high = low_orig >> (16 - cnt). For cnt ∈ [1, 8]:
+                 *   xba+and gives low_orig >> 8 (the high byte of low_orig
+                 *   zero-extended), then lsr × (8-cnt) more lowers that to
+                 *   low_orig >> (16-cnt). cnt=1 → 7 lsrs, cnt=8 → no lsrs.
+                 * For cnt > 8 the formula would need bits from the low byte
+                 * of low_orig too, so we fall through to the general path. */
+                emitload(r0, fn);
+                fprintf(outf, "\txba\n");
+                fprintf(outf, "\tand.w #$00FF\n");
+                for (int j = 0; j < 8 - cnt; j++)
+                    fprintf(outf, "\tlsr a\n");
+                emit_store_high(i->to, fn);
+                acache_invalidate();
+                break;
+            }
+            /* 0 < cnt < 16 (general): cross-half via per-bit asl(low) / rol(high) */
             emitload(r0, fn);
             emitstore(i->to, fn);
             emit_load_high(r0, fn, 0);
@@ -3213,12 +3578,20 @@ emitins(Ins *i, Fn *fn)
          * addr+2), each stored to the corresponding half of the dest Kl
          * temp's widened slot. */
         if (i->op == Oload && i->cls == Kl) {
+            /* Narrowing: when the loaded Kl value is used only as an
+             * address for bank-discarding load/store (mark_addr_only_kl),
+             * skip reading and storing the high half. Saves ~9 cycles per
+             * 32-bit-pointer-load-then-deref pattern (typical for `*a`
+             * after `T *a` param materialisation). */
+            int skip_high = ref_to_is_addr_only(i->to);
             int aslot = getallocslot(r0, fn);
             if (aslot >= 0) {
                 emit_stack_load((aslot + 1) * 2, 0);
                 emitstore(i->to, fn);
-                emit_stack_load((aslot + 1) * 2 + 2, 0);
-                emit_store_high(i->to, fn);
+                if (!skip_high) {
+                    emit_stack_load((aslot + 1) * 2 + 2, 0);
+                    emit_store_high(i->to, fn);
+                }
             } else if (rtype(r0) == RSlot) {
                 int s = rsval(r0);
                 int low_off = (s < 0)
@@ -3226,8 +3599,10 @@ emitins(Ins *i, Fn *fn)
                     : (s + 1) * 2;
                 emit_stack_load(low_off, 0);
                 emitstore(i->to, fn);
-                emit_stack_load(low_off + 2, 0);
-                emit_store_high(i->to, fn);
+                if (!skip_high) {
+                    emit_stack_load(low_off + 2, 0);
+                    emit_store_high(i->to, fn);
+                }
             } else if (rtype(r0) == RCon && fn->con[r0.val].type == CAddr) {
                 Con *c0 = &fn->con[r0.val];
                 int off = (int)c0->bits.i;
@@ -3236,16 +3611,20 @@ emitins(Ins *i, Fn *fn)
                     fprintf(outf, "+%d", off);
                 fprintf(outf, "\n");
                 emitstore(i->to, fn);
-                fprintf(outf, "\tlda.w %s+%d\n",
-                        stripsym(str(c0->sym.id)), off + 2);
-                emit_store_high(i->to, fn);
+                if (!skip_high) {
+                    fprintf(outf, "\tlda.w %s+%d\n",
+                            stripsym(str(c0->sym.id)), off + 2);
+                    emit_store_high(i->to, fn);
+                }
             } else if (isvreg(r0)) {
                 /* Near-pointer in DP virtual register — bank is implicit. */
                 fprintf(outf, "\tlda ($%02X)\n", regaddr(r0.val));
                 emitstore(i->to, fn);
-                fprintf(outf, "\tldy.w #2\n");
-                fprintf(outf, "\tlda ($%02X),y\n", regaddr(r0.val));
-                emit_store_high(i->to, fn);
+                if (!skip_high) {
+                    fprintf(outf, "\tldy.w #2\n");
+                    fprintf(outf, "\tlda ($%02X),y\n", regaddr(r0.val));
+                    emit_store_high(i->to, fn);
+                }
             } else {
                 /* 24-bit pointer in temp — copy to tcc__r9 (3 bytes),
                  * indirect-load 4 bytes. */
@@ -3255,9 +3634,11 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "\tsta.b tcc__r9+2\n");
                 fprintf(outf, "\tlda [tcc__r9]\n");
                 emitstore(i->to, fn);
-                fprintf(outf, "\tldy.w #2\n");
-                fprintf(outf, "\tlda [tcc__r9],y\n");
-                emit_store_high(i->to, fn);
+                if (!skip_high) {
+                    fprintf(outf, "\tldy.w #2\n");
+                    fprintf(outf, "\tlda [tcc__r9],y\n");
+                    emit_store_high(i->to, fn);
+                }
             }
             acache_invalidate();
             break;
@@ -3462,7 +3843,7 @@ emitins(Ins *i, Fn *fn)
         }
         emitload(r0, fn);
         emitstore(i->to, fn);
-        if (i->cls == Kl) {
+        if (i->cls == Kl && !ref_to_is_addr_only(i->to)) {
             fprintf(outf, "\tlda.w #0\n");
             emit_store_high(i->to, fn);
         }
@@ -3944,6 +4325,8 @@ w65816_emitfn(Fn *fn, FILE *f)
     count_temp_uses(fn);
     build_alias_table(fn);
     mark_dead_stores(fn);
+    mark_high_zero(fn);
+    mark_addr_only_kl(fn);
     caller_param_bytes = count_fn_param_bytes(fn);
 
     /* Frame elimination: if all temps are aliased or dead-retval, go frameless */
