@@ -138,6 +138,20 @@ emit_load_high(Ref r, Fn *fn, int sp_adjust)
     switch (rtype(r)) {
     case RTmp:
         if (r.val >= Tmp0) {
+            /* Kw/Kh/Kb temps occupy a SINGLE 2-byte slot, not a Kl pair —
+             * the byte at (slot+1)*2+2 belongs to the NEXT temp (or is
+             * uninitialised). When such a temp is used in a Kl context
+             * (e.g. `%kl_dest =l mul %kw_op, N` for array indexing, where
+             * cproc emits a Kw operand into a Kl result), the high half
+             * is *implicitly* zero by zero-extension semantics — emit a
+             * literal #0 instead of reading the bogus slot. Was the root
+             * cause of tetris's intermittent corruption post-A1-followup:
+             * every `board[r][c]` indexing triggered `__mul32(garbage, 10)`
+             * because the high half came from the next slot. */
+            if (fn->tmp[r.val].cls != Kl) {
+                fprintf(outf, "\tlda.w #0\n");
+                break;
+            }
             slot = fn->tmp[r.val].slot;
             if (slot >= 0)
                 emit_stack_load((slot + 1) * 2 + 2, sp_adjust);
@@ -900,8 +914,32 @@ consumes_r0_via_emitload(Ins *i, Fn *fn)
     case Oalloc4: case Oalloc8: case Oalloc16:
         return 0;
     /* Mul: inline constant multiplies load r0 first (A-cache hit);
-     * variable*variable and __mul16 fallback load r1 first (no A-cache for r0) */
+     * variable*variable and __mul16 fallback load r1 first (no A-cache for r0).
+     *
+     * Kl mul has its own codegen path: only constants 0, 1, and pow2 are
+     * inlined (and emit via emitload(r0), A-cache compatible). All other
+     * Kl mul cases go through __mul32, which pushes the operands onto the
+     * stack via emitload_adj — that reads the operand's slot, NOT A-cache.
+     * Treating non-inlined Kl mul as A-cache-consuming would cause
+     * `mark_dead_stores` to skip the operand's slot store, and __mul32
+     * would multiply uninitialised stack garbage. This was the root cause
+     * of tetris's broken `board[r][c]` indexing post-A1-followup (every
+     * Kl mul of a Kw temp by non-pow2 sizeof). */
     case Omul:
+        if (i->cls == Kl) {
+            if (rtype(i->arg[1]) == RCon) {
+                Con *c = &fn->con[i->arg[1].val];
+                if (c->type == CBits) {
+                    int64_t val = c->bits.i;
+                    /* Match the Kl mul emit's own fast paths: 0, 1, pow2 (< 16). */
+                    if (val == 0 || val == 1)
+                        return 1;
+                    if (val > 0 && val < (1LL << 16) && (val & (val - 1)) == 0)
+                        return 1;
+                }
+            }
+            return 0;
+        }
         if (rtype(i->arg[1]) == RCon) {
             Con *c = &fn->con[i->arg[1].val];
             return is_inline_mul_const(c->bits.i);
