@@ -4083,6 +4083,14 @@ emitins(Ins *i, Fn *fn)
             }
             if (has_retval) {
                 emitstore(i->to, fn);
+                /* Kl call result: A held only the LOW 16 bits; the HIGH
+                 * 16 bits are in tcc__retval_hi (per the Jretl callee
+                 * convention added 2026-05-21). Pull it into A and store
+                 * to the high half of i->to. */
+                if (i->cls == Kl) {
+                    fprintf(outf, "\tlda.b tcc__retval_hi\n");
+                    emit_store_high(i->to, fn);
+                }
             } else {
                 acache_invalidate();
             }
@@ -4195,8 +4203,22 @@ emitjmp(Blk *b, Fn *fn)
     case Jret0:
     case Jretw:
     case Jretl:
-        if (!req(b->jmp.arg, R))
+        if (!req(b->jmp.arg, R)) {
+            /* Kl return convention (added 2026-05-21):
+             *   - LOW 16 bits in A (existing emitload behavior)
+             *   - HIGH 16 bits in `tcc__retval_hi` (global at $00:0xxx)
+             * The caller reads tcc__retval_hi back into A and stores to
+             * the high half of i->to in the Ocall post-call sequence.
+             * Mirrors the mul32_hi / div32_qh pattern but for arbitrary
+             * C functions that return s32/u32.
+             *
+             * For Kw / Kh / Kb returns, only A is used. */
+            if (b->jmp.type == Jretl) {
+                emit_load_high(b->jmp.arg, fn, 0);
+                fprintf(outf, "\tsta.b tcc__retval_hi\n");
+            }
             emitload(b->jmp.arg, fn);
+        }
         break;
     case Jjmp:
         emitphimoves(b, b->s1, fn);
