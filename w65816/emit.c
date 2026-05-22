@@ -2823,8 +2823,19 @@ emitins(Ins *i, Fn *fn)
              *
              * General path: cross-half asl(low) + rol(high) bit-by-bit. */
             if (ref_is_high_zero(r0, fn) && cnt >= 1 && cnt <= 8) {
-                /* new_low = low_orig << cnt   (Kw asl × cnt, in A) */
+                /* new_low = low_orig << cnt   (Kw asl × cnt, in A)
+                 *
+                 * CRITICAL (fixed 2026-05-22): spill low_orig to tcc__r0
+                 * BEFORE the destructive ASL sequence. The high-half
+                 * computation below needs the ORIGINAL low_orig, not the
+                 * shifted A. Without the spill, the second emitload(r0)
+                 * tries to reload from r0's slot — but r0 may be an
+                 * unspilled value (e.g. result of `lda.l table,x`) whose
+                 * slot was never written, reading garbage. Manifested as
+                 * fix32Sin(64) returning 0 instead of FIX32(1).
+                 * See .claude/notes/tech/cc65816_kl_shift_high_half.md. */
                 emitload(r0, fn);
+                fprintf(outf, "\tsta.b tcc__r0\n");
                 for (int j = 0; j < cnt; j++)
                     fprintf(outf, "\tasl a\n");
                 emitstore(i->to, fn);
@@ -2834,7 +2845,7 @@ emitins(Ins *i, Fn *fn)
                  *   low_orig >> (16-cnt). cnt=1 → 7 lsrs, cnt=8 → no lsrs.
                  * For cnt > 8 the formula would need bits from the low byte
                  * of low_orig too, so we fall through to the general path. */
-                emitload(r0, fn);
+                fprintf(outf, "\tlda.b tcc__r0\n");
                 fprintf(outf, "\txba\n");
                 fprintf(outf, "\tand.w #$00FF\n");
                 for (int j = 0; j < 8 - cnt; j++)
