@@ -77,7 +77,12 @@ foldint(Con *res, int op, int w, Con *cl, Con *cr)
 	case Oand:  x = l.u & r.u; break;
 	case Oor:   x = l.u | r.u; break;
 	case Oxor:  x = l.u ^ r.u; break;
-	case Osar:  x = (w ? l.s : (int32_t)l.s) >> (r.u & (31|w<<5)); break;
+	/* w65816 fork: Kl is 32-bit (the target has no 64-bit integer) but QBE marks
+	 * Kl as w=1. A negative 32-bit constant is stored zero-extended in the 64-bit
+	 * con, so the upstream `w ? l.s : (int32_t)l.s` arithmetic-shifts a *positive*
+	 * 64-bit value and drops the sign — e.g. (s32)-256 >> 4 folded to 0x0FFFFFF0
+	 * instead of 0xFFFFFFF0. Force 32-bit signed semantics. (chantier A7 Phase 1) */
+	case Osar:  x = (int32_t)l.s >> (r.u & 31); break;
 	case Oshr:  x = (w ? l.u : (uint32_t)l.u) >> (r.u & (31|w<<5)); break;
 	case Oshl:  x = l.u << (r.u & (31|w<<5)); break;
 	case Oextsb: x = (int8_t)l.u;   break;
