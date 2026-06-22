@@ -561,6 +561,80 @@ ref_is_high_zero(Ref r, Fn *fn)
     return temp_high_zero[idx];
 }
 
+/* === A6 Phase 1: far-pointer taint analysis (provenance, not value) ===
+ * A Kl temp is "far-tainted" if its value may carry a non-zero bank byte — i.e.
+ * it derives from a LOADED pointer value (`%p =l load …`). Bank-$00 addresses
+ * rooted in a symbol / stack / Kw operand are NEVER tainted, so they keep the
+ * fast `lda.l $0000,x` path. A deref through a far-tainted address is lowered as
+ * a 24-bit DP-indirect-long (`[tcc__farptr]`); its bank byte is kept live.
+ * Unlike high-zero this tracks PROVENANCE, so Omul/overflow can't make it unsound
+ * and `arr[i]` (= `add $sym, offset`) stays fast by construction. */
+static int far_tainted[MAX_ALIAS_TEMPS];
+
+static int
+ref_far_tainted(Ref r, Fn *fn)
+{
+    int idx;
+    (void)fn;                           /* symmetry with ref_is_high_zero */
+    if (rtype(r) != RTmp || r.val < Tmp0)
+        return 0;                       /* consts / symbols / vregs: bank-$00 */
+    idx = r.val - Tmp0;
+    if (idx < 0 || idx >= MAX_ALIAS_TEMPS)
+        return 0;
+    return far_tainted[idx];
+}
+
+static void
+mark_far_tainted(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    Phi *p;
+    int idx, n, changed;
+
+    memset(far_tainted, 0, sizeof(far_tainted));
+    /* Seed: a Kl load is a loaded pointer value. */
+    for (b = fn->start; b; b = b->link)
+        for (i = b->ins; i < &b->ins[b->nins]; i++)
+            if (i->op == Oload && i->cls == Kl
+                && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
+                idx = i->to.val - Tmp0;
+                if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+                    far_tainted[idx] = 1;
+            }
+    /* Propagate through add/sub/copy (a tainted operand taints the result) and
+     * phi (any tainted arg). Fixpoint for chains / back-edges. */
+    do {
+        changed = 0;
+        for (b = fn->start; b; b = b->link) {
+            for (i = b->ins; i < &b->ins[b->nins]; i++) {
+                if (i->cls != Kl) continue;
+                if (i->op != Oadd && i->op != Osub && i->op != Ocopy) continue;
+                if (rtype(i->to) != RTmp || i->to.val < Tmp0) continue;
+                idx = i->to.val - Tmp0;
+                if (idx < 0 || idx >= MAX_ALIAS_TEMPS || far_tainted[idx]) continue;
+                if (ref_far_tainted(i->arg[0], fn)
+                    || (i->op != Ocopy && ref_far_tainted(i->arg[1], fn))) {
+                    far_tainted[idx] = 1;
+                    changed = 1;
+                }
+            }
+            for (p = b->phi; p; p = p->link) {
+                if (p->cls != Kl) continue;
+                if (rtype(p->to) != RTmp || p->to.val < Tmp0) continue;
+                idx = p->to.val - Tmp0;
+                if (idx < 0 || idx >= MAX_ALIAS_TEMPS || far_tainted[idx]) continue;
+                for (n = 0; n < (int)p->narg; n++)
+                    if (ref_far_tainted(p->arg[n], fn)) {
+                        far_tainted[idx] = 1;
+                        changed = 1;
+                        break;
+                    }
+            }
+        }
+    } while (changed);
+}
+
 /* Test whether `ref` is a temp marked addr_only — i.e. its defining op
  * (typically Oadd Kl for a + offset) can skip the high-half computation
  * because every consumer is a bank-discarding load/store. */
@@ -670,10 +744,10 @@ mark_addr_only_kl(Fn *fn)
                          * bank-$00 path. A far deref (non-high-zero pointer,
                          * A6 Phase 1) reads the bank byte — so it's a blocking
                          * use and the high half must be kept live. */
-                        is_addr_use = ref_is_high_zero(r, fn); break;
+                        is_addr_use = !ref_far_tainted(r, fn); break;
                     case Oloadsw: case Oloaduw: case Oload:
                         if (i->cls != Kl)
-                            is_addr_use = ref_is_high_zero(r, fn);
+                            is_addr_use = !ref_far_tainted(r, fn);
                         break;
                     case Oextuw: case Oextsw:
                         /* high half of operand is never read (ext reads low) */
@@ -686,7 +760,7 @@ mark_addr_only_kl(Fn *fn)
                     case Ostorel:
                         /* Store address: bank-discarding only on the fast path
                          * (see the load comment above). */
-                        is_addr_use = ref_is_high_zero(r, fn); break;
+                        is_addr_use = !ref_far_tainted(r, fn); break;
                     default: break;
                     }
                 }
@@ -1999,6 +2073,21 @@ emit_mul_body(FILE *outf, int base)
         fprintf(outf, "\tsbc.b tcc__r9\n");
         break;
     }
+}
+
+/* A6 Phase 1: write the 24-bit pointer in `r` to the DP scratch tcc__farptr,
+ * ready for a `lda/sta [tcc__farptr]` (DP-indirect-long) far deref. Clobbers A
+ * (the deref's value, if any, must be (re)loaded AFTER this). Leaves 16-bit A. */
+static void
+emit_farptr_setup(Ref r, Fn *fn)
+{
+    emitload(r, fn);                               /* A = pointer low 16 */
+    fprintf(outf, "\tsta.b tcc__farptr\n");
+    emit_load_high(r, fn, 0);                      /* A = pointer high 16 (bank in low byte) */
+    emit_sep20();
+    fprintf(outf, "\tsta.b tcc__farptr+2\n");      /* bank byte */
+    emit_rep20();
+    acache_invalidate();
 }
 
 /*
@@ -3527,6 +3616,14 @@ emitins(Ins *i, Fn *fn)
                     fprintf(outf, "\tsta.l $%06lX\n",
                             (unsigned long)c->bits.i + 2);
                 }
+            } else if (ref_far_tainted(r1, fn)) {
+                /* A6 far path: store both halves via [tcc__farptr] (24-bit). */
+                emit_farptr_setup(r1, fn);               /* farptr = dest addr */
+                emitload(r0, fn);                        /* A = value low16 */
+                fprintf(outf, "\tsta [tcc__farptr]\n");
+                emit_load_high(r0, fn, 0);               /* A = value high16 */
+                fprintf(outf, "\tldy.w #2\n");
+                fprintf(outf, "\tsta [tcc__farptr],y\n");
             } else {
                 /* Address in temp — push low value, load high to A,
                  * push it too, then pop both in order via X-indirect. */
@@ -3567,6 +3664,7 @@ emitins(Ins *i, Fn *fn)
         {
             int aslot_r1 = getallocslot(r1, fn);
             if (aslot_r1 < 0 && !isvreg(r1) && rtype(r1) != RCon
+                && !ref_far_tainted(r1, fn)
                 && acache_has(r1)) {
                 fprintf(outf, "\ttax\n");
                 acache_invalidate();
@@ -3575,6 +3673,14 @@ emitins(Ins *i, Fn *fn)
                 acache_invalidate();
                 break;
             }
+        }
+        if (rtype(r1) == RTmp && r1.val >= Tmp0 && ref_far_tainted(r1, fn)) {
+            /* A6 far path: 16-bit store via [tcc__farptr] (address first). */
+            emit_farptr_setup(r1, fn);          /* farptr = dest addr; clobbers A */
+            emitload(r0, fn);                   /* A = value */
+            fprintf(outf, "\tsta [tcc__farptr]\n");
+            acache_invalidate();
+            break;
         }
         emitload(r0, fn);
         {
@@ -3659,6 +3765,14 @@ emitins(Ins *i, Fn *fn)
                     /* Literal address */
                     fprintf(outf, "\tsta.l $%06lX\n", (unsigned long)c->bits.i);
                 }
+            } else if (ref_far_tainted(r1, fn)) {
+                /* A6 far byte store: address-first (avoids the 8-bit pha stack
+                 * shift), then reload the value and store via [tcc__farptr]. */
+                emit_rep20();                   /* 16-bit for farptr setup */
+                emit_farptr_setup(r1, fn);      /* farptr = addr; clobbers A */
+                emitload(r0, fn);               /* reload value (16-bit) */
+                emit_sep20();                   /* 8-bit for byte store */
+                fprintf(outf, "\tsta [tcc__farptr]\n");
             } else {
                 /* Address in temp - indirect store */
                 /* A already has the value, load addr to X, then store */
@@ -3789,6 +3903,10 @@ emitins(Ins *i, Fn *fn)
                 if (c->bits.i)
                     fprintf(outf, "+%d", (int)c->bits.i);
                 fprintf(outf, "\n");
+            } else if (ref_far_tainted(r0, fn)) {
+                /* A6 far path: 16-bit load via [tcc__farptr] (24-bit). */
+                emit_farptr_setup(r0, fn);
+                fprintf(outf, "\tlda [tcc__farptr]\n");
             } else {
                 /* Address in temp - indirect load */
                 emitload(r0, fn);
@@ -3816,24 +3934,19 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "+%d", (int)c->bits.i);
             fprintf(outf, "\n");
             emit_rep20();
-        } else if (ref_is_high_zero(r0, fn)) {
-            /* Pointer provably bank-$00 — fast path (load addr, indirect via X) */
+        } else if (!ref_far_tainted(r0, fn)) {
+            /* Not far-tainted (bank-$00) — fast path (load addr, indirect via X) */
             emitload(r0, fn);  /* Load pointer value to A */
             fprintf(outf, "\ttax\n");  /* Transfer to X */
             emit_sep20();
             fprintf(outf, "\tlda.l $0000,x\n");  /* Load byte from memory */
             emit_rep20();
         } else {
-            /* A6 far path: pointer bank byte is live — 24-bit deref via the
-             * dedicated DP scratch tcc__farptr + DP-indirect-long. */
-            emitload(r0, fn);                              /* A = ptr low16 */
-            fprintf(outf, "\tsta.b tcc__farptr\n");
-            emit_load_high(r0, fn, 0);                     /* A = ptr high16 (bank low) */
+            /* A6 far path: pointer carries a live bank byte — 24-bit deref. */
+            emit_farptr_setup(r0, fn);
             emit_sep20();
-            fprintf(outf, "\tsta.b tcc__farptr+2\n");      /* bank byte */
             fprintf(outf, "\tlda [tcc__farptr]\n");        /* byte load (8-bit A) */
             emit_rep20();
-            acache_invalidate();
         }
         fprintf(outf, "\tand.w #$00FF\n");  /* Zero extend */
         if (i->op == Oloadsb) {
@@ -4468,6 +4581,7 @@ w65816_emitfn(Fn *fn, FILE *f)
     build_alias_table(fn);
     mark_dead_stores(fn);
     mark_high_zero(fn);
+    mark_far_tainted(fn);
     mark_addr_only_kl(fn);
     caller_param_bytes = count_fn_param_bytes(fn);
 
