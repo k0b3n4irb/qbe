@@ -463,24 +463,73 @@ count_temp_uses(Fn *fn)
  * No propagation through Ocopy / Ophi for the MVP — the pattern of
  * interest (Oextuw immediately consumed by Omul Kl pow2) doesn't pass
  * through copies. */
+/* Operand high-zero test used INSIDE mark_high_zero's fixpoint (reads the
+ * in-progress temp_high_zero[]). A C symbol address (CAddr) counts as high-zero:
+ * by the SDK model all C symbols live in bank $00 (chantier A6 Phase 1 — far
+ * DATA is reached through pointer VALUES, which are loadl'd and never marked). */
+static int
+operand_high_zero_inpass(Ref r, Fn *fn)
+{
+    int idx;
+    if (rtype(r) == RCon) {
+        Con *c = &fn->con[r.val];
+        if (c->type == CAddr)
+            return 1;                                   /* bank-$00 C symbol */
+        if (c->type == CBits)
+            return ((c->bits.i >> 16) & 0xFFFF) == 0;
+        return 0;
+    }
+    if (rtype(r) != RTmp || r.val < Tmp0)
+        return 0;
+    if (fn->tmp[r.val].cls == Kw)
+        return 1;                                       /* Kw → zero-extended */
+    idx = r.val - Tmp0;
+    if (idx < 0 || idx >= MAX_ALIAS_TEMPS)
+        return 0;
+    return temp_high_zero[idx];
+}
+
 static void
 mark_high_zero(Fn *fn)
 {
     Blk *b;
     Ins *i;
-    int idx;
+    int idx, changed;
 
     memset(temp_high_zero, 0, sizeof(temp_high_zero));
+    /* Seed: Oextuw (zero-extend word to long). */
     for (b = fn->start; b; b = b->link) {
         for (i = b->ins; i < &b->ins[b->nins]; i++) {
-            if (i->op != Oextuw) continue;
-            if (i->cls != Kl) continue;
+            if (i->op != Oextuw || i->cls != Kl) continue;
             if (rtype(i->to) != RTmp || i->to.val < Tmp0) continue;
             idx = i->to.val - Tmp0;
             if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
                 temp_high_zero[idx] = 1;
         }
     }
+    /* Propagate through Oadd Kl: base + offset where BOTH halves are high-zero
+     * stays high-zero (the address arithmetic for `arr[i]` / `&sym + i`). This
+     * keeps such derefs on the fast bank-$00 path (A6 Phase 1 dispatch). Sound
+     * under the same no-bank-$FFFF-wrap assumption the fast path already relies
+     * on. Osub is intentionally NOT propagated (a borrow can set the bank bits).
+     * Fixpoint to cover add chains (add(add(...),...)). */
+    do {
+        changed = 0;
+        for (b = fn->start; b; b = b->link) {
+            for (i = b->ins; i < &b->ins[b->nins]; i++) {
+                if (i->op != Oadd || i->cls != Kl) continue;
+                if (rtype(i->to) != RTmp || i->to.val < Tmp0) continue;
+                idx = i->to.val - Tmp0;
+                if (idx < 0 || idx >= MAX_ALIAS_TEMPS || temp_high_zero[idx])
+                    continue;
+                if (operand_high_zero_inpass(i->arg[0], fn)
+                    && operand_high_zero_inpass(i->arg[1], fn)) {
+                    temp_high_zero[idx] = 1;
+                    changed = 1;
+                }
+            }
+        }
+    } while (changed);
 }
 
 /* Test whether a Ref's high half (when read in Kl context) is statically
@@ -617,13 +666,17 @@ mark_addr_only_kl(Fn *fn)
                     switch (i->op) {
                     case Oloadsb: case Oloadub:
                     case Oloadsh: case Oloaduh:
-                        is_addr_use = 1; break;
+                        /* Deref address: bank-discarding ONLY on the fast
+                         * bank-$00 path. A far deref (non-high-zero pointer,
+                         * A6 Phase 1) reads the bank byte — so it's a blocking
+                         * use and the high half must be kept live. */
+                        is_addr_use = ref_is_high_zero(r, fn); break;
                     case Oloadsw: case Oloaduw: case Oload:
                         if (i->cls != Kl)
-                            is_addr_use = 1;
+                            is_addr_use = ref_is_high_zero(r, fn);
                         break;
                     case Oextuw: case Oextsw:
-                        /* high half of operand is never read */
+                        /* high half of operand is never read (ext reads low) */
                         is_addr_use = 1; break;
                     default: break;
                     }
@@ -631,7 +684,9 @@ mark_addr_only_kl(Fn *fn)
                     switch (i->op) {
                     case Ostoreb: case Ostoreh: case Ostorew:
                     case Ostorel:
-                        is_addr_use = 1; break;
+                        /* Store address: bank-discarding only on the fast path
+                         * (see the load comment above). */
+                        is_addr_use = ref_is_high_zero(r, fn); break;
                     default: break;
                     }
                 }
@@ -3761,13 +3816,24 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "+%d", (int)c->bits.i);
             fprintf(outf, "\n");
             emit_rep20();
-        } else {
-            /* Pointer in stack slot - load addr, then indirect through X */
+        } else if (ref_is_high_zero(r0, fn)) {
+            /* Pointer provably bank-$00 — fast path (load addr, indirect via X) */
             emitload(r0, fn);  /* Load pointer value to A */
             fprintf(outf, "\ttax\n");  /* Transfer to X */
             emit_sep20();
             fprintf(outf, "\tlda.l $0000,x\n");  /* Load byte from memory */
             emit_rep20();
+        } else {
+            /* A6 far path: pointer bank byte is live — 24-bit deref via the
+             * dedicated DP scratch tcc__farptr + DP-indirect-long. */
+            emitload(r0, fn);                              /* A = ptr low16 */
+            fprintf(outf, "\tsta.b tcc__farptr\n");
+            emit_load_high(r0, fn, 0);                     /* A = ptr high16 (bank low) */
+            emit_sep20();
+            fprintf(outf, "\tsta.b tcc__farptr+2\n");      /* bank byte */
+            fprintf(outf, "\tlda [tcc__farptr]\n");        /* byte load (8-bit A) */
+            emit_rep20();
+            acache_invalidate();
         }
         fprintf(outf, "\tand.w #$00FF\n");  /* Zero extend */
         if (i->op == Oloadsb) {
