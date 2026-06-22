@@ -3266,6 +3266,15 @@ emitins(Ins *i, Fn *fn)
         if (!req(i->to, r0)) {
             emitload(r0, fn);
             emitstore(i->to, fn);
+            /* Kl copy: also move the HIGH half unless it is provably dead
+             * (addr_only = bank-$00 pointer whose bank is never read). Without
+             * this a far-tainted pointer (or a u32 value) copied via Ocopy —
+             * including phi-resolved moves — keeps a stale high half, so a later
+             * far deref reads the wrong bank. (chantier A6 attempt #3) */
+            if (i->cls == Kl && !ref_to_is_addr_only(i->to)) {
+                emit_load_high(r0, fn, 0);
+                emit_store_high(i->to, fn);
+            }
         }
         break;
 
