@@ -641,13 +641,15 @@ mark_far_tainted(Fn *fn)
 static int
 ref_to_is_addr_only(Ref r)
 {
-    int idx;
-    if (rtype(r) != RTmp || r.val < Tmp0)
-        return 0;
-    idx = r.val - Tmp0;
-    if (idx < 0 || idx >= MAX_ALIAS_TEMPS)
-        return 0;
-    return temp_addr_only[idx];
+    /* A6 Tier 2 spike (uniform Kl moves): disable the high-half-skip
+     * optimization entirely. With far addressing, a pointer's high half is the
+     * bank byte and must survive EVERY Kl move/copy/phi/materialisation — the
+     * per-site addr_only gating (attempts #1–#3) kept missing a move site and
+     * dropping the bank. Forcing this to 0 makes all Kl values carry both halves
+     * unconditionally (correctness first); the addr_only narrowing is re-added
+     * later, proven safe, to recover the cycles. */
+    return 0;
+    (void)r;
 }
 
 /* Pre-pass: mark Kl temps whose every use is the address operand of a
