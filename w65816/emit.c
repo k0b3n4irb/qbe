@@ -615,7 +615,12 @@ mark_addr_only_kl(Fn *fn)
                 int is_addr_use = 0;
                 if (a == 0) {
                     switch (i->op) {
-                    case Oloadsb: case Oloadub:
+                    /* A6 Tier 2, cell #1: byte loads are NO LONGER bank-
+                     * discarding — Oloadsb/Oloadub now deref via the 24-bit
+                     * `lda [tcc__r9]` path (bank-aware), so their address temp
+                     * must keep its high half (the bank byte). The word/half
+                     * loads still hardcode bank $00 (future cells), so they
+                     * stay classified as address uses here. */
                     case Oloadsh: case Oloaduh:
                         is_addr_use = 1; break;
                     case Oloadsw: case Oloaduw: case Oload:
@@ -3762,11 +3767,17 @@ emitins(Ins *i, Fn *fn)
             fprintf(outf, "\n");
             emit_rep20();
         } else {
-            /* Pointer in stack slot - load addr, then indirect through X */
-            emitload(r0, fn);  /* Load pointer value to A */
-            fprintf(outf, "\ttax\n");  /* Transfer to X */
+            /* A6 Tier 2, cell #1: 24-bit pointer in temp/slot — copy the full
+             * 3-byte pointer to tcc__r9 and deref with `lda [tcc__r9]`, so the
+             * byte read lands in the pointer's actual bank instead of the
+             * bank-$00-hardcoded `lda.l $0000,x`. Mirrors the Kl-load else path.
+             * Pointer halves loaded in 16-bit mode; byte read in 8-bit mode. */
+            emitload(r0, fn);              /* low 16 of pointer */
+            fprintf(outf, "\tsta.b tcc__r9\n");
+            emit_load_high(r0, fn, 0);     /* bank byte (Kl high half) */
+            fprintf(outf, "\tsta.b tcc__r9+2\n");
             emit_sep20();
-            fprintf(outf, "\tlda.l $0000,x\n");  /* Load byte from memory */
+            fprintf(outf, "\tlda [tcc__r9]\n");  /* Load byte from pointer's bank */
             emit_rep20();
         }
         fprintf(outf, "\tand.w #$00FF\n");  /* Zero extend */
