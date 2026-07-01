@@ -134,6 +134,12 @@ inline_record(Fn *fn)
         r->blk_count++;
         if (b->phi) r->has_phis = 1;
         for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            /* Debug metadata (dbgloc) is zero-cost and must NOT affect inlinability,
+             * else a debug build inlines differently from release — and a C99
+             * `inline` helper sitting on the size threshold (e.g. colorMathEnable)
+             * would spill a standalone external definition, duplicating the symbol
+             * the canonical .c already emits (link error). */
+            if (i->op == Odbgloc) continue;
             r->ins_count++;
             if (i->op == Ocall) r->has_calls = 1;
             if (isalloc(i->op)) r->has_allocs = 1;
