@@ -19,6 +19,11 @@
 
 Target T;
 
+/* Cooper -g: keep C locals memory-resident for source-level debugging by
+ * suppressing the promote() pass (allocas would otherwise become SSA temps with
+ * no stable address). Debug builds only; trades optimisation for inspectability. */
+static int keeplocals;
+
 #ifdef HAS_BACKTRACE
 /* Diagnostic signal handler: when QBE crashes on a host where reproducing
  * the failure locally is hard (macOS arm64 strict alignment), we want a
@@ -203,7 +208,8 @@ func(Fn *fn)
 	T.abi0(fn);
 	fillcfg(fn);
 	filluse(fn);
-	promote(fn);
+	if (!keeplocals)
+		promote(fn);
 	filluse(fn);
 	ssa(fn);
 	filluse(fn);
@@ -306,8 +312,11 @@ main(int ac, char *av[])
 
 	T = Deftgt;
 	outf = stdout;
-	while ((c = getopt(ac, av, "hd:o:t:")) != -1)
+	while ((c = getopt(ac, av, "ghd:o:t:")) != -1)
 		switch (c) {
+		case 'g':
+			keeplocals = 1;
+			break;
 		case 'd':
 			for (; *optarg; optarg++)
 				if (isalpha(*optarg)) {
