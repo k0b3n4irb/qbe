@@ -4130,6 +4130,15 @@ emitins(Ins *i, Fn *fn)
         }
         break;
 
+    case Odbgloc:
+        /* Cooper source-level debug: emit the C source line as a WLA-safe comment
+         * (NOT the shared `.loc`, which WLA can't parse). The line is an RInt ref
+         * (parse.c stores `arg[0] = INT(line)`). Cooper joins these comments with
+         * the .sym PC->asm-line table to get PC->C-line. */
+        if (rtype(i->arg[0]) == RInt)
+            fprintf(outf, "\t; @cline %d\n", rsval(i->arg[0]));
+        break;
+
     default:
         fprintf(outf, "\t; unhandled op %d\n", i->op);
         acache_invalidate();
@@ -4430,7 +4439,14 @@ w65816_emitfn(Fn *fn, FILE *f)
             fn->name, framesize, fn->slot, w65816_alloc_slots, fn->leaf, leaf_opt);
     for (int t = Tmp0; t < fn->ntmp; t++) {
         int aslot = (t - Tmp0 >= 0 && t - Tmp0 < MAX_ALLOC_TEMPS) ? allocslot[t - Tmp0] : -1;
+        const char *nm = fn->tmp[t].name;
         fprintf(outf, "; temp %d: slot=%d, alloc=%d\n", t, fn->tmp[t].slot, aslot);
+        /* Cooper -g: a named alloc temp is a C local kept in memory. Surface its
+         * name (cproc-encoded "typecode_cname.id") and stack-frame byte offset
+         * (allocslot+1)*2 from the frame base, for the debugger's Locals view. */
+        if (aslot >= 0 && nm[0] >= 'a' && nm[0] <= 'z') {
+            fprintf(outf, "; @dbglocal %s %d\n", nm, (aslot + 1) * 2);
+        }
     }
     fprintf(outf, ".SECTION \".text.%s\" SUPERFREE\n", fn->name);
     /* Tell WLA-DX that registers are 16-bit (65816 native mode ABI).
