@@ -191,11 +191,16 @@ static int reftype_emit_size[] = {
 	[DL] = 3,  /* .dl <sym>  — 24-bit address */
 };
 
+/* NOTE: WLA-DX's `.dl` writes 24-bit values for NUMBERS too (verified
+ * empirically: `.dl 0` in a struct produced a 3-byte hole — the anim.h
+ * AnimClip NULL-durations field, 2026-07-07). The old table claimed 4
+ * bytes, so numeric DW/DL fields got NO pad (dtype_size 4 - "4" = 0)
+ * and, worse, values above 24 bits would be silently truncated. Numeric
+ * DW/DL are therefore emitted as two explicit `.dw` halves (see below)
+ * and this table only covers DB/DH. */
 static int numtype_emit_size[] = {
 	[DB] = 1,  /* .db <n>  */
 	[DH] = 2,  /* .dw <n>  */
-	[DW] = 4,  /* .dl <n>  */
-	[DL] = 4,  /* .dl <n>  — 32-bit literal, dtype_size says 8 → pad */
 };
 
 static void
@@ -233,9 +238,20 @@ emit_init_data(FILE *f)
 		} else {
 			/* Numeric value */
 			type = init_items[i].type;
-			fprintf(f, "%s %"PRId64"\n",
-				dtoa[type], init_items[i].num);
-			pad = dtype_size[type] - numtype_emit_size[type];
+			if (type == DW || type == DL) {
+				/* 32-bit literal: two .dw halves — right-sized
+				 * (4 bytes, matching dtype_size) and immune to
+				 * WLA `.dl`'s 24-bit truncation. */
+				fprintf(f, "\t.dw %"PRId64"\n",
+					init_items[i].num & 0xFFFF);
+				fprintf(f, "\t.dw %"PRId64"\n",
+					(init_items[i].num >> 16) & 0xFFFF);
+				pad = dtype_size[type] - 4;
+			} else {
+				fprintf(f, "%s %"PRId64"\n",
+					dtoa[type], init_items[i].num);
+				pad = dtype_size[type] - numtype_emit_size[type];
+			}
 			if (pad > 0)
 				fprintf(f, "\t.dsb %d, 0\n", pad);
 		}
