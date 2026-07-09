@@ -3762,8 +3762,18 @@ emitins(Ins *i, Fn *fn)
             fprintf(outf, "\n");
             emit_rep20();
         } else {
-            /* Pointer in stack slot - load addr, then indirect through X */
-            emitload(r0, fn);  /* Load pointer value to A */
+            /* Pointer in stack slot - load addr, then indirect through X.
+             * The address load MUST be 16-bit: a preceding Ostoreb leaves
+             * A in 8-bit mode (it deliberately doesn't restore — see its
+             * emit), and emitins() exempts byte ops from the entry
+             * emit_rep20(). Without this rep the 16-bit `lda addr,s` loads
+             * only the pointer's LOW byte and `tax` keeps a stale high
+             * byte, so the deref reads the wrong page (issue #99). The
+             * Ostoreb store-indirect path does the same emit_rep20() before
+             * its address load; this mirrors it. emit_rep20() is a no-op
+             * when already 16-bit, so the common path costs nothing. */
+            emit_rep20();
+            emitload(r0, fn);  /* Load pointer value to A (16-bit) */
             fprintf(outf, "\ttax\n");  /* Transfer to X */
             emit_sep20();
             fprintf(outf, "\tlda.l $0000,x\n");  /* Load byte from memory */
