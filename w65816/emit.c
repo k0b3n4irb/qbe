@@ -824,33 +824,48 @@ is_nop_instruction(Ins *i)
 {
     int idx;
 
-    /* Alloc with param-shadow → nop when frameless */
-    if (i->op == Oalloc4 || i->op == Oalloc8 || i->op == Oalloc16) {
-        if (rtype(i->to) == RTmp && i->to.val >= Tmp0) {
-            idx = i->to.val - Tmp0;
-            if (idx >= 0 && idx < MAX_ALIAS_TEMPS && alloc_param[idx] != 0)
-                return 1;
-        }
-        return 0;
-    }
+    /* CRITICAL INVARIANT: every rule below must mirror its emission-side
+     * skip condition EXACTLY (same op, same leaf_opt gate, same cls
+     * restriction). An instruction the emitter actually emits clobbers A
+     * and retags the A-cache; treating it as a nop lets mark_dead_stores
+     * Case 2 elide the spill of a value whose slot the real consumer then
+     * reads back — uninitialised. Caught 2026-07-19 (audio v2 chantier):
+     * `extuw` producing Kl (a far-store pointer) is REAL code (the Kl
+     * skip requires cls != Kl at emission) but was nop-listed here, so
+     * the preceding loadw's spill was dropped and audioGetSampleInfo
+     * stored garbage. When in doubt return 0 — a missed nop only costs
+     * one redundant sta, a wrong nop miscompiles. */
 
-    /* Copy with aliased source → skipped */
-    if (i->op == Ocopy && rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0) {
+    /* Alloc: the emission-side skip is `framesize == 0`, decided AFTER
+     * this analysis runs (the frameless pass). Conservative: never a
+     * nop. Allocs live in the entry-block prologue, so Case 2 patterns
+     * (def immediately followed by consumer) span them essentially
+     * never — measured zero corpus churn when this rule was dropped. */
+    if (i->op == Oalloc4 || i->op == Oalloc8 || i->op == Oalloc16)
+        return 0;
+
+    /* Copy with aliased source → skipped at emission under leaf_opt. */
+    if (leaf_opt && i->op == Ocopy
+        && rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0) {
         idx = i->arg[0].val - Tmp0;
         if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0)
             return 1;
     }
 
-    /* Store into param-shadow alloc → skipped */
-    if ((i->op == Ostorew || i->op == Ostoreh)
+    /* Store into param-shadow alloc → skipped at emission under leaf_opt. */
+    if (leaf_opt && (i->op == Ostorew || i->op == Ostoreh)
         && rtype(i->arg[1]) == RTmp && i->arg[1].val >= Tmp0) {
         idx = i->arg[1].val - Tmp0;
         if (idx >= 0 && idx < MAX_ALIAS_TEMPS && alloc_param[idx] != 0)
             return 1;
     }
 
-    /* Load from param slot or param-shadow alloc → aliased, skipped */
-    if (i->op == Oloadsw || i->op == Oloaduw || i->op == Oload) {
+    /* Load from param slot or param-shadow alloc → aliased, skipped at
+     * emission under leaf_opt. The Kl pair-load path (Oload with
+     * cls == Kl) runs BEFORE the alias skips at emission and always
+     * emits — exclude it. */
+    if (leaf_opt && (i->op == Oloadsw || i->op == Oloaduw
+                     || (i->op == Oload && i->cls != Kl))) {
         if (rtype(i->arg[0]) == RSlot && rsval(i->arg[0]) < 0)
             return 1;
         if (rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0) {
@@ -860,10 +875,13 @@ is_nop_instruction(Ins *i)
         }
     }
 
-    /* No-op extensions with aliased source → skipped.
-     * NOTE: Oextub/Oextsb excluded — they emit real code (AND/sign-extend). */
-    if ((i->op == Oextuh || i->op == Oextsh
-         || i->op == Oextsw || i->op == Oextuw)
+    /* No-op extensions with aliased source → skipped at emission under
+     * leaf_opt AND ONLY for non-Kl results (a Kl ext materialises the
+     * low half + zero/sign high — real code). Oextub/Oextsb excluded —
+     * they emit real code (AND/sign-extend) in every class. */
+    if (leaf_opt && i->cls != Kl
+        && (i->op == Oextuh || i->op == Oextsh
+            || i->op == Oextsw || i->op == Oextuw)
         && rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0) {
         idx = i->arg[0].val - Tmp0;
         if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0)
@@ -1019,6 +1037,7 @@ mark_dead_stores(Fn *fn)
 
             /* Case 1: never used as operand (jnz/ret not counted here) */
             if (temp_use_count[idx] == 0 && !temp_is_retval[idx]) {
+                if (getenv("QBE_DBG_DEAD")) fprintf(stderr, "DEADSTORE case1 tmp%d\n", idx);
                 temp_is_dead_store[idx] = 1;
                 continue;
             }
@@ -1034,6 +1053,7 @@ mark_dead_stores(Fn *fn)
                     && next->arg[0].val >= Tmp0
                     && (next->arg[0].val - Tmp0) == idx
                     && consumes_r0_via_emitload(next, fn)) {
+                    if (getenv("QBE_DBG_DEAD")) fprintf(stderr, "DEADSTORE case2 tmp%d (next op %d)\n", idx, next->op);
                     temp_is_dead_store[idx] = 1;
                 }
             }
@@ -1737,6 +1757,7 @@ emitstore(Ref r, Fn *fn)
         && fn->tmp[r.val].cls != Kl) {
         int idx = r.val - Tmp0;
         if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
+            if (getenv("QBE_DBG_DEAD")) fprintf(stderr, "ELIDE leaf-alias tmp%d\n", idx);
             acache_set(r);
             return;
         }
@@ -1760,6 +1781,7 @@ emitstore(Ref r, Fn *fn)
         && fn->tmp[r.val].cls != Kl) {
         int idx = r.val - Tmp0;
         if (idx == skip_dead_retstore_temp) {
+            if (getenv("QBE_DBG_DEAD")) fprintf(stderr, "ELIDE retstore tmp%d\n", idx);
             acache_set(r);
             return;
         }
@@ -1775,6 +1797,8 @@ emitstore(Ref r, Fn *fn)
             if (slot >= 0) {
                 emit_stack_store((slot + 1) * 2, 0);
                 stored = 1;
+            } else if (getenv("QBE_DBG_DEAD")) {
+                fprintf(stderr, "SILENT-NOSLOT tmp%d\n", r.val - Tmp0);
             }
         }
         break;
@@ -1957,6 +1981,12 @@ emitins(Ins *i, Fn *fn)
 
     r0 = i->arg[0];
     r1 = i->arg[1];
+
+    if (getenv("QBE_DBG_DEAD"))
+        fprintf(outf, "\t; IR op=%d to=t%d a0=t%d a1=t%d\n", i->op,
+                rtype(i->to) == RTmp ? i->to.val : -1,
+                rtype(r0) == RTmp ? r0.val : -1,
+                rtype(r1) == RTmp ? r1.val : -1);
 
     /* Ensure 16-bit A mode before each instruction.
      * Byte operations (Ostoreb, Oloadsb, Oloadub) switch to 8-bit internally.
@@ -4150,9 +4180,15 @@ emitins(Ins *i, Fn *fn)
         break;
 
     default:
-        fprintf(outf, "\t; unhandled op %d\n", i->op);
-        acache_invalidate();
-        break;
+        /* An op this emitter can't lower is a MISCOMPILATION, not a
+         * comment: the historical fallthrough silently dropped struct
+         * assignments (Oblit0/Oblit1, op 60/61 — caught 2026-07-19 via
+         * audioGetSampleInfo returning garbage). Fail the build. */
+        fprintf(stderr,
+                "cc65816/qbe: unhandled IR op %d in function emission — "
+                "refusing to emit silently-wrong code (struct assignment "
+                "is not supported yet; copy field-by-field)\n", i->op);
+        exit(1);
     }
 
     /* A-cache is now maintained entirely by emitstore() (sets on store)
