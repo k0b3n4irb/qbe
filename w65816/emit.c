@@ -891,6 +891,98 @@ is_nop_instruction(Ins *i)
     return 0;
 }
 
+/* Forward declarations for the byte-pair store fusion below (the
+ * definitions live further down with the emission machinery). */
+static void emitload(Ref r, Fn *fn);
+static void emit_rep20(void);
+static void emit_sep20(void);
+
+/* Emit `sta` to a constant address (symbol or literal), 8-bit A assumed.
+ * Shared by the byte-pair store fusion and mirrored on Ostoreb's forms. */
+static void
+emit_sta_conaddr(Fn *fn, Ref r)
+{
+    Con *c = &fn->con[r.val];
+    if (c->type == CAddr) {
+        fprintf(outf, "\tsta.w %s", stripsym(str(c->sym.id)));
+        if (c->bits.i)
+            fprintf(outf, "+%d", (int)c->bits.i);
+        fprintf(outf, "\n");
+    } else {
+        fprintf(outf, "\tsta.l $%06lX\n", (unsigned long)c->bits.i);
+    }
+}
+
+/* Byte-pair store fusion (C1 audit, 2026-07-19). The C idiom for a
+ * 16-bit value written to 8-bit MMIO as two bytes —
+ *     storeb %v, [constA]
+ *     %h =w shr %v, 8        (single use)
+ *     storeb %h, [constB]
+ * — otherwise emits two independent byte stores with a rep / lda /
+ * xba / and re-materialisation of the high byte in between (~39
+ * cycles). Fused: ONE 16-bit load, sep, sta, xba, sta (~21 cycles),
+ * the whole pair in a single 8-bit stretch. This is the PPU
+ * double-write pattern (M7x, M7HOFS, VRAM port pairs...), so it fires
+ * across every MMIO-heavy module.
+ *
+ * Returns 1 (and emits the fused sequence) when the triple matches;
+ * the caller then skips the two consumed instructions. Constraints:
+ * const store addresses only, shift amount exactly 8, non-Kl, and the
+ * high-byte temp used exactly once (by the second store). */
+static int
+try_fuse_bytepair_store(Ins *i, Blk *b, Fn *fn)
+{
+    Ins *i1, *i2;
+    Con *c;
+    int hidx;
+
+    if (i + 2 >= &b->ins[b->nins])
+        return 0;
+    i1 = i + 1;
+    i2 = i + 2;
+
+    if (i->op != Ostoreb || rtype(i->arg[1]) != RCon)
+        return 0;
+    if (rtype(i->arg[0]) != RTmp && rtype(i->arg[0]) != RSlot)
+        return 0;
+
+    if ((i1->op != Oshr && i1->op != Osar) || i1->cls == Kl)
+        return 0;
+    if (!req(i1->arg[0], i->arg[0]))
+        return 0;
+    if (rtype(i1->arg[1]) != RCon)
+        return 0;
+    c = &fn->con[i1->arg[1].val];
+    if (c->type != CBits || c->bits.i != 8)
+        return 0;
+    if (rtype(i1->to) != RTmp || i1->to.val < Tmp0)
+        return 0;
+
+    if (i2->op != Ostoreb || rtype(i2->arg[1]) != RCon)
+        return 0;
+    if (!req(i2->arg[0], i1->to))
+        return 0;
+
+    hidx = i1->to.val - Tmp0;
+    if (hidx < 0 || hidx >= MAX_ALIAS_TEMPS)
+        return 0;
+    if (temp_use_count[hidx] != 1 || temp_is_retval[hidx])
+        return 0;
+
+    if (getenv("QBE_DBG_DEAD"))
+        fprintf(stderr, "FUSE bytepair store (tmp%d)\n", hidx);
+
+    emit_rep20();
+    emitload(i->arg[0], fn);    /* 16-bit value (acache hit if fresh) */
+    emit_sep20();
+    emit_sta_conaddr(fn, i->arg[1]);    /* low byte */
+    fprintf(outf, "\txba\n");
+    emit_sta_conaddr(fn, i2->arg[1]);   /* high byte */
+    /* stay in 8-bit like Ostoreb does — emitins re-reps as needed */
+    acache_invalidate();
+    return 1;
+}
+
 /* Check if a constant multiply value will be inlined (emitload(r0) first).
  * Returns 1 for values handled by shift-add patterns and composite decomposition.
  * Returns 0 for values that fall through to __mul16 (loads r1 first). */
@@ -4583,6 +4675,14 @@ w65816_emitfn(Fn *fn, FILE *f)
                     fused_cmp_r1 = i->arg[1];
                     continue;  /* skip emitins for this comparison */
                 }
+            }
+
+            /* Byte-pair store fusion: storeb v + shr v,8 + storeb h
+             * into one 16-bit load + sep/sta/xba/sta (PPU double-write
+             * idiom). Consumes the two following instructions. */
+            if (try_fuse_bytepair_store(i, b, fn)) {
+                i += 2;
+                continue;
             }
 
             /* Dead return store elimination: detect last instruction
