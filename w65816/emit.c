@@ -899,6 +899,7 @@ is_nop_instruction(Ins *i)
 /* Forward declarations for the byte-pair store fusion below (the
  * definitions live further down with the emission machinery). */
 static void emitload(Ref r, Fn *fn);
+static void emitstore(Ref r, Fn *fn);
 static void emit_rep20(void);
 static void emit_sep20(void);
 
@@ -931,6 +932,96 @@ emit_cst_ptr_setup(Ref r0, Fn *fn)
     emit_load_high(r0, fn, 0);
     fprintf(outf, "\tsta.b tcc__r9+2\n");
     acache_invalidate();
+}
+
+/* Indexed-long load fusion (#121 follow-up). The C idiom for reading
+ * a const array —
+ *     %a =l add $sym, %idx      (single use)
+ *     %v =w cst load* [%a]
+ * — otherwise pays the full [tcc__r9] far setup (~25 cyc). Absolute
+ * long INDEXED addressing does it in one instruction: the hardware
+ * adds X to the complete 24-bit address (bank carries included), so
+ *     emitload(%idx) ; tax ; lda.l sym+off,x
+ * is bank-correct for any placement and any index. Byte and 16-bit
+ * word loads; Kl (4-byte) loads keep the generic path.
+ *
+ * Returns 1 (sequence emitted, result stored) when the pair matches;
+ * the caller skips the consumed load. */
+static int
+try_fuse_cst_index_load(Ins *i, Blk *b, Fn *fn)
+{
+    Ins *ld;
+    Con *c;
+    Ref sym, idx;
+    int aidx;
+
+    if (i + 1 >= &b->ins[b->nins])
+        return 0;
+    ld = i + 1;
+
+    if (i->op != Oadd || i->cls != Kl)
+        return 0;
+    if (rtype(i->to) != RTmp || i->to.val < Tmp0)
+        return 0;
+
+    /* one operand a CAddr constant, the other a temp index */
+    if (rtype(i->arg[0]) == RCon && fn->con[i->arg[0].val].type == CAddr
+        && rtype(i->arg[1]) == RTmp) {
+        sym = i->arg[0];
+        idx = i->arg[1];
+    } else if (rtype(i->arg[1]) == RCon
+               && fn->con[i->arg[1].val].type == CAddr
+               && rtype(i->arg[0]) == RTmp) {
+        sym = i->arg[1];
+        idx = i->arg[0];
+    } else {
+        return 0;
+    }
+
+    if (!(ld->volat & 2) || ld->cls == Kl)
+        return 0;
+    if (ld->op != Oloadsb && ld->op != Oloadub
+        && ld->op != Oloadsw && ld->op != Oloaduw && ld->op != Oload)
+        return 0;
+    if (!req(ld->arg[0], i->to))
+        return 0;
+
+    aidx = i->to.val - Tmp0;
+    if (aidx < 0 || aidx >= MAX_ALIAS_TEMPS)
+        return 0;
+    if (temp_use_count[aidx] != 1 || temp_is_retval[aidx])
+        return 0;
+
+    if (getenv("QBE_DBG_DEAD"))
+        fprintf(stderr, "FUSE cst index load (tmp%d)\n", aidx);
+
+    c = &fn->con[sym.val];
+    emit_rep20();
+    emitload(idx, fn);          /* low 16 bits of the index */
+    fprintf(outf, "\ttax\n");
+    if (ld->op == Oloadsb || ld->op == Oloadub) {
+        emit_sep20();
+        fprintf(outf, "\tlda.l %s", stripsym(str(c->sym.id)));
+        if (c->bits.i)
+            fprintf(outf, "+%d", (int)c->bits.i);
+        fprintf(outf, ",x\n");
+        emit_rep20();
+        fprintf(outf, "\tand.w #$00FF\n");
+        if (ld->op == Oloadsb) {
+            fprintf(outf, "\tcmp.w #$0080\n");
+            fprintf(outf, "\tbcc +\n");
+            fprintf(outf, "\tora.w #$FF00\n");
+            fprintf(outf, "+\n");
+        }
+    } else {
+        fprintf(outf, "\tlda.l %s", stripsym(str(c->sym.id)));
+        if (c->bits.i)
+            fprintf(outf, "+%d", (int)c->bits.i);
+        fprintf(outf, ",x\n");
+    }
+    acache_invalidate();
+    emitstore(ld->to, fn);
+    return 1;
 }
 
 /* Byte-pair store fusion (C1 audit, 2026-07-19). The C idiom for a
@@ -4732,6 +4823,13 @@ w65816_emitfn(Fn *fn, FILE *f)
              * idiom). Consumes the two following instructions. */
             if (try_fuse_bytepair_store(i, b, fn)) {
                 i += 2;
+                continue;
+            }
+
+            /* Indexed-long cst load fusion: add($sym, idx) + cst load
+             * into emitload(idx)/tax/lda.l sym,x. Consumes the load. */
+            if (try_fuse_cst_index_load(i, b, fn)) {
+                i += 1;
                 continue;
             }
 
