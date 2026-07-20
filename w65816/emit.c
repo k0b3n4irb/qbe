@@ -617,9 +617,14 @@ mark_addr_only_kl(Fn *fn)
                     switch (i->op) {
                     case Oloadsb: case Oloadub:
                     case Oloadsh: case Oloaduh:
-                        is_addr_use = 1; break;
+                        /* #121: a cst-marked load READS the address's
+                         * bank byte (far deref) — the high half is
+                         * live, not discardable. */
+                        if (!(i->volat & 2))
+                            is_addr_use = 1;
+                        break;
                     case Oloadsw: case Oloaduw: case Oload:
-                        if (i->cls != Kl)
+                        if (i->cls != Kl && !(i->volat & 2))
                             is_addr_use = 1;
                         break;
                     case Oextuw: case Oextsw:
@@ -911,6 +916,21 @@ emit_sta_conaddr(Fn *fn, Ref r)
     } else {
         fprintf(outf, "\tsta.l $%06lX\n", (unsigned long)c->bits.i);
     }
+}
+
+/* #121: load a 24-bit pointer into tcc__r9 for a bank-honouring
+ * [tcc__r9] dereference. Used by cst-marked loads (the C object is
+ * const-qualified = ROM whose linked bank is unknown; the plain
+ * paths' lda.l $0000,x / lda.w sym forms are bank-$00-implicit). */
+static void
+emit_cst_ptr_setup(Ref r0, Fn *fn)
+{
+    emit_rep20();
+    emitload(r0, fn);
+    fprintf(outf, "\tsta.b tcc__r9\n");
+    emit_load_high(r0, fn, 0);
+    fprintf(outf, "\tsta.b tcc__r9+2\n");
+    acache_invalidate();
 }
 
 /* Byte-pair store fusion (C1 audit, 2026-07-19). The C idiom for a
@@ -3840,7 +3860,20 @@ emitins(Ins *i, Fn *fn)
         }
         {
             int aslot = getallocslot(r0, fn);
-            if (aslot >= 0) {
+            if ((i->volat & 2) && aslot < 0 && rtype(r0) == RCon
+                && fn->con[r0.val].type == CAddr) {
+                /* cst + folded symbol: absolute LONG read (#121) */
+                Con *c1 = &fn->con[r0.val];
+                fprintf(outf, "\tlda.l %s", stripsym(str(c1->sym.id)));
+                if (c1->bits.i)
+                    fprintf(outf, "+%d", (int)c1->bits.i);
+                fprintf(outf, "\n");
+            } else if ((i->volat & 2) && aslot < 0 && rtype(r0) != RSlot
+                       && !isvreg(r0)) {
+                /* cst + runtime pointer: [tcc__r9] 16-bit read (#121) */
+                emit_cst_ptr_setup(r0, fn);
+                fprintf(outf, "\tlda [tcc__r9]\n");
+            } else if (aslot >= 0) {
                 /* Load from stack-allocated local variable */
                 emit_stack_load((aslot + 1) * 2, 0);
             } else if (rtype(r0) == RSlot) {
@@ -3869,7 +3902,24 @@ emitins(Ins *i, Fn *fn)
     case Oloadsb:
     case Oloadub:
         /* Load byte from memory, zero/sign extend to 16-bit */
-        if (isvreg(r0)) {
+        if ((i->volat & 2) && rtype(r0) == RCon
+            && fn->con[r0.val].type == CAddr) {
+            /* cst + folded symbol address: absolute LONG — the linker
+             * supplies the 24-bit address, correct in any bank (#121) */
+            Con *c0 = &fn->con[r0.val];
+            emit_sep20();
+            fprintf(outf, "\tlda.l %s", stripsym(str(c0->sym.id)));
+            if (c0->bits.i)
+                fprintf(outf, "+%d", (int)c0->bits.i);
+            fprintf(outf, "\n");
+            emit_rep20();
+        } else if ((i->volat & 2) && !isvreg(r0)) {
+            /* cst + runtime pointer: bank-honouring [tcc__r9] (#121) */
+            emit_cst_ptr_setup(r0, fn);
+            emit_sep20();
+            fprintf(outf, "\tlda [tcc__r9]\n");
+            emit_rep20();
+        } else if (isvreg(r0)) {
             /* Pointer in virtual register - use indirect */
             emit_sep20();
             fprintf(outf, "\tlda ($%02X)\n", regaddr(r0.val));

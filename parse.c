@@ -52,6 +52,7 @@ enum Token {
 	Tenv,
 	Tphi,
 	Tvolat,
+	Tcst,
 	Tjmp,
 	Tjnz,
 	Tret,
@@ -117,6 +118,7 @@ static char *kwmap[Ntok] = {
 	 * no load forwarding, no dead-store elimination). Set by cproc
 	 * when the C type carries QUALVOLATILE. */
 	[Tvolat] = "volat",
+	[Tcst] = "cst",
 	[Tjmp] = "jmp",
 	[Tjnz] = "jnz",
 	[Tret] = "ret",
@@ -617,12 +619,11 @@ parseline(PState ps)
 
 	is_volat = 0;
 	t = nextnl();
-	/* OpenSNES patch (chantier A2): `volat` keyword at line start
-	 * marks the next instruction as volatile (used by cproc for
-	 * stores, which have no result token). Consume the keyword and
-	 * fall through to parse the actual op. */
-	if (t == Tvolat) {
-		is_volat = 1;
+	/* OpenSNES patch (chantier A2 + #121): `volat` / `cst` keywords
+	 * at line start flag the next instruction (bit 0 = volatile,
+	 * bit 1 = const-target far load). Accept both in any order. */
+	while (t == Tvolat || t == Tcst) {
+		is_volat |= (t == Tvolat) ? 1 : 2;
 		t = nextnl();
 	}
 	if (ps == PLbl && t != Tlbl && t != Trbrace)
@@ -633,10 +634,10 @@ parseline(PState ps)
 		expect(Teq);
 		k = parsecls(&ty);
 		op = next();
-		/* OpenSNES patch (chantier A2): `volat` keyword between
-		 * the result class and the op marks a volatile load. */
-		if (op == Tvolat) {
-			is_volat = 1;
+		/* OpenSNES patch (chantier A2 + #121): `volat` / `cst`
+		 * between the result class and the op flag the load. */
+		while (op == Tvolat || op == Tcst) {
+			is_volat |= (op == Tvolat) ? 1 : 2;
 			op = next();
 		}
 		break;
@@ -818,7 +819,7 @@ parseline(PState ps)
 		 * could alter the semantic shape of a volatile access
 		 * (loadopt, gcm) gate themselves on `i->volat` to skip the
 		 * affected instructions. */
-		curi->volat = is_volat ? 1 : 0;
+		curi->volat = is_volat;   /* bitfield: 1=volat, 2=cst (#121) */
 		curi->to = r;
 		curi->arg[0] = arg[0];
 		curi->arg[1] = arg[1];
