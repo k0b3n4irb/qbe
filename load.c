@@ -48,8 +48,8 @@ loadsz(Ins *l)
 	switch (l->op) {
 	case Oloadsb: case Oloadub: return 1;
 	case Oloadsh: case Oloaduh: return 2;
-	case Oloadsw: case Oloaduw: return 4;
-	case Oload: return KWIDE(l->cls) ? 8 : 4;
+	case Oloadsw: case Oloaduw: return T.wordsz;
+	case Oload: return KWIDE(l->cls) ? 2 * T.wordsz : T.wordsz;
 	}
 	die("unreachable");
 }
@@ -60,8 +60,8 @@ storesz(Ins *s)
 	switch (s->op) {
 	case Ostoreb: return 1;
 	case Ostoreh: return 2;
-	case Ostorew: case Ostores: return 4;
-	case Ostorel: case Ostored: return 8;
+	case Ostorew: case Ostores: return T.wordsz;
+	case Ostorel: case Ostored: return 2 * T.wordsz;
 	}
 	die("unreachable");
 }
@@ -132,7 +132,7 @@ load(Slice sl, bits msk, Loc *l)
 	if (all)
 		cls = sl.cls;
 	else
-		cls = sl.sz > 4 ? Kl : Kw;
+		cls = sl.sz > T.wordsz ? Kl : Kw;
 	r = sl.ref;
 	/* sl.ref might not be live here,
 	 * but its alias base ref will be
@@ -229,7 +229,7 @@ def(Slice sl, bits msk, Blk *b, Ins *i, Loc *il)
 
 	if (!i)
 		i = &b->ins[b->nins];
-	cls = sl.sz > 4 ? Kl : Kw;
+	cls = sl.sz > T.wordsz ? Kl : Kw;
 	msks = MASK(sl.sz);
 
 	while (i > b->ins) {
@@ -291,7 +291,7 @@ def(Slice sl, bits msk, Blk *b, Ins *i, Loc *il)
 			}
 			if (off) {
 				cls1 = cls;
-				if (op == Oshr && off + sl.sz > 4)
+				if (op == Oshr && off + sl.sz > T.wordsz)
 					cls1 = Kl;
 				cast(&r, cls1, il);
 				r1 = getcon(8*off, curf);

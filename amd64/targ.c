@@ -31,6 +31,7 @@ amd64_memargs(int op)
 
 Target T_amd64_sysv = {
 	.name = "amd64_sysv",
+	.wordsz = 4,
 	.emitfin = elf_emitfin,
 	.asloc = ".L",
 	AMD64_COMMON
@@ -38,6 +39,7 @@ Target T_amd64_sysv = {
 
 Target T_amd64_apple = {
 	.name = "amd64_apple",
+	.wordsz = 4,
 	.apple = 1,
 	.emitfin = macho_emitfin,
 	.asloc = "L",

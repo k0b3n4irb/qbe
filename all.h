@@ -45,6 +45,12 @@ struct Target {
 	char name[16];
 	char apple;
 	char skiprega;  /* skip spill/rega for stack machines */
+	/* Byte width of the Kw class. 4 everywhere QBE was written for; the
+	 * w65816 backend redefines `w` as 16-bit, and load.c's forwarding
+	 * needs to know — serving a byte load out of an earlier word load
+	 * by shifting is only correct if the shift distance matches the
+	 * width actually fetched. Kl is assumed to be twice this. */
+	int wordsz;
 	int gpr0;   /* first general purpose reg */
 	int ngpr;
 	int fpr0;   /* first floating point reg */

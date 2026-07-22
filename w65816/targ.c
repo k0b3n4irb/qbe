@@ -35,6 +35,7 @@ Target T_w65816 = {
     .name = "w65816",
     .apple = 0,
     .skiprega = 1,  /* No traditional register allocation */
+    .wordsz = 2,   /* `w` is 16-bit on this target — see struct Target */
     .gpr0 = R0,
     .ngpr = NGPR,
     .fpr0 = R0,
