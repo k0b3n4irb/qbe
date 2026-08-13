@@ -4457,14 +4457,33 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
                 if (dstslot < 0)
                     continue;
 
-                /* Handle the argument */
+                /* Handle the argument.
+                 *
+                 * Kl (4-byte far pointer / 32-bit) phi args must move BOTH
+                 * halves: the low/offset word at (slot+1)*2 and the high/bank
+                 * word at (slot+1)*2 + 2. The historical code moved only the
+                 * low word, so a phi of address constants (`x ? "A" : "B"`) or
+                 * of Kl temps left the result's bank half as stack garbage —
+                 * consumers (arg push, pointer return, store) then read a
+                 * corrupt far pointer. See
+                 * .claude/notes/tech/ternary_addr_const_bank_drop.md. */
                 if (rtype(p->arg[n]) == RCon) {
-                    /* Constant: load and store to phi slot */
+                    /* Constant: load and store to phi slot (low half) */
                     emitload(p->arg[n], fn);
                     emit_stack_store((dstslot + 1) * 2, 0);
+                    if (p->cls == Kl) {
+                        /* High/bank half: `lda.w #:sym` (CAddr) or the top
+                         * 16 bits (CBits), then store to the high slot. */
+                        emit_load_high(p->arg[n], fn, 0);
+                        emit_stack_store((dstslot + 1) * 2 + 2, 0);
+                    }
                 } else if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
                     int idx = p->arg[n].val - Tmp0;
-                    if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
+                    /* The leaf-opt param alias slot is 16-bit and cannot carry
+                     * a Kl high half — mirror emitload_adj's `cls != Kl` guard
+                     * so Kl temps fall through to the two-half spilled copy. */
+                    if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS
+                        && temp_alias[idx] != 0 && fn->tmp[p->arg[n].val].cls != Kl) {
                         /* Aliased to param slot — load from caller frame */
                         if (!acache_has(p->arg[n])) {
                             int neg_slot = temp_alias[idx];
@@ -4482,8 +4501,17 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
                                 acache_set(p->arg[n]);
                             }
                             emit_stack_store((dstslot + 1) * 2, 0);
+                            if (p->cls == Kl) {
+                                /* Copy the high/bank half too. This clobbers A
+                                 * (which held the low half), so drop the cache
+                                 * afterward. */
+                                emit_stack_load((srcslot + 1) * 2 + 2, 0);
+                                emit_stack_store((dstslot + 1) * 2 + 2, 0);
+                                acache_invalidate();
+                            }
                         }
-                        /* If same slot, no copy needed (coalesced) */
+                        /* If same slot, no copy needed (coalesced) — a Kl temp
+                         * owns both slots, so the high half is shared too. */
                     }
                 }
                 break;
