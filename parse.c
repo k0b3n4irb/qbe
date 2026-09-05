@@ -53,6 +53,7 @@ enum Token {
 	Tphi,
 	Tvolat,
 	Tcst,
+	Tfar,       /* OpenSNES B2: far-RAM (bank $7E) access */
 	Tjmp,
 	Tjnz,
 	Tret,
@@ -119,6 +120,7 @@ static char *kwmap[Ntok] = {
 	 * when the C type carries QUALVOLATILE. */
 	[Tvolat] = "volat",
 	[Tcst] = "cst",
+	[Tfar] = "farram",   /* "far" collides in the keyword perfect hash */
 	[Tjmp] = "jmp",
 	[Tjnz] = "jnz",
 	[Tret] = "ret",
@@ -622,8 +624,8 @@ parseline(PState ps)
 	/* OpenSNES patch (chantier A2 + #121): `volat` / `cst` keywords
 	 * at line start flag the next instruction (bit 0 = volatile,
 	 * bit 1 = const-target far load). Accept both in any order. */
-	while (t == Tvolat || t == Tcst) {
-		is_volat |= (t == Tvolat) ? 1 : 2;
+	while (t == Tvolat || t == Tcst || t == Tfar) {
+		is_volat |= (t == Tvolat) ? 1 : (t == Tcst) ? 2 : 4;
 		t = nextnl();
 	}
 	if (ps == PLbl && t != Tlbl && t != Trbrace)
@@ -636,8 +638,8 @@ parseline(PState ps)
 		op = next();
 		/* OpenSNES patch (chantier A2 + #121): `volat` / `cst`
 		 * between the result class and the op flag the load. */
-		while (op == Tvolat || op == Tcst) {
-			is_volat |= (op == Tvolat) ? 1 : 2;
+		while (op == Tvolat || op == Tcst || op == Tfar) {
+			is_volat |= (op == Tvolat) ? 1 : (op == Tcst) ? 2 : 4;
 			op = next();
 		}
 		break;

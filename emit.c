@@ -155,8 +155,13 @@ emitlnk(char *n, Lnk *l, int s, FILE *f)
 		fprintf(f, ".SECTION \".rodata.%d\" SUPERFREE\n", ++datasec_counter);
 		break;
 	case SecBss:
-		/* BSS goes to RAM (SLOT 1) not ROM */
-		fprintf(f, ".RAMSECTION \".bss.%d\" BANK 0 SLOT 1\n", ++datasec_counter);
+		/* BSS goes to RAM (SLOT 1) not ROM. OpenSNES B2: a `section ".far"`
+		 * object lives in bank $7E (SLOT 2 = $2000-$FFFF), outside the 8 KB
+		 * bank-0 band — the C side reads it with far addressing (QUALFAR). */
+		if (l && l->sec && strstr(l->sec, ".far"))
+			fprintf(f, ".RAMSECTION \".far.%d\" BANK $7E SLOT 2\n", ++datasec_counter);
+		else
+			fprintf(f, ".RAMSECTION \".bss.%d\" BANK 0 SLOT 1\n", ++datasec_counter);
 		break;
 	}
 	/* WLA-DX: skip .globl since we compile as single file.
@@ -288,9 +293,12 @@ emitdat(Dat *d, FILE *f)
 			fputc('\n', f);
 		}
 		else if (!has_nonzero_data) {
-			/* Pure BSS - only zeros, emit RAMSECTION */
+			/* Pure BSS - only zeros, emit RAMSECTION (bank $7E for `.far`, B2) */
 			sec_id = ++datasec_counter;
-			fprintf(f, ".RAMSECTION \".bss.%d\" BANK 0 SLOT 1\n", sec_id);
+			if (cur_data_lnk && cur_data_lnk->sec && strstr(cur_data_lnk->sec, ".far"))
+				fprintf(f, ".RAMSECTION \".far.%d\" BANK $7E SLOT 2\n", sec_id);
+			else
+				fprintf(f, ".RAMSECTION \".bss.%d\" BANK 0 SLOT 1\n", sec_id);
 			p = cur_data_name[0] == '"' ? "" : T.assym;
 			name = cur_data_name;
 			if (name[0] == '.' && name[1] == 'L')
@@ -315,6 +323,8 @@ emitdat(Dat *d, FILE *f)
 		}
 		else {
 			/* Mutable initialized data - emit RAM section + ROM init record */
+			if (cur_data_lnk && cur_data_lnk->sec && strstr(cur_data_lnk->sec, ".far"))
+				die("initialised __far object %s: not supported yet (B2 Phase 2 — the init record and CopyInitData are bank-0 only); zero-initialise it and fill at runtime", cur_data_name);
 			sec_id = ++datasec_counter;
 			p = cur_data_name[0] == '"' ? "" : T.assym;
 			name = cur_data_name;
