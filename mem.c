@@ -36,7 +36,7 @@ promote(Fn *fn)
 			 * memory access into a register copy and lose the
 			 * volatile semantics. Bail out of the promotion
 			 * attempt so the alloca stays put. */
-			if (l->volat)
+			if (l->volat & 1)
 				goto Skip;
 			if (isload(l->op))
 			if (s == -1 || s == loadsz(l)) {

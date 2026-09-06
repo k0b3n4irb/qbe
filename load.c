@@ -437,7 +437,7 @@ loadopt(Fn *fn)
 			 * the load as a "fresh" load with no candidate def to
 			 * substitute, preserving the original load instruction
 			 * intact in the emit pass. */
-			if (i->volat)
+			if (i->volat & 1)
 				continue;
 			sz = loadsz(i);
 			sl = (Slice){i->arg[0], 0, sz, i->cls};
