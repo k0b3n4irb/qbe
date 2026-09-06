@@ -391,6 +391,174 @@ static int temp_high_zero[MAX_ALIAS_TEMPS];
  * computation entirely — saving ~25 cycles per array indexing site. */
 static int temp_addr_only[MAX_ALIAS_TEMPS];
 
+/* #121 + B2: the access target's bank is not $00 — a const object (ROM,
+ * access-flag bit 1, #121) or a `__far` object in bank $7E WRAM (bit 2,
+ * B2). Every load/store path keyed on this predicate uses bank-honouring
+ * addressing: `lda.l/sta.l sym` (the linker supplies the 24-bit address),
+ * `lda.l/sta.l sym,x` (indexed long, bank carries included), or a
+ * `[tcc__r9]` deref through the staged 24-bit pointer. Everything else
+ * keeps the bank-$00-implicit forms. */
+static int
+is_far(Ins *i)
+{
+    return (i->volat & 6) != 0;
+}
+
+/* B2: far address decomposition. A far load/store whose address temp is
+ * defined by a Kl `add` can use the add's OPERANDS directly instead of
+ * the materialised 24-bit sum:
+ *
+ *   FAR_SYM_IDX   %a =l add $sym, %idx   → emitload(idx); tax;
+ *                                          lda.l/sta.l sym+off,x
+ *   FAR_BASE_CON  %a =l add %p, N        → stage p in tcc__r9;
+ *                                          ldy #N; lda/sta [tcc__r9],y
+ *   FAR_BASE_IDX  %a =l add %p, %idx     → stage p in tcc__r9;
+ *                                          emitload(idx); tay; [tcc__r9],y
+ *
+ * Absolute long indexed and [dp],y both carry the bank, so every form is
+ * bank-exact for any placement. When EVERY use of %a is such a far access
+ * the add itself is not emitted at all (far_decomp_all): `far_arr[i]`
+ * costs what the near form does, and a struct-field sequence `p->a; p->b`
+ * through one far pointer stages tcc__r9 once (the r9 cache below). The
+ * base of FAR_BASE_IDX must be unambiguous: when both operands are Kl,
+ * the index is the one whose high half is statically zero
+ * (temp_high_zero, i.e. an Oextuw result); otherwise no decomposition.
+ * This generalises the #121 single-use indexed-long load fusion. */
+enum { FAR_NONE = 0, FAR_SYM_IDX, FAR_BASE_CON, FAR_BASE_IDX };
+static int far_decomp_kind[MAX_ALIAS_TEMPS];
+static Ref far_decomp_base[MAX_ALIAS_TEMPS];   /* $sym con or base temp */
+static Ref far_decomp_idx[MAX_ALIAS_TEMPS];    /* index temp or CBits con */
+static int far_decomp_all[MAX_ALIAS_TEMPS];    /* every use is a far access */
+
+/* tcc__r9 cache: which Kl ref is currently staged in tcc__r9 (24-bit).
+ * Valid only within a block and only across loads/stores — every other
+ * op may use tcc__r9 as scratch (Kl add/sub, mul bodies, indirect
+ * calls), so emitins() drops the cache before emitting any of them. */
+static Ref r9_ref;
+static int r9_valid;
+
+static void
+r9_invalidate(void)
+{
+    r9_valid = 0;
+}
+
+static int
+far_addr_idx(Ref r)
+{
+    int idx;
+    if (rtype(r) != RTmp || r.val < Tmp0)
+        return -1;
+    idx = r.val - Tmp0;
+    if (idx < 0 || idx >= MAX_ALIAS_TEMPS)
+        return -1;
+    return idx;
+}
+
+/* Is instruction `i` a far access whose ADDRESS operand is ref r? */
+static int
+is_far_access_of(Ins *i, Ref r)
+{
+    if (!is_far(i))
+        return 0;
+    switch (i->op) {
+    case Oloadsb: case Oloadub: case Oloadsh: case Oloaduh:
+    case Oloadsw: case Oloaduw: case Oload:
+        return req(i->arg[0], r);
+    case Ostoreb: case Ostoreh: case Ostorew: case Ostorel:
+        return req(i->arg[1], r);
+    default:
+        return 0;
+    }
+}
+
+static void
+mark_far_decomp(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    int aidx, k;
+    Ref base, idx;
+
+    memset(far_decomp_kind, 0, sizeof(far_decomp_kind));
+    memset(far_decomp_all, 0, sizeof(far_decomp_all));
+
+    for (b = fn->start; b; b = b->link) {
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (i->op != Oadd || i->cls != Kl)
+                continue;
+            aidx = far_addr_idx(i->to);
+            if (aidx < 0)
+                continue;
+            k = FAR_NONE;
+            base = R; idx = R;
+            if (rtype(i->arg[0]) == RCon && fn->con[i->arg[0].val].type == CAddr
+                && far_addr_idx(i->arg[1]) >= 0) {
+                k = FAR_SYM_IDX; base = i->arg[0]; idx = i->arg[1];
+            } else if (rtype(i->arg[1]) == RCon
+                       && fn->con[i->arg[1].val].type == CAddr
+                       && far_addr_idx(i->arg[0]) >= 0) {
+                k = FAR_SYM_IDX; base = i->arg[1]; idx = i->arg[0];
+            } else if (far_addr_idx(i->arg[0]) >= 0
+                       && fn->tmp[i->arg[0].val].cls == Kl
+                       && rtype(i->arg[1]) == RCon
+                       && fn->con[i->arg[1].val].type == CBits
+                       && fn->con[i->arg[1].val].bits.i >= 0
+                       && fn->con[i->arg[1].val].bits.i < 0xFFFE) {
+                k = FAR_BASE_CON; base = i->arg[0]; idx = i->arg[1];
+            } else if (far_addr_idx(i->arg[0]) >= 0
+                       && far_addr_idx(i->arg[1]) >= 0) {
+                int k0 = fn->tmp[i->arg[0].val].cls == Kl;
+                int k1 = fn->tmp[i->arg[1].val].cls == Kl;
+                int z0 = temp_high_zero[i->arg[0].val - Tmp0];
+                int z1 = temp_high_zero[i->arg[1].val - Tmp0];
+                if (k0 && (!k1 || z1) && !z0) {
+                    k = FAR_BASE_IDX; base = i->arg[0]; idx = i->arg[1];
+                } else if (k1 && (!k0 || z0) && !z1) {
+                    k = FAR_BASE_IDX; base = i->arg[1]; idx = i->arg[0];
+                }
+            }
+            if (k == FAR_NONE)
+                continue;
+            far_decomp_kind[aidx] = k;
+            far_decomp_base[aidx] = base;
+            far_decomp_idx[aidx] = idx;
+        }
+    }
+
+    /* far_decomp_all: every use of the add's result is a far access with
+     * it as the address (then the add need not be emitted at all). */
+    for (b = fn->start; b; b = b->link) {
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (i->op != Oadd || i->cls != Kl)
+                continue;
+            aidx = far_addr_idx(i->to);
+            if (aidx < 0 || far_decomp_kind[aidx] == FAR_NONE)
+                continue;
+            if (temp_is_retval[aidx] || temp_use_count[aidx] == 0)
+                continue;
+            {
+                Blk *b2; Ins *i2; int n = 0;
+                for (b2 = fn->start; b2; b2 = b2->link)
+                    for (i2 = b2->ins; i2 < &b2->ins[b2->nins]; i2++)
+                        if (is_far_access_of(i2, i->to))
+                            n++;
+                if (n == temp_use_count[aidx])
+                    far_decomp_all[aidx] = 1;
+            }
+        }
+    }
+}
+
+static int
+far_decomp_of(Ref r)
+{
+    int idx = far_addr_idx(r);
+    if (idx < 0)
+        return FAR_NONE;
+    return far_decomp_kind[idx];
+}
+
 /* Comparison+branch fusion state:
  * When a comparison instruction's result is used only by the block's jnz,
  * we skip boolean materialization (0/1) and emit a direct compare+branch.
@@ -470,15 +638,50 @@ mark_high_zero(Fn *fn)
     Ins *i;
     int idx;
 
+    /* B2: `bits[idx]` = a proven upper bound (in bits) on the temp's
+     * value, 0 = unknown. A zero-extension gives 8 (extub) or 16
+     * (extuh/extuw); `shl`/`mul pow2` by cnt keeps the high half zero
+     * while bits + cnt <= 16 — this is what makes `far_u16arr[u8 k]`
+     * (index k*2) decomposable into a [tcc__r9],y walk. Instructions are
+     * visited in order; cproc emits the ext before the scale. */
+    static unsigned char bits[MAX_ALIAS_TEMPS];
     memset(temp_high_zero, 0, sizeof(temp_high_zero));
+    memset(bits, 0, sizeof(bits));
     for (b = fn->start; b; b = b->link) {
         for (i = b->ins; i < &b->ins[b->nins]; i++) {
-            if (i->op != Oextuw) continue;
+            int nb = 0;
             if (i->cls != Kl) continue;
             if (rtype(i->to) != RTmp || i->to.val < Tmp0) continue;
             idx = i->to.val - Tmp0;
-            if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+            if (idx < 0 || idx >= MAX_ALIAS_TEMPS) continue;
+            /* any zero-extension into Kl — cproc widens a u8/u16 index
+             * with extub/extuh, not only extuw */
+            if (i->op == Oextub)
+                nb = 8;
+            else if (i->op == Oextuh || i->op == Oextuw)
+                nb = 16;
+            else if ((i->op == Oshl || i->op == Omul)
+                     && rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0
+                     && i->arg[0].val - Tmp0 < MAX_ALIAS_TEMPS
+                     && bits[i->arg[0].val - Tmp0] > 0
+                     && rtype(i->arg[1]) == RCon
+                     && fn->con[i->arg[1].val].type == CBits) {
+                int64_t v = fn->con[i->arg[1].val].bits.i;
+                int cnt = -1;
+                if (i->op == Oshl && v >= 0 && v < 16)
+                    cnt = (int)v;
+                else if (i->op == Omul && v > 0 && v < 65536
+                         && (v & (v - 1)) == 0) {
+                    cnt = 0;
+                    while ((1 << cnt) < v) cnt++;
+                }
+                if (cnt >= 0 && bits[i->arg[0].val - Tmp0] + cnt <= 16)
+                    nb = bits[i->arg[0].val - Tmp0] + cnt;
+            }
+            if (nb > 0) {
+                bits[idx] = (unsigned char)nb;
                 temp_high_zero[idx] = 1;
+            }
         }
     }
 }
@@ -613,18 +816,32 @@ mark_addr_only_kl(Fn *fn)
                  * operand's high half is unconditionally dead at this site,
                  * independent of the consumer's own status). */
                 int is_addr_use = 0;
+                /* B2: a Kl add folded into its far accesses (far_decomp_all)
+                 * is never emitted: its INDEX operand's high half is dead
+                 * (X/Y are 16-bit), its BASE operand's high half is the
+                 * bank byte staged in tcc__r9 — a blocking use. */
+                if (i->op == Oadd && i->cls == Kl) {
+                    int didx = far_addr_idx(i->to);
+                    if (didx >= 0 && far_decomp_all[didx]) {
+                        if (req(r, far_decomp_idx[didx]))
+                            addr_use[idx]++;
+                        else
+                            block_use[idx]++;
+                        continue;
+                    }
+                }
                 if (a == 0) {
                     switch (i->op) {
                     case Oloadsb: case Oloadub:
                     case Oloadsh: case Oloaduh:
-                        /* #121: a cst-marked load READS the address's
-                         * bank byte (far deref) — the high half is
-                         * live, not discardable. */
-                        if (!(i->volat & 2))
+                        /* #121 / B2: a far-tainted load READS the
+                         * address's bank byte ([tcc__r9] deref) — the
+                         * high half is live, not discardable. */
+                        if (!is_far(i))
                             is_addr_use = 1;
                         break;
                     case Oloadsw: case Oloaduw: case Oload:
-                        if (i->cls != Kl && !(i->volat & 2))
+                        if (i->cls != Kl && !is_far(i))
                             is_addr_use = 1;
                         break;
                     case Oextuw: case Oextsw:
@@ -636,7 +853,11 @@ mark_addr_only_kl(Fn *fn)
                     switch (i->op) {
                     case Ostoreb: case Ostoreh: case Ostorew:
                     case Ostorel:
-                        is_addr_use = 1; break;
+                        /* B2: a far store goes through [tcc__r9] and
+                         * needs the bank byte — a blocking use. */
+                        if (!is_far(i))
+                            is_addr_use = 1;
+                        break;
                     default: break;
                     }
                 }
@@ -902,15 +1123,19 @@ static void emitload(Ref r, Fn *fn);
 static void emitstore(Ref r, Fn *fn);
 static void emit_rep20(void);
 static void emit_sep20(void);
+static int getallocslot(Ref r, Fn *fn);
+static int isvreg(Ref r);
+static int far_store_via_ptr(Ins *i, Fn *fn);
 
 /* Emit `sta` to a constant address (symbol or literal), 8-bit A assumed.
  * Shared by the byte-pair store fusion and mirrored on Ostoreb's forms. */
 static void
-emit_sta_conaddr(Fn *fn, Ref r)
+emit_sta_conaddr(Fn *fn, Ref r, int far)
 {
     Con *c = &fn->con[r.val];
     if (c->type == CAddr) {
-        fprintf(outf, "\tsta.w %s", stripsym(str(c->sym.id)));
+        fprintf(outf, "\tsta.%c %s", far ? 'l' : 'w',
+                stripsym(str(c->sym.id)));
         if (c->bits.i)
             fprintf(outf, "+%d", (int)c->bits.i);
         fprintf(outf, "\n");
@@ -926,101 +1151,218 @@ emit_sta_conaddr(Fn *fn, Ref r)
 static void
 emit_cst_ptr_setup(Ref r0, Fn *fn)
 {
+    if (r9_valid && req(r9_ref, r0))
+        return;                     /* B2: already staged (r9 cache) */
     emit_rep20();
     emitload(r0, fn);
     fprintf(outf, "\tsta.b tcc__r9\n");
     emit_load_high(r0, fn, 0);
     fprintf(outf, "\tsta.b tcc__r9+2\n");
     acache_invalidate();
+    r9_ref = r0;
+    r9_valid = 1;
 }
 
-/* Indexed-long load fusion (#121 follow-up). The C idiom for reading
- * a const array —
- *     %a =l add $sym, %idx      (single use)
- *     %v =w cst load* [%a]
- * — otherwise pays the full [tcc__r9] far setup (~25 cyc). Absolute
- * long INDEXED addressing does it in one instruction: the hardware
- * adds X to the complete 24-bit address (bank carries included), so
- *     emitload(%idx) ; tax ; lda.l sym+off,x
- * is bank-correct for any placement and any index. Byte and 16-bit
- * word loads; Kl (4-byte) loads keep the generic path.
- *
- * Returns 1 (sequence emitted, result stored) when the pair matches;
- * the caller skips the consumed load. */
-static int
-try_fuse_cst_index_load(Ins *i, Blk *b, Fn *fn)
+/* B2: prepare the bank-honouring operand for a far access whose address
+ * ref `a` is decomposed (see mark_far_decomp) and return it in buf. For
+ * the indexed-long form X holds the index (the opcode needs `.l`); for
+ * the [tcc__r9] forms Y holds the offset, or the operand is a plain
+ * [tcc__r9] for offset 0. Index/offset loads run in 16-bit A; the
+ * caller sets 8-bit afterwards if it needs to. Clobbers A — load the
+ * stored value AFTER calling this. */
+static void
+emit_far_decomp_operand(Ref a, Fn *fn, char *buf, size_t n)
 {
-    Ins *ld;
+    int idx = far_addr_idx(a);
     Con *c;
-    Ref sym, idx;
-    int aidx;
 
-    if (i + 1 >= &b->ins[b->nins])
-        return 0;
-    ld = i + 1;
-
-    if (i->op != Oadd || i->cls != Kl)
-        return 0;
-    if (rtype(i->to) != RTmp || i->to.val < Tmp0)
-        return 0;
-
-    /* one operand a CAddr constant, the other a temp index */
-    if (rtype(i->arg[0]) == RCon && fn->con[i->arg[0].val].type == CAddr
-        && rtype(i->arg[1]) == RTmp) {
-        sym = i->arg[0];
-        idx = i->arg[1];
-    } else if (rtype(i->arg[1]) == RCon
-               && fn->con[i->arg[1].val].type == CAddr
-               && rtype(i->arg[0]) == RTmp) {
-        sym = i->arg[1];
-        idx = i->arg[0];
-    } else {
-        return 0;
-    }
-
-    if (!(ld->volat & 2) || ld->cls == Kl)
-        return 0;
-    if (ld->op != Oloadsb && ld->op != Oloadub
-        && ld->op != Oloadsw && ld->op != Oloaduw && ld->op != Oload)
-        return 0;
-    if (!req(ld->arg[0], i->to))
-        return 0;
-
-    aidx = i->to.val - Tmp0;
-    if (aidx < 0 || aidx >= MAX_ALIAS_TEMPS)
-        return 0;
-    if (temp_use_count[aidx] != 1 || temp_is_retval[aidx])
-        return 0;
-
-    if (getenv("QBE_DBG_DEAD"))
-        fprintf(stderr, "FUSE cst index load (tmp%d)\n", aidx);
-
-    c = &fn->con[sym.val];
-    emit_rep20();
-    emitload(idx, fn);          /* low 16 bits of the index */
-    fprintf(outf, "\ttax\n");
-    if (ld->op == Oloadsb || ld->op == Oloadub) {
-        emit_sep20();
-        fprintf(outf, "\tlda.l %s", stripsym(str(c->sym.id)));
-        if (c->bits.i)
-            fprintf(outf, "+%d", (int)c->bits.i);
-        fprintf(outf, ",x\n");
+    switch (far_decomp_kind[idx]) {
+    case FAR_SYM_IDX:
+        c = &fn->con[far_decomp_base[idx].val];
         emit_rep20();
-        fprintf(outf, "\tand.w #$00FF\n");
-        if (ld->op == Oloadsb) {
-            fprintf(outf, "\tcmp.w #$0080\n");
-            fprintf(outf, "\tbcc +\n");
-            fprintf(outf, "\tora.w #$FF00\n");
-            fprintf(outf, "+\n");
+        emitload(far_decomp_idx[idx], fn);      /* low 16 bits of the index */
+        fprintf(outf, "\ttax\n");
+        acache_invalidate();
+        if ((int)c->bits.i)
+            snprintf(buf, n, "%s+%d,x", stripsym(str(c->sym.id)),
+                     (int)c->bits.i);
+        else
+            snprintf(buf, n, "%s,x", stripsym(str(c->sym.id)));
+        break;
+    case FAR_BASE_CON:
+        emit_cst_ptr_setup(far_decomp_base[idx], fn);
+        c = &fn->con[far_decomp_idx[idx].val];
+        if ((int)c->bits.i) {
+            emit_rep20();
+            fprintf(outf, "\tldy.w #%d\n", (int)c->bits.i);
+            snprintf(buf, n, "[tcc__r9],y");
+        } else {
+            snprintf(buf, n, "[tcc__r9]");
         }
+        break;
+    case FAR_BASE_IDX:
+        emit_cst_ptr_setup(far_decomp_base[idx], fn);
+        emit_rep20();
+        emitload(far_decomp_idx[idx], fn);      /* low 16 bits of the index */
+        fprintf(outf, "\ttay\n");
+        acache_invalidate();
+        snprintf(buf, n, "[tcc__r9],y");
+        break;
+    default:
+        die("emit_far_decomp_operand: no decomposition");
+    }
+}
+
+/* B2: the operand for the +2 (high) half of a Kl far access, after
+ * emit_far_decomp_operand prepared the low half. X/Y still hold the
+ * index/offset (the value's high half is loaded with lda forms only). */
+static void
+emit_far_decomp_operand_hi(Ref a, Fn *fn, char *buf, size_t n)
+{
+    int idx = far_addr_idx(a);
+    Con *c;
+
+    switch (far_decomp_kind[idx]) {
+    case FAR_SYM_IDX:
+        c = &fn->con[far_decomp_base[idx].val];
+        snprintf(buf, n, "%s+%d,x", stripsym(str(c->sym.id)),
+                 (int)c->bits.i + 2);
+        break;
+    case FAR_BASE_CON:
+        c = &fn->con[far_decomp_idx[idx].val];
+        fprintf(outf, "\tldy.w #%d\n", (int)c->bits.i + 2);
+        snprintf(buf, n, "[tcc__r9],y");
+        break;
+    case FAR_BASE_IDX:
+        fprintf(outf, "\tiny\n");
+        fprintf(outf, "\tiny\n");
+        snprintf(buf, n, "[tcc__r9],y");
+        break;
+    default:
+        die("emit_far_decomp_operand_hi: no decomposition");
+    }
+}
+
+/* B2: operand for a far access through address ref `a` — decomposed when
+ * possible, else the pointer staged in tcc__r9. Returns the decomposition
+ * kind; `sfx` receives ".l" for the indexed-long form, "" otherwise. */
+static int
+emit_far_operand(Ref a, Fn *fn, char *buf, size_t n, const char **sfx)
+{
+    int k = far_decomp_of(a);
+    if (k != FAR_NONE) {
+        emit_far_decomp_operand(a, fn, buf, n);
     } else {
-        fprintf(outf, "\tlda.l %s", stripsym(str(c->sym.id)));
-        if (c->bits.i)
-            fprintf(outf, "+%d", (int)c->bits.i);
-        fprintf(outf, ",x\n");
+        emit_cst_ptr_setup(a, fn);
+        snprintf(buf, n, "[tcc__r9]");
+    }
+    *sfx = (k == FAR_SYM_IDX) ? ".l" : "";
+    return k;
+}
+
+static void
+emit_far_operand_hi(Ref a, Fn *fn, int k, char *buf, size_t n)
+{
+    if (k != FAR_NONE) {
+        emit_far_decomp_operand_hi(a, fn, buf, n);
+    } else {
+        fprintf(outf, "\tldy.w #2\n");
+        snprintf(buf, n, "[tcc__r9],y");
+    }
+}
+
+/* B2: store the value r0 through the 24-bit pointer r1 (a temp, a param
+ * slot or an alloc'd local holding a pointer), bank-honouring. The
+ * pointer is staged in tcc__r9 FIRST (it goes through A), then the value
+ * is loaded and written with `sta [tcc__r9]` (+`,y` = 2 for the Kl high
+ * half). Byte stores switch to 8-bit for the store only. */
+static void
+emit_far_ptr_store(Ins *i, Fn *fn)
+{
+    Ref r0 = i->arg[0], r1 = i->arg[1];
+    char opnd[96];
+    const char *sfx;
+    int k;
+
+    k = emit_far_operand(r1, fn, opnd, sizeof opnd, &sfx);
+    if (i->op == Ostoreb) {
+        if (rtype(r0) == RCon && fn->con[r0.val].type == CBits) {
+            emit_sep20();
+            fprintf(outf, "\tlda #%d\n", (int)(fn->con[r0.val].bits.i & 0xFF));
+        } else {
+            emit_rep20();
+            emitload(r0, fn);
+            emit_sep20();
+        }
+        fprintf(outf, "\tsta%s %s\n", sfx, opnd);
+        /* stay in 8-bit like Ostoreb does — emitins re-reps as needed */
+    } else {
+        emit_rep20();
+        emitload(r0, fn);
+        fprintf(outf, "\tsta%s %s\n", sfx, opnd);
+        if (i->op == Ostorel) {
+            /* high half: same base, +2. emit_load_high only does lda
+             * forms, so X/Y survive it. */
+            emit_load_high(r0, fn, 0);
+            emit_far_operand_hi(r1, fn, k, opnd, sizeof opnd);
+            fprintf(outf, "\tsta%s %s\n", sfx, opnd);
+        }
     }
     acache_invalidate();
-    emitstore(ld->to, fn);
+}
+
+/* B2: far LOAD through a runtime pointer (word or byte; the Kl case is
+ * emit_far_ptr_load_kl). Loads into A; the caller does the extend/store.
+ * `byte` selects 8-bit A for the load itself. */
+static void
+emit_far_ptr_load(Ins *i, Fn *fn, int byte)
+{
+    char opnd[96];
+    const char *sfx;
+
+    emit_far_operand(i->arg[0], fn, opnd, sizeof opnd, &sfx);
+    if (byte)
+        emit_sep20();
+    fprintf(outf, "\tlda%s %s\n", sfx, opnd);
+    if (byte)
+        emit_rep20();
+    acache_invalidate();
+}
+
+/* B2: far Kl (32-bit) load through a runtime pointer: low half, then
+ * the high half at +2 through the same base. Stores both halves. */
+static void
+emit_far_ptr_load_kl(Ins *i, Fn *fn, int skip_high)
+{
+    char opnd[96];
+    const char *sfx;
+    int k;
+
+    k = emit_far_operand(i->arg[0], fn, opnd, sizeof opnd, &sfx);
+    fprintf(outf, "\tlda%s %s\n", sfx, opnd);
+    emitstore(i->to, fn);
+    if (skip_high)
+        return;
+    emit_far_operand_hi(i->arg[0], fn, k, opnd, sizeof opnd);
+    fprintf(outf, "\tlda%s %s\n", sfx, opnd);
+    emit_store_high(i->to, fn);
+    acache_invalidate();
+}
+
+/* B2: does this store's address need the far path? Symbol-direct
+ * addresses take `sta.l sym` inline in each Ostore* case; this is the
+ * runtime-pointer test (temp / param slot / alloc'd local, not a DP
+ * vreg, not a constant). */
+static int
+far_store_via_ptr(Ins *i, Fn *fn)
+{
+    Ref r1 = i->arg[1];
+    if (!is_far(i))
+        return 0;
+    if (isvreg(r1) || rtype(r1) == RCon)
+        return 0;
+    if (getallocslot(r1, fn) >= 0)
+        return 0;   /* the address IS a stack local — bank 0 by construction */
     return 1;
 }
 
@@ -1086,9 +1428,9 @@ try_fuse_bytepair_store(Ins *i, Blk *b, Fn *fn)
     emit_rep20();
     emitload(i->arg[0], fn);    /* 16-bit value (acache hit if fresh) */
     emit_sep20();
-    emit_sta_conaddr(fn, i->arg[1]);    /* low byte */
+    emit_sta_conaddr(fn, i->arg[1], is_far(i));    /* low byte */
     fprintf(outf, "\txba\n");
-    emit_sta_conaddr(fn, i2->arg[1]);   /* high byte */
+    emit_sta_conaddr(fn, i2->arg[1], is_far(i2));  /* high byte */
     /* stay in 8-bit like Ostoreb does — emitins re-reps as needed */
     acache_invalidate();
     return 1;
@@ -1134,6 +1476,12 @@ consumes_r0_via_emitload(Ins *i, Fn *fn)
     /* Alloc: doesn't load arg[0] value */
     case Oalloc4: case Oalloc8: case Oalloc16:
         return 0;
+    /* B2: a far store through a runtime pointer prepares the ADDRESS
+     * first (stages tcc__r9 / loads the index into X or Y — all through
+     * A), then loads the value from its slot. The slot must exist.
+     * Symbol-direct far stores load the value first like near ones. */
+    case Ostoreb: case Ostoreh: case Ostorew: case Ostorel:
+        return !far_store_via_ptr(i, fn);
     /* Mul: inline constant multiplies load r0 first (A-cache hit);
      * variable*variable and __mul16 fallback load r1 first (no A-cache for r0).
      *
@@ -2204,6 +2552,18 @@ emitins(Ins *i, Fn *fn)
         break;
     default:
         emit_rep20();
+        break;
+    }
+    /* B2: the tcc__r9 cache survives only across loads and stores —
+     * anything else may scribble tcc__r9 (Kl arithmetic, mul bodies,
+     * indirect calls) or write the staged temp (phi copies). */
+    switch (i->op) {
+    case Oloadsb: case Oloadub: case Oloadsh: case Oloaduh:
+    case Oloadsw: case Oloaduw: case Oload:
+    case Ostoreb: case Ostoreh: case Ostorew: case Ostorel:
+        break;
+    default:
+        r9_invalidate();
         break;
     }
 
@@ -3676,6 +4036,11 @@ emitins(Ins *i, Fn *fn)
          * Old code hardcoded the high word to 0, which silently dropped
          * the bank byte of any pointer or the high half of any u32.
          * Now: low half via emitload, high half via emit_load_high. */
+        /* B2: far store through a runtime pointer → [tcc__r9] / ,y */
+        if (far_store_via_ptr(i, fn)) {
+            emit_far_ptr_store(i, fn);
+            break;
+        }
         emitload(r0, fn);  /* Load low 16 bits */
         {
             int aslot = getallocslot(r1, fn);
@@ -3691,12 +4056,14 @@ emitins(Ins *i, Fn *fn)
             } else if (rtype(r1) == RCon) {
                 c = &fn->con[r1.val];
                 if (c->type == CAddr) {
-                    fprintf(outf, "\tsta.w %s", stripsym(str(c->sym.id)));
+                    /* B2: far symbol → absolute long (linker bank) */
+                    char w = is_far(i) ? 'l' : 'w';
+                    fprintf(outf, "\tsta.%c %s", w, stripsym(str(c->sym.id)));
                     if (c->bits.i)
                         fprintf(outf, "+%d", (int)c->bits.i);
                     fprintf(outf, "\n");
                     emit_load_high(r0, fn, 0);
-                    fprintf(outf, "\tsta.w %s+%d\n",
+                    fprintf(outf, "\tsta.%c %s+%d\n", w,
                             stripsym(str(c->sym.id)), (int)c->bits.i + 2);
                 } else {
                     fprintf(outf, "\tsta.l $%06lX\n",
@@ -3728,10 +4095,17 @@ emitins(Ins *i, Fn *fn)
             if (aidx >= 0 && aidx < MAX_ALIAS_TEMPS && alloc_param[aidx] != 0)
                 break;  /* param already in caller frame, skip copy */
         }
-        /* stz optimization: store zero to symbol without loading A */
+        /* B2: far store through a runtime pointer → [tcc__r9] */
+        if (far_store_via_ptr(i, fn)) {
+            emit_far_ptr_store(i, fn);
+            break;
+        }
+        /* stz optimization: store zero to symbol without loading A
+         * (no long-addressing stz exists — far symbols take lda #0). */
         if (rtype(r0) == RCon && fn->con[r0.val].type == CBits
             && (fn->con[r0.val].bits.i & 0xFFFF) == 0
-            && rtype(r1) == RCon && fn->con[r1.val].type == CAddr) {
+            && rtype(r1) == RCon && fn->con[r1.val].type == CAddr
+            && !is_far(i)) {
             c = &fn->con[r1.val];
             fprintf(outf, "\tstz.w %s", stripsym(str(c->sym.id)));
             if (c->bits.i)
@@ -3766,8 +4140,9 @@ emitins(Ins *i, Fn *fn)
                 /* Direct address constant or symbol */
                 c = &fn->con[r1.val];
                 if (c->type == CAddr) {
-                    /* Symbol address - emit symbol name */
-                    fprintf(outf, "\tsta.w %s", stripsym(str(c->sym.id)));
+                    /* Symbol address - emit symbol name (B2: `.l` when far) */
+                    fprintf(outf, "\tsta.%c %s", is_far(i) ? 'l' : 'w',
+                            stripsym(str(c->sym.id)));
                     if (c->bits.i)
                         fprintf(outf, "+%d", (int)c->bits.i);
                     fprintf(outf, "\n");
@@ -3794,10 +4169,17 @@ emitins(Ins *i, Fn *fn)
          * For constant values: switch to 8-bit first, use 8-bit immediate (2 bytes).
          * For variable values: load in 16-bit, then switch to 8-bit for store.
          */
+        /* B2: far store through a runtime pointer → [tcc__r9] */
+        if (far_store_via_ptr(i, fn)) {
+            emit_far_ptr_store(i, fn);
+            break;
+        }
         if (rtype(r0) == RCon && fn->con[r0.val].type == CBits
             && (fn->con[r0.val].bits.i & 0xFF) == 0
-            && rtype(r1) == RCon && fn->con[r1.val].type == CAddr) {
-            /* Byte store zero to symbol: use stz */
+            && rtype(r1) == RCon && fn->con[r1.val].type == CAddr
+            && !is_far(i)) {
+            /* Byte store zero to symbol: use stz (no long form — far
+             * symbols take the 8-bit immediate path below) */
             emit_sep20();
             c = &fn->con[r1.val];
             fprintf(outf, "\tstz.w %s", stripsym(str(c->sym.id)));
@@ -3828,8 +4210,9 @@ emitins(Ins *i, Fn *fn)
                 /* Direct address constant or symbol */
                 c = &fn->con[r1.val];
                 if (c->type == CAddr) {
-                    /* Symbol address - emit symbol name */
-                    fprintf(outf, "\tsta.w %s", stripsym(str(c->sym.id)));
+                    /* Symbol address - emit symbol name (B2: `.l` when far) */
+                    fprintf(outf, "\tsta.%c %s", is_far(i) ? 'l' : 'w',
+                            stripsym(str(c->sym.id)));
                     if (c->bits.i)
                         fprintf(outf, "+%d", (int)c->bits.i);
                     fprintf(outf, "\n");
@@ -3893,13 +4276,14 @@ emitins(Ins *i, Fn *fn)
             } else if (rtype(r0) == RCon && fn->con[r0.val].type == CAddr) {
                 Con *c0 = &fn->con[r0.val];
                 int off = (int)c0->bits.i;
-                fprintf(outf, "\tlda.w %s", stripsym(str(c0->sym.id)));
+                char w = is_far(i) ? 'l' : 'w';   /* B2: far symbol → long */
+                fprintf(outf, "\tlda.%c %s", w, stripsym(str(c0->sym.id)));
                 if (off)
                     fprintf(outf, "+%d", off);
                 fprintf(outf, "\n");
                 emitstore(i->to, fn);
                 if (!skip_high) {
-                    fprintf(outf, "\tlda.w %s+%d\n",
+                    fprintf(outf, "\tlda.%c %s+%d\n", w,
                             stripsym(str(c0->sym.id)), off + 2);
                     emit_store_high(i->to, fn);
                 }
@@ -3912,13 +4296,13 @@ emitins(Ins *i, Fn *fn)
                     fprintf(outf, "\tlda ($%02X),y\n", regaddr(r0.val));
                     emit_store_high(i->to, fn);
                 }
+            } else if (is_far(i)) {
+                /* B2: far 32-bit load — decomposed operand or [tcc__r9] */
+                emit_far_ptr_load_kl(i, fn, skip_high);
             } else {
-                /* 24-bit pointer in temp — copy to tcc__r9 (3 bytes),
+                /* 24-bit pointer in temp — stage in tcc__r9 (3 bytes),
                  * indirect-load 4 bytes. */
-                emitload(r0, fn);
-                fprintf(outf, "\tsta.b tcc__r9\n");
-                emit_load_high(r0, fn, 0);
-                fprintf(outf, "\tsta.b tcc__r9+2\n");
+                emit_cst_ptr_setup(r0, fn);
                 fprintf(outf, "\tlda [tcc__r9]\n");
                 emitstore(i->to, fn);
                 if (!skip_high) {
@@ -3951,19 +4335,19 @@ emitins(Ins *i, Fn *fn)
         }
         {
             int aslot = getallocslot(r0, fn);
-            if ((i->volat & 2) && aslot < 0 && rtype(r0) == RCon
+            if (is_far(i) && aslot < 0 && rtype(r0) == RCon
                 && fn->con[r0.val].type == CAddr) {
-                /* cst + folded symbol: absolute LONG read (#121) */
+                /* cst/far + folded symbol: absolute LONG read (#121, B2) */
                 Con *c1 = &fn->con[r0.val];
                 fprintf(outf, "\tlda.l %s", stripsym(str(c1->sym.id)));
                 if (c1->bits.i)
                     fprintf(outf, "+%d", (int)c1->bits.i);
                 fprintf(outf, "\n");
-            } else if ((i->volat & 2) && aslot < 0 && rtype(r0) != RSlot
+            } else if (is_far(i) && aslot < 0 && rtype(r0) != RSlot
                        && !isvreg(r0)) {
-                /* cst + runtime pointer: [tcc__r9] 16-bit read (#121) */
-                emit_cst_ptr_setup(r0, fn);
-                fprintf(outf, "\tlda [tcc__r9]\n");
+                /* cst/far + runtime pointer: bank-honouring 16-bit read
+                 * (#121, B2) — decomposed operand or [tcc__r9] */
+                emit_far_ptr_load(i, fn, 0);
             } else if (aslot >= 0) {
                 /* Load from stack-allocated local variable */
                 emit_stack_load((aslot + 1) * 2, 0);
@@ -3993,10 +4377,10 @@ emitins(Ins *i, Fn *fn)
     case Oloadsb:
     case Oloadub:
         /* Load byte from memory, zero/sign extend to 16-bit */
-        if ((i->volat & 2) && rtype(r0) == RCon
+        if (is_far(i) && rtype(r0) == RCon
             && fn->con[r0.val].type == CAddr) {
-            /* cst + folded symbol address: absolute LONG — the linker
-             * supplies the 24-bit address, correct in any bank (#121) */
+            /* cst/far + folded symbol address: absolute LONG — the linker
+             * supplies the 24-bit address, correct in any bank (#121, B2) */
             Con *c0 = &fn->con[r0.val];
             emit_sep20();
             fprintf(outf, "\tlda.l %s", stripsym(str(c0->sym.id)));
@@ -4004,12 +4388,10 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "+%d", (int)c0->bits.i);
             fprintf(outf, "\n");
             emit_rep20();
-        } else if ((i->volat & 2) && !isvreg(r0)) {
-            /* cst + runtime pointer: bank-honouring [tcc__r9] (#121) */
-            emit_cst_ptr_setup(r0, fn);
-            emit_sep20();
-            fprintf(outf, "\tlda [tcc__r9]\n");
-            emit_rep20();
+        } else if (is_far(i) && !isvreg(r0) && getallocslot(r0, fn) < 0) {
+            /* cst/far + runtime pointer: bank-honouring byte read
+             * (#121, B2) — decomposed operand or [tcc__r9] */
+            emit_far_ptr_load(i, fn, 1);
         } else if (isvreg(r0)) {
             /* Pointer in virtual register - use indirect */
             emit_sep20();
@@ -4078,7 +4460,7 @@ emitins(Ins *i, Fn *fn)
         emitload(r0, fn);
         fprintf(outf, "\tand.w #$00FF\n");
         emitstore(i->to, fn);
-        if (i->cls == Kl) {
+        if (i->cls == Kl && !ref_to_is_addr_only(i->to)) {
             fprintf(outf, "\tlda.w #0\n");
             emit_store_high(i->to, fn);
         }
@@ -4124,7 +4506,7 @@ emitins(Ins *i, Fn *fn)
         }
         emitload(r0, fn);
         emitstore(i->to, fn);
-        if (i->cls == Kl) {
+        if (i->cls == Kl && !ref_to_is_addr_only(i->to)) {
             fprintf(outf, "\tlda.w #0\n");
             emit_store_high(i->to, fn);
         }
@@ -4718,7 +5100,9 @@ w65816_emitfn(Fn *fn, FILE *f)
     build_alias_table(fn);
     mark_dead_stores(fn);
     mark_high_zero(fn);
+    mark_far_decomp(fn);        /* B2: before addr_only (feeds it) */
     mark_addr_only_kl(fn);
+    r9_invalidate();
     caller_param_bytes = count_fn_param_bytes(fn);
 
     /* Frame elimination: if all temps are aliased or dead-retval, go frameless */
@@ -4821,6 +5205,7 @@ w65816_emitfn(Fn *fn, FILE *f)
         /* Ensure 16-bit mode at block entry — incoming edges may differ */
         emit_rep20();
         fprintf(outf, "@%s:\n", b->name);
+        r9_invalidate();        /* B2: control-flow merge */
         acache_invalidate();
 
         fused_cmp = 0;
@@ -4854,11 +5239,13 @@ w65816_emitfn(Fn *fn, FILE *f)
                 continue;
             }
 
-            /* Indexed-long cst load fusion: add($sym, idx) + cst load
-             * into emitload(idx)/tax/lda.l sym,x. Consumes the load. */
-            if (try_fuse_cst_index_load(i, b, fn)) {
-                i += 1;
-                continue;
+            /* B2 (+#121 indexed-long fusion, generalised): a Kl add whose
+             * every use is a far access is folded into those accesses'
+             * operands (mark_far_decomp) — nothing to emit here. */
+            if (i->op == Oadd && i->cls == Kl) {
+                int aidx = far_addr_idx(i->to);
+                if (aidx >= 0 && far_decomp_all[aidx])
+                    continue;
             }
 
             /* Dead return store elimination: detect last instruction

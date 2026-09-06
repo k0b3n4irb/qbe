@@ -322,9 +322,12 @@ emitdat(Dat *d, FILE *f)
 			fputs(".ENDS\n", f);
 		}
 		else {
-			/* Mutable initialized data - emit RAM section + ROM init record */
-			if (cur_data_lnk && cur_data_lnk->sec && strstr(cur_data_lnk->sec, ".far"))
-				die("initialised __far object %s: not supported yet (B2 Phase 2 — the init record and CopyInitData are bank-0 only); zero-initialise it and fill at runtime", cur_data_name);
+			/* Mutable initialized data - emit RAM section + ROM init record.
+			 * OpenSNES B2: a `section ".far"` object lives in bank $7E
+			 * (SLOT 2); the init record carries the target bank byte so
+			 * crt0's CopyInitData writes through a 24-bit pointer. */
+			int far = cur_data_lnk && cur_data_lnk->sec
+			          && strstr(cur_data_lnk->sec, ".far");
 			sec_id = ++datasec_counter;
 			p = cur_data_name[0] == '"' ? "" : T.assym;
 			name = cur_data_name;
@@ -332,16 +335,21 @@ emitdat(Dat *d, FILE *f)
 				name = name + 2;
 
 			/* 1. Emit RAMSECTION for the variable */
-			fprintf(f, ".RAMSECTION \".data.%d\" BANK 0 SLOT 1\n", sec_id);
+			if (far)
+				fprintf(f, ".RAMSECTION \".far.%d\" BANK $7E SLOT 2\n", sec_id);
+			else
+				fprintf(f, ".RAMSECTION \".data.%d\" BANK 0 SLOT 1\n", sec_id);
 			fprintf(f, "%s%s:\n", p, name);
 			fprintf(f, "\tdsb %"PRId64"\n", init_total_size);
 			fputs(".ENDS\n\n", f);
 
 			/* 2. Emit ROM section with init data */
-			/* Format: [target_addr:2][size:2][data:N] */
+			/* Format: [target_addr:2][target_bank:1][size:2][data:N]
+			 * (templates/data_init_start.asm, crt0.asm CopyInitData) */
 			/* Use APPENDTO to add to the existing .data_init section */
 			fprintf(f, ".SECTION \".data_init.%d\" SEMIFREE APPENDTO \".data_init\"\n", sec_id);
 			fprintf(f, "\t.dw %s%s\n", p, name);  /* RAM target address */
+			fprintf(f, "\t.db :%s%s\n", p, name);  /* RAM target bank ($00 or $7E) */
 			fprintf(f, "\t.dw %"PRId64"\n", init_total_size);  /* Size */
 			emit_init_data(f);  /* Actual data bytes */
 			fputs(".ENDS\n", f);
