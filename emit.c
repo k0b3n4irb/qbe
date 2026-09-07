@@ -152,7 +152,14 @@ emitlnk(char *n, Lnk *l, int s, FILE *f)
 		fprintf(f, ".SECTION \".text.%s\" SUPERFREE\n", name);
 		break;
 	case SecData:
-		fprintf(f, ".SECTION \".rodata.%d\" SUPERFREE\n", ++datasec_counter);
+		/* OpenSNES #127.3: C const data is read through far addressing
+		 * (#121: `lda.l sym`, `lda.l sym,x`, `[tcc__r9]`) and handed to
+		 * the lib as far pointers, so it never needed the code bank.
+		 * SEMISUPERFREE BANKS ASSET_BANKS lets the linker walk the memory
+		 * map's asset banks (highest first) and keeps bank $00 for code;
+		 * ASSET_BANKS is a string .DEFINE in every memmap the SDK ships
+		 * (wrap_asm includes it before this unit). */
+		fprintf(f, ".SECTION \".rodata.%d\" SEMISUPERFREE BANKS ASSET_BANKS\n", ++datasec_counter);
 		break;
 	case SecBss:
 		/* BSS goes to RAM (SLOT 1) not ROM. OpenSNES B2: a `section ".far"`
@@ -316,7 +323,7 @@ emitdat(Dat *d, FILE *f)
 			name = cur_data_name;
 			if (name[0] == '.' && name[1] == 'L')
 				name = name + 2;
-			fprintf(f, ".SECTION \".rodata.%d\" SUPERFREE\n", sec_id);
+			fprintf(f, ".SECTION \".rodata.%d\" SEMISUPERFREE BANKS ASSET_BANKS\n", sec_id);  /* #127.3, see emitlnk */
 			fprintf(f, "%s%s:\n", p, name);
 			emit_init_data(f);
 			fputs(".ENDS\n", f);
