@@ -983,7 +983,8 @@ parsefn(Lnk *lnk)
 		b->dlink = 0; /* was trashed by findblk() */
 	for (i=0; i<BMask+1; ++i)
 		blkh[i] = 0;
-	memset(tmph, 0, tmphcap * sizeof tmph[0]);
+	if (tmph)
+		memset(tmph, 0, tmphcap * sizeof tmph[0]);
 	typecheck(curf);
 	return curf;
 }
