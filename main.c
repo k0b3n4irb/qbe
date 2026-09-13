@@ -381,12 +381,16 @@ main(int ac, char *av[])
 		}
 		parse(inf, f, dbgfile, data, func);
 		fclose(inf);
+		/* Pass 1.b + 2 for this file, while its types are still alive
+		 * (parse() resets the type table per file; the collected
+		 * functions index into it). */
+		if (!dbg)
+			emit_collected(outf);
+		freetyps();
 	} while (++optind < ac);
 
-	if (!dbg) {
-		emit_collected(outf);
+	if (!dbg)
 		T.emitfin(outf);
-	}
 
 	exit(0);
 }

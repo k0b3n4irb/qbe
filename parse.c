@@ -1247,17 +1247,35 @@ parselnk(Lnk *lnk)
 		}
 }
 
+/* Release the types of the last parsed file. Called by main.c once the
+ * collected functions of that file have been emitted, and by parse()
+ * before it starts a new file. */
+void
+freetyps(void)
+{
+	uint n;
+
+	if (!typ)
+		return;
+	for (n=0; n<ntyp; n++)
+		if (typ[n].nunion)
+			vfree(typ[n].fields);
+	vfree(typ);
+	typ = 0;
+	ntyp = 0;
+}
+
 void
 parse(FILE *f, char *path, void dbgfile(char *), void data(Dat *), void func(Fn *))
 {
 	Lnk lnk;
-	uint n;
 
 	lexinit();
 	inf = f;
 	inpath = path;
 	lnum = 1;
 	thead = Txxx;
+	freetyps();
 	ntyp = 0;
 	typ = vnew(0, sizeof typ[0], PHeap);
 	for (;;) {
@@ -1280,10 +1298,12 @@ parse(FILE *f, char *path, void dbgfile(char *), void data(Dat *), void func(Fn 
 			parsetyp();
 			break;
 		case Teof:
-			for (n=0; n<ntyp; n++)
-				if (typ[n].nunion)
-					vfree(typ[n].fields);
-			vfree(typ);
+			/* OpenSNES: the types stay alive until freetyps(). The
+			 * 2-pass architecture (main.c) runs abi1 / isel / emit on
+			 * the collected functions after parse() returns, and the
+			 * arm64 / amd64 / rv64 ABIs read typ[].fields there —
+			 * freeing here was a use-after-free on every target but
+			 * w65816 (found by the upstream suite, gaps review H1). */
 			return;
 		}
 	}

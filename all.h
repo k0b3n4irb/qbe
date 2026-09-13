@@ -557,6 +557,7 @@ bshas(BSet *bs, uint elt)
 /* parse.c */
 extern Op optab[NOp];
 void parse(FILE *, char *, void (char *), void (Dat *), void (Fn *));
+void freetyps(void);
 void printfn(Fn *, FILE *);
 void printref(Ref, Fn *, FILE *);
 void err(char *, ...) __attribute__((noreturn));
