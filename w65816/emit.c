@@ -251,6 +251,61 @@ emitop2_high(char *op, Ref r, Fn *fn)
 }
 
 /* A-register cache: track which Ref is currently in A to skip redundant loads */
+static int var_shift_seq = 0;   /* @vsh_*.N labels of variable-count Kl shifts */
+static int scmp_seq = 0;        /* @scmp.N labels of signed compares */
+
+/* A Kl comparison must not be fused with the branch: cmp_branch_info's
+ * single load+cmp sees the low words only (c_features ROM, 2026-09-13). */
+static int
+is_kl_cmp(int op)
+{
+    switch (op) {
+    case Oceql: case Ocnel:
+    case Ocsltl: case Ocsgtl: case Ocslel: case Ocsgel:
+    case Ocultl: case Ocugtl: case Oculel: case Ocugel:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Signed 16-bit compare: leave N = (a < b). `cmp` alone is wrong when the
+ * subtraction overflows (-30000 < 30000 gave N = 0), so subtract and fold
+ * V into N. Clobbers A; Z is NOT meaningful afterwards. */
+static void emitload(Ref, Fn *);
+static void emitop2(char *, Ref, Fn *);
+static void acache_invalidate(void);
+static void
+emit_scmp_w(Ref a, Ref b, Fn *fn)
+{
+    int lbl = ++scmp_seq;
+    emitload(a, fn);
+    fprintf(outf, "\tsec\n");
+    emitop2("sbc", b, fn);
+    fprintf(outf, "\tbvc @scmp.%d\n", lbl);
+    fprintf(outf, "\teor.w #$8000\n");
+    fprintf(outf, "@scmp.%d:\n", lbl);
+    acache_invalidate();
+}
+
+/* Signed high-half compare of a Kl pair: on return Z = (high halves
+ * equal) is only valid at the `beq` the caller emits FIRST; after that
+ * N = (a_high < b_high) with overflow folded in. The caller's sequence
+ * must be: this, then `beq <low-compare>`, then the N-based branch — so
+ * the overflow fix-up is emitted here BETWEEN a Z test and the N test. */
+static void
+emit_scmp_high(Ref a, Ref b, Fn *fn, const char *eq_label)
+{
+    int lbl = ++scmp_seq;
+    emit_load_high(a, fn, 0);
+    fprintf(outf, "\tsec\n");
+    emitop2_high("sbc", b, fn);
+    fprintf(outf, "\tbeq %s\n", eq_label);
+    fprintf(outf, "\tbvc @scmp.%d\n", lbl);
+    fprintf(outf, "\teor.w #$8000\n");
+    fprintf(outf, "@scmp.%d:\n", lbl);
+    acache_invalidate();
+}
 static int acache_valid;
 static Ref acache_ref;
 
@@ -3463,6 +3518,36 @@ emitins(Ins *i, Fn *fn)
             acache_invalidate();
             break;
         }
+        if (i->cls == Kl) {
+            /* Variable-count 32-bit left shift: copy the pair to the
+             * destination, then shift it in place `count` times with the
+             * carry crossing the halves. The Kw fallback below shifted the
+             * low half alone and stored an unwritten slot as the high half
+             * (c_features ROM, 2026-09-13; the count is a Kw temp, so only
+             * its low word is read — counts of 32 or more shift to zero /
+             * the sign, as the loop naturally does). The load / store
+             * helpers never touch C, which is what carries the bit across. */
+            int lbl = ++var_shift_seq;
+            emitload(r0, fn);
+            emitstore(i->to, fn);
+            emit_load_high(r0, fn, 0);
+            emit_store_high(i->to, fn);
+            emitload(r1, fn);
+            fprintf(outf, "\ttax\n");
+            fprintf(outf, "\tbeq @vsh_done.%d\n", lbl);
+            fprintf(outf, "@vsh_loop.%d:\n", lbl);
+            emitload(i->to, fn);
+            fprintf(outf, "\tasl a\n");
+            emitstore(i->to, fn);
+            emit_load_high(i->to, fn, 0);
+            fprintf(outf, "\trol a\n");
+            emit_store_high(i->to, fn);
+            fprintf(outf, "\tdex\n");
+            fprintf(outf, "\tbne @vsh_loop.%d\n", lbl);
+            fprintf(outf, "@vsh_done.%d:\n", lbl);
+            acache_invalidate();
+            break;
+        }
         emitload(r0, fn);
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
@@ -3565,6 +3650,37 @@ emitins(Ins *i, Fn *fn)
             break;
         }
         /* Arithmetic shift right: preserves sign for negative values. */
+        if (i->cls == Kl) {
+            /* Variable-count 32-bit arithmetic right shift: copy the pair to the
+             * destination, then shift it in place `count` times with the
+             * carry crossing the halves. The Kw fallback below shifted the
+             * low half alone and stored an unwritten slot as the high half
+             * (c_features ROM, 2026-09-13; the count is a Kw temp, so only
+             * its low word is read — counts of 32 or more shift to zero /
+             * the sign, as the loop naturally does). The load / store
+             * helpers never touch C, which is what carries the bit across. */
+            int lbl = ++var_shift_seq;
+            emitload(r0, fn);
+            emitstore(i->to, fn);
+            emit_load_high(r0, fn, 0);
+            emit_store_high(i->to, fn);
+            emitload(r1, fn);
+            fprintf(outf, "\ttax\n");
+            fprintf(outf, "\tbeq @vsh_done.%d\n", lbl);
+            fprintf(outf, "@vsh_loop.%d:\n", lbl);
+            emit_load_high(i->to, fn, 0);
+            fprintf(outf, "\tcmp.w #$8000\n");   /* C = sign bit */
+            fprintf(outf, "\tror a\n");
+            emit_store_high(i->to, fn);
+            emitload(i->to, fn);
+            fprintf(outf, "\tror a\n");
+            emitstore(i->to, fn);
+            fprintf(outf, "\tdex\n");
+            fprintf(outf, "\tbne @vsh_loop.%d\n", lbl);
+            fprintf(outf, "@vsh_done.%d:\n", lbl);
+            acache_invalidate();
+            break;
+        }
         emitload(r0, fn);
         if (rtype(r1) == RCon) {
             c = &fn->con[r1.val];
@@ -3665,6 +3781,36 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "\tror a\n");
                 emitstore(i->to, fn);
             }
+            acache_invalidate();
+            break;
+        }
+        if (i->cls == Kl) {
+            /* Variable-count 32-bit logical right shift: copy the pair to the
+             * destination, then shift it in place `count` times with the
+             * carry crossing the halves. The Kw fallback below shifted the
+             * low half alone and stored an unwritten slot as the high half
+             * (c_features ROM, 2026-09-13; the count is a Kw temp, so only
+             * its low word is read — counts of 32 or more shift to zero /
+             * the sign, as the loop naturally does). The load / store
+             * helpers never touch C, which is what carries the bit across. */
+            int lbl = ++var_shift_seq;
+            emitload(r0, fn);
+            emitstore(i->to, fn);
+            emit_load_high(r0, fn, 0);
+            emit_store_high(i->to, fn);
+            emitload(r1, fn);
+            fprintf(outf, "\ttax\n");
+            fprintf(outf, "\tbeq @vsh_done.%d\n", lbl);
+            fprintf(outf, "@vsh_loop.%d:\n", lbl);
+            emit_load_high(i->to, fn, 0);
+            fprintf(outf, "\tlsr a\n");
+            emit_store_high(i->to, fn);
+            emitload(i->to, fn);
+            fprintf(outf, "\tror a\n");
+            emitstore(i->to, fn);
+            fprintf(outf, "\tdex\n");
+            fprintf(outf, "\tbne @vsh_loop.%d\n", lbl);
+            fprintf(outf, "@vsh_done.%d:\n", lbl);
             acache_invalidate();
             break;
         }
@@ -3784,9 +3930,8 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Ocsltw:
-        /* Signed less than */
-        emitload(r0, fn);
-        emitop2("cmp", r1, fn);
+        /* Signed less than (N = a < b, overflow folded in) */
+        emit_scmp_w(r0, r1, fn);
         fprintf(outf, "\tbmi +\n");
         fprintf(outf, "\tlda.w #0\n");
         fprintf(outf, "\tbra ++\n");
@@ -3797,9 +3942,7 @@ emitins(Ins *i, Fn *fn)
 
     case Ocsltl:
         /* Signed less than (32-bit): cascade high → low. */
-        emit_load_high(r0, fn, 0);
-        emitop2_high("cmp", r1, fn);
-        fprintf(outf, "\tbeq +\n");
+        emit_scmp_high(r0, r1, fn, "+");   /* Z-test first, then N with overflow folded */
         fprintf(outf, "\tbmi ++\n");
         fprintf(outf, "\tbra +++\n");
         fprintf(outf, "+\n");
@@ -3816,8 +3959,7 @@ emitins(Ins *i, Fn *fn)
 
     case Ocsgtw:
         /* Signed greater than: swap operands and use less than */
-        emitload(r1, fn);
-        emitop2("cmp", r0, fn);
+        emit_scmp_w(r1, r0, fn);
         fprintf(outf, "\tbmi +\n");
         fprintf(outf, "\tlda.w #0\n");
         fprintf(outf, "\tbra ++\n");
@@ -3828,9 +3970,7 @@ emitins(Ins *i, Fn *fn)
 
     case Ocsgtl:
         /* Signed greater than (32-bit): test r1 < r0. */
-        emit_load_high(r1, fn, 0);
-        emitop2_high("cmp", r0, fn);
-        fprintf(outf, "\tbeq +\n");
+        emit_scmp_high(r1, r0, fn, "+");   /* Z-test first, then N with overflow folded */
         fprintf(outf, "\tbmi ++\n");
         fprintf(outf, "\tbra +++\n");
         fprintf(outf, "+\n");
@@ -3847,8 +3987,7 @@ emitins(Ins *i, Fn *fn)
 
     case Ocslew:
         /* Signed less or equal: !(a > b) */
-        emitload(r1, fn);
-        emitop2("cmp", r0, fn);
+        emit_scmp_w(r1, r0, fn);
         fprintf(outf, "\tbmi +\n");
         fprintf(outf, "\tlda.w #1\n");
         fprintf(outf, "\tbra ++\n");
@@ -3859,9 +3998,7 @@ emitins(Ins *i, Fn *fn)
 
     case Ocslel:
         /* Signed <= (32-bit): NOT (r1 < r0). */
-        emit_load_high(r1, fn, 0);
-        emitop2_high("cmp", r0, fn);
-        fprintf(outf, "\tbeq +\n");
+        emit_scmp_high(r1, r0, fn, "+");   /* Z-test first, then N with overflow folded */
         fprintf(outf, "\tbmi +++\n");
         fprintf(outf, "\tbra ++\n");
         fprintf(outf, "+\n");
@@ -3878,8 +4015,7 @@ emitins(Ins *i, Fn *fn)
 
     case Ocsgew:
         /* Signed greater or equal: !(a < b) */
-        emitload(r0, fn);
-        emitop2("cmp", r1, fn);
+        emit_scmp_w(r0, r1, fn);
         fprintf(outf, "\tbmi +\n");
         fprintf(outf, "\tlda.w #1\n");
         fprintf(outf, "\tbra ++\n");
@@ -3890,9 +4026,7 @@ emitins(Ins *i, Fn *fn)
 
     case Ocsgel:
         /* Signed >= (32-bit): NOT (r0 < r1). */
-        emit_load_high(r0, fn, 0);
-        emitop2_high("cmp", r1, fn);
-        fprintf(outf, "\tbeq +\n");
+        emit_scmp_high(r0, r1, fn, "+");   /* Z-test first, then N with overflow folded */
         fprintf(outf, "\tbmi +++\n");
         fprintf(outf, "\tbra ++\n");
         fprintf(outf, "+\n");
@@ -4446,7 +4580,13 @@ emitins(Ins *i, Fn *fn)
         emitstore(i->to, fn);
         /* === A6.11: extend high half for Kl dest === */
         if (i->cls == Kl) {
-            fprintf(outf, "\tbpl +\n");
+            /* The sign test must not rely on N surviving emitstore():
+             * a far-frame store is `ldy #n ; sta [tcc__fp],y`, and ldy
+             * rewrites N (found by the c_features ROM, 2026-09-13:
+             * (s32)(s16)-7 came out as $0000FFF9). A still holds the
+             * word, so derive the sign from a compare: C = A >= $8000. */
+            fprintf(outf, "\tcmp.w #$8000\n");
+            fprintf(outf, "\tbcc +\n");
             fprintf(outf, "\tlda.w #$FFFF\n");
             fprintf(outf, "\tbra ++\n");
             fprintf(outf, "+\tlda.w #0\n");
@@ -4482,7 +4622,13 @@ emitins(Ins *i, Fn *fn)
         emitload(r0, fn);
         emitstore(i->to, fn);
         if (i->cls == Kl) {
-            fprintf(outf, "\tbpl +\n");
+            /* The sign test must not rely on N surviving emitstore():
+             * a far-frame store is `ldy #n ; sta [tcc__fp],y`, and ldy
+             * rewrites N (found by the c_features ROM, 2026-09-13:
+             * (s32)(s16)-7 came out as $0000FFF9). A still holds the
+             * word, so derive the sign from a compare: C = A >= $8000. */
+            fprintf(outf, "\tcmp.w #$8000\n");
+            fprintf(outf, "\tbcc +\n");
             fprintf(outf, "\tlda.w #$FFFF\n");
             fprintf(outf, "\tbra ++\n");
             fprintf(outf, "+\tlda.w #0\n");
@@ -4528,7 +4674,13 @@ emitins(Ins *i, Fn *fn)
         emitload(r0, fn);
         emitstore(i->to, fn);
         if (i->cls == Kl) {
-            fprintf(outf, "\tbpl +\n");
+            /* The sign test must not rely on N surviving emitstore():
+             * a far-frame store is `ldy #n ; sta [tcc__fp],y`, and ldy
+             * rewrites N (found by the c_features ROM, 2026-09-13:
+             * (s32)(s16)-7 came out as $0000FFF9). A still holds the
+             * word, so derive the sign from a compare: C = A >= $8000. */
+            fprintf(outf, "\tcmp.w #$8000\n");
+            fprintf(outf, "\tbcc +\n");
             fprintf(outf, "\tlda.w #$FFFF\n");
             fprintf(outf, "\tbra ++\n");
             fprintf(outf, "+\tlda.w #0\n");
@@ -4799,10 +4951,33 @@ emitins(Ins *i, Fn *fn)
          * comment: the historical fallthrough silently dropped struct
          * assignments (Oblit0/Oblit1, op 60/61 — caught 2026-07-19 via
          * audioGetSampleInfo returning garbage). Fail the build. */
-        fprintf(stderr,
-                "cc65816/qbe: unhandled IR op %d in function emission — "
-                "refusing to emit silently-wrong code (struct assignment "
-                "is not supported yet; copy field-by-field)\n", i->op);
+        {
+            const char *hint;
+            switch (i->op) {
+            case Ovastart: case Ovaarg:
+                hint = "variadic functions (va_start / va_arg) are not "
+                       "supported on w65816; pass an array and a count";
+                break;
+            case Oparc: case Oargc:
+                hint = "struct parameters and struct returns by value are "
+                       "not supported on w65816; pass a pointer";
+                break;
+            case Oblit0: case Oblit1:
+            case Oloaduh: case Oloadsh: case Ostoreh:
+                /* blit is expanded to halfword loads/stores before it
+                 * reaches the emitter; the front end never emits them
+                 * otherwise on a 16-bit-int target */
+                hint = "struct assignment is not supported yet; copy "
+                       "field-by-field";
+                break;
+            default:
+                hint = "this operation has no w65816 lowering";
+            }
+            fprintf(stderr,
+                    "cc65816/qbe: unhandled IR op %d (%s) in function "
+                    "emission — refusing to emit silently-wrong code: %s\n",
+                    i->op, optab[i->op].name, hint);
+        }
         exit(1);
     }
 
@@ -4942,7 +5117,14 @@ emitjmp(Blk *b, Fn *fn)
             int swap;
             const char *bt, *bf;
             cmp_branch_info(fused_cmp_op, &swap, &bt, &bf);
-            if (swap) {
+            if (fused_cmp_op == Ocsltw || fused_cmp_op == Ocsgtw
+                || fused_cmp_op == Ocslew || fused_cmp_op == Ocsgew) {
+                /* signed: N must include the overflow bit */
+                if (swap)
+                    emit_scmp_w(fused_cmp_r1, fused_cmp_r0, fn);
+                else
+                    emit_scmp_w(fused_cmp_r0, fused_cmp_r1, fn);
+            } else if (swap) {
                 emitload(fused_cmp_r1, fn);
                 emitop2("cmp", fused_cmp_r0, fn);
             } else {
@@ -4975,11 +5157,21 @@ emitjmp(Blk *b, Fn *fn)
             }
             fused_cmp = 0;
         } else {
+            /* A 32-bit condition (`if (long_var)`) is nonzero when EITHER
+             * half is: OR the high half in before testing Z. Testing the
+             * low word alone made `if (x)` false for x = 0x10000
+             * (c_features ROM, 2026-09-13). */
+            int kl = rtype(b->jmp.arg) == RTmp && b->jmp.arg.val >= Tmp0
+                     && fn->tmp[b->jmp.arg.val].cls == Kl;
             emitload(b->jmp.arg, fn);
+            if (kl) {
+                emitop2_high("ora", b->jmp.arg, fn);
+                acache_invalidate();
+            }
             /* Only emit cmp.w #0 when A-cache hit skipped the lda.
              * When emitload actually emitted an lda, Z flag is already
              * correctly set from the loaded value. */
-            if (!last_load_emitted)
+            else if (!last_load_emitted)
                 fprintf(outf, "\tcmp.w #0\n");
             if (b->s1 == b->link) {
                 /* True branch falls through - invert: branch on zero to s2 */
@@ -5217,7 +5409,7 @@ w65816_emitfn(Fn *fn, FILE *f)
              * a direct compare+conditional branch instead. */
             if (i == &b->ins[b->nins] - 1
                 && b->jmp.type == Jjnz
-                && is_cmp_op(i->op)
+                && is_cmp_op(i->op) && !is_kl_cmp(i->op)
                 && rtype(i->to) == RTmp && i->to.val >= Tmp0
                 && req(i->to, b->jmp.arg)) {
                 int cidx = i->to.val - Tmp0;
