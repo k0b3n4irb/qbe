@@ -319,7 +319,9 @@ selcall(Fn *fn, Ins *i0, Ins *i1, RAlloc **rap)
 	} else
 		ca = argsclass(i0, i1, ac, Oarg, 0, &env);
 
-	for (stk=0, a=&ac[i1-i0]; a>ac;)
+	/* a call with no argument has ac == alloc(0) == NULL; forming
+	 * &ac[0] is a UBSan pointer-overflow report on clang < 19 */
+	for (stk=0, a=(i1>i0 ? &ac[i1-i0] : ac); a>ac;)
 		if ((--a)->inmem) {
 			if (a->align > 4)
 				err("sysv abi requires alignments of 16 or less");
