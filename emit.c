@@ -131,8 +131,10 @@ string_length(char *str)
 	return len;
 }
 
-void
-emitlnk(char *n, Lnk *l, int s, FILE *f)
+static void wla_emitdat(Dat *d, FILE *f);
+
+static void
+wla_emitlnk(char *n, Lnk *l, int s, FILE *f)
 {
 	char *pfx;
 	char *name;
@@ -174,6 +176,152 @@ emitlnk(char *n, Lnk *l, int s, FILE *f)
 	/* WLA-DX: skip .globl since we compile as single file.
 	 * Symbols are visible within the same compilation unit. */
 	fprintf(f, "%s%s:\n", pfx, name);
+}
+
+/* The two emitters above speak WLA-DX for the w65816 target. The
+ * upstream ELF/Mach-O emitters (QBE e0ded59, the fork's base) are kept
+ * verbatim below so the amd64 / arm64 / rv64 targets still assemble:
+ * that is what lets `tools/test.sh` (the upstream suite) run natively on
+ * the host and exercise the shared passes this fork patched. The public
+ * emitlnk / emitdat dispatch on the selected target. */
+
+static void
+elf_emitlnk(char *n, Lnk *l, int s, FILE *f)
+{
+	static char *sec[2][3] = {
+		[0][SecText] = ".text",
+		[0][SecData] = ".data",
+		[0][SecBss] = ".bss",
+		[1][SecText] = ".abort \"unreachable\"",
+		[1][SecData] = ".section .tdata,\"awT\"",
+		[1][SecBss] = ".section .tbss,\"awT\"",
+	};
+	char *pfx, *sfx;
+
+	pfx = n[0] == '"' ? "" : T.assym;
+	sfx = "";
+	if (T.apple && l->thread) {
+		l->sec = "__DATA";
+		l->secf = "__thread_data,thread_local_regular";
+		sfx = "$tlv$init";
+		fputs(
+			".section __DATA,__thread_vars,"
+			"thread_local_variables\n",
+			f
+		);
+		fprintf(f, "%s%s:\n", pfx, n);
+		fprintf(f,
+			"\t.quad __tlv_bootstrap\n"
+			"\t.quad 0\n"
+			"\t.quad %s%s%s\n\n",
+			pfx, n, sfx
+		);
+	}
+	if (l->sec) {
+		fprintf(f, ".section %s", l->sec);
+		if (l->secf)
+			fprintf(f, ",%s", l->secf);
+	} else
+		fputs(sec[l->thread != 0][s], f);
+	fputc('\n', f);
+	if (l->align)
+		fprintf(f, ".balign %d\n", l->align);
+	if (l->export)
+		fprintf(f, ".globl %s%s\n", pfx, n);
+	fprintf(f, "%s%s%s:\n", pfx, n, sfx);
+}
+
+
+static void
+elf_emitdat(Dat *d, FILE *f)
+{
+	static struct {
+		char decl[8];
+		int64_t mask;
+	} di[] = {
+		[DB] = {"\t.byte", 0xffL},
+		[DH] = {"\t.short", 0xffffL},
+		[DW] = {"\t.int", 0xffffffffL},
+		[DL] = {"\t.quad", -1L},
+	};
+	static int64_t zero;
+	char *p;
+
+	switch (d->type) {
+	case DStart:
+		zero = 0;
+		break;
+	case DEnd:
+		if (d->lnk->common) {
+			if (zero == -1)
+				die("invalid common data definition");
+			p = d->name[0] == '"' ? "" : T.assym;
+			fprintf(f, ".comm %s%s,%"PRId64,
+				p, d->name, zero);
+			if (d->lnk->align)
+				fprintf(f, ",%d", d->lnk->align);
+			fputc('\n', f);
+		}
+		else if (zero != -1) {
+			elf_emitlnk(d->name, d->lnk, SecBss, f);
+			fprintf(f, "\t.fill %"PRId64",1,0\n", zero);
+		}
+		break;
+	case DZ:
+		if (zero != -1)
+			zero += d->u.num;
+		else
+			fprintf(f, "\t.fill %"PRId64",1,0\n", d->u.num);
+		break;
+	default:
+		if (zero != -1) {
+			elf_emitlnk(d->name, d->lnk, SecData, f);
+			if (zero > 0)
+				fprintf(f, "\t.fill %"PRId64",1,0\n", zero);
+			zero = -1;
+		}
+		if (d->isstr) {
+			if (d->type != DB)
+				err("strings only supported for 'b' currently");
+			fprintf(f, "\t.ascii %s\n", d->u.str);
+		}
+		else if (d->isref) {
+			p = d->u.ref.name[0] == '"' ? "" : T.assym;
+			fprintf(f, "%s %s%s%+"PRId64"\n",
+				di[d->type].decl, p, d->u.ref.name,
+				d->u.ref.off);
+		}
+		else {
+			fprintf(f, "%s %"PRId64"\n",
+				di[d->type].decl,
+				d->u.num & di[d->type].mask);
+		}
+		break;
+	}
+}
+
+static int
+wla_target(void)
+{
+	return strcmp(T.name, "w65816") == 0;
+}
+
+void
+emitlnk(char *n, Lnk *l, int s, FILE *f)
+{
+	if (wla_target())
+		wla_emitlnk(n, l, s, f);
+	else
+		elf_emitlnk(n, l, s, f);
+}
+
+void
+emitdat(Dat *d, FILE *f)
+{
+	if (wla_target())
+		wla_emitdat(d, f);
+	else
+		elf_emitdat(d, f);
 }
 
 void
@@ -270,8 +418,8 @@ emit_init_data(FILE *f)
 	}
 }
 
-void
-emitdat(Dat *d, FILE *f)
+static void
+wla_emitdat(Dat *d, FILE *f)
 {
 	char *p;
 	char *name;
