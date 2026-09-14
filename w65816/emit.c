@@ -156,7 +156,7 @@ emit_load_high(Ref r, Fn *fn, int sp_adjust)
             if (slot >= 0)
                 emit_stack_load((slot + 1) * 2 + 2, sp_adjust);
             else
-                fprintf(outf, "\t; unallocated temp high %d\n", r.val);
+                fprintf(outf, "\t; unallocated temp high %u\n", r.val);
         } else {
             /* R0-R7 vregs are 16-bit only — no high half to load. */
             fprintf(outf, "\tlda.w #0\n");
@@ -1659,7 +1659,7 @@ mark_dead_stores(Fn *fn)
                     && next->arg[0].val >= Tmp0
                     && (next->arg[0].val - Tmp0) == idx
                     && consumes_r0_via_emitload(next, fn)) {
-                    if (getenv("QBE_DBG_DEAD")) fprintf(stderr, "DEADSTORE case2 tmp%d (next op %d)\n", idx, next->op);
+                    if (getenv("QBE_DBG_DEAD")) fprintf(stderr, "DEADSTORE case2 tmp%d (next op %u)\n", idx, next->op);
                     temp_is_dead_store[idx] = 1;
                 }
             }
@@ -2288,10 +2288,10 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
                 if (slot >= 0)
                     emit_stack_load((slot + 1) * 2, sp_adjust);
                 else
-                    fprintf(outf, "\t; unallocated temp %d\n", r.val);
+                    fprintf(outf, "\t; unallocated temp %u\n", r.val);
             }
         } else {
-            fprintf(outf, "\t; unknown temp %d\n", r.val);
+            fprintf(outf, "\t; unknown temp %u\n", r.val);
         }
         break;
     case RCon:
