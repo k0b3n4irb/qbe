@@ -4933,6 +4933,19 @@ emitins(Ins *i, Fn *fn)
                 fprintf(outf, "\tclc\n");
                 fprintf(outf, "\tadc.w #%d\n", (aslot + 1) * 2);
                 emitstore(i->to, fn);
+                /* The address of a local is a FAR pointer like any other
+                 * (A6): its bank half must be written, and the stack lives
+                 * in bank $00. Until 2026-09-21 only the low half was
+                 * stored, so `&local` handed to a bank-honouring reader — a
+                 * `const T *` parameter (#121), a lib asm routine reading
+                 * the bank byte — carried whatever the stack held there:
+                 * zero on a fresh power-on, which is why it survived, and
+                 * a wild bank once earlier calls had dirtied that slot
+                 * (collideRect(&a, &b) returning 0 in the lib fixture). */
+                if (i->cls == Kl && !ref_to_is_addr_only(i->to)) {
+                    fprintf(outf, "\tlda.w #0\n");
+                    emit_store_high(i->to, fn);
+                }
             }
         }
         break;
