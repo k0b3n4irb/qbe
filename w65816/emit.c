@@ -119,6 +119,9 @@ emit_stack_op(const char *op, int frame_off, int sp_adjust)
 /* Forward declaration — acache_invalidate is defined just below the Kl
  * helpers but the helpers call it on high-half load. */
 static void acache_invalidate(void);
+static void note_high_written(Ref r);
+static int high_written(Ref r);
+static void check_high_read(Ref r, Fn *fn);
 
 /* === Kl-class high-half helpers (chantiers A6 + A7) ===
  *
@@ -152,6 +155,7 @@ emit_load_high(Ref r, Fn *fn, int sp_adjust)
                 fprintf(outf, "\tlda.w #0\n");
                 break;
             }
+            check_high_read(r, fn);
             slot = fn->tmp[r.val].slot;
             if (slot >= 0)
                 emit_stack_load((slot + 1) * 2 + 2, sp_adjust);
@@ -202,6 +206,7 @@ emit_store_high(Ref r, Fn *fn)
     acache_invalidate();
 
     if (rtype(r) == RTmp && r.val >= Tmp0) {
+        note_high_written(r);
         slot = fn->tmp[r.val].slot;
         if (slot >= 0)
             emit_stack_store((slot + 1) * 2 + 2, 0);
@@ -224,6 +229,7 @@ emitop2_high(char *op, Ref r, Fn *fn)
     switch (rtype(r)) {
     case RTmp:
         if (r.val >= Tmp0) {
+            check_high_read(r, fn);
             slot = fn->tmp[r.val].slot;
             if (slot >= 0)
                 emit_stack_op(op, (slot + 1) * 2 + 2, 0);
@@ -445,6 +451,52 @@ static int temp_high_zero[MAX_ALIAS_TEMPS];
  * When set, Oadd Kl / Omul Kl pow2 emitting this temp skip the high-half
  * computation entirely — saving ~25 cycles per array indexing site. */
 static int temp_addr_only[MAX_ALIAS_TEMPS];
+
+/* Kl high-half invariant (2026-09-26). A Kl temp owns two words; every
+ * producer must write both, except the addr_only ones whose consumers
+ * never read the high word. Four silent bugs in three months (DL fields
+ * cut to 24 bits, #132 const struct banks, the Kl phi, `&local`) were a
+ * producer writing only the low word, each found downstream by a
+ * consumer. So the emitter now checks the class itself: a high-word
+ * write marks the temp, a high-word read of an unmarked Kl temp stops
+ * compilation. Emission follows the block order, where a def precedes
+ * its uses and a phi's entry-edge copy precedes the loop body. */
+static unsigned char temp_high_written[MAX_ALIAS_TEMPS];
+
+static void
+note_high_written(Ref r)
+{
+    int idx;
+    if (rtype(r) != RTmp || r.val < Tmp0)
+        return;
+    idx = r.val - Tmp0;
+    if (idx >= 0 && idx < MAX_ALIAS_TEMPS)
+        temp_high_written[idx] = 1;
+}
+
+static int
+high_written(Ref r)
+{
+    int idx = r.val - Tmp0;
+    return idx < 0 || idx >= MAX_ALIAS_TEMPS || temp_high_written[idx];
+}
+
+static void
+check_high_read(Ref r, Fn *fn)
+{
+    if (rtype(r) != RTmp || r.val < Tmp0 || fn->tmp[r.val].cls != Kl)
+        return;
+    if (fn->tmp[r.val].slot < 0 || high_written(r))
+        return;
+    if (getenv("QBE_KL_CHECK_WARN")) {
+        fprintf(stderr, "qbe: Kl high half of %%%s read before any write in %s\n",
+                fn->tmp[r.val].name, fn->name);
+        return;
+    }
+    err("internal compiler error: the high word of the 32-bit value %%%s "
+        "is read in %s but no instruction wrote it (Kl high-half invariant, "
+        "compiler/qbe/w65816/emit.c)", fn->tmp[r.val].name, fn->name);
+}
 
 /* #121 + B2: the access target's bank is not $00 — a const object (ROM,
  * access-flag bit 1, #121) or a `__far` object in bank $7E WRAM (bit 2,
@@ -3900,6 +3952,13 @@ emitins(Ins *i, Fn *fn)
         if (!req(i->to, r0)) {
             emitload(r0, fn);
             emitstore(i->to, fn);
+            /* A Kl copy moves both words. gvn folds every copy seen so far
+             * before emission, which is the only reason this lowered the
+             * low word alone without a miscompile. */
+            if (i->cls == Kl && !ref_to_is_addr_only(i->to)) {
+                emit_load_high(r0, fn, 0);
+                emit_store_high(i->to, fn);
+            }
         }
         break;
 
@@ -5085,6 +5144,7 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
                          * 16 bits (CBits), then store to the high slot. */
                         emit_load_high(p->arg[n], fn, 0);
                         emit_stack_store((dstslot + 1) * 2 + 2, 0);
+                        note_high_written(p->to);
                     }
                 } else if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
                     int idx = p->arg[n].val - Tmp0;
@@ -5114,11 +5174,18 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
                                 /* Copy the high/bank half too. This clobbers A
                                  * (which held the low half), so drop the cache
                                  * afterward. */
+                                check_high_read(p->arg[n], fn);
                                 emit_stack_load((srcslot + 1) * 2 + 2, 0);
                                 emit_stack_store((dstslot + 1) * 2 + 2, 0);
+                                note_high_written(p->to);
                                 acache_invalidate();
                             }
                         }
+                        /* Coalesced slot: the phi's high word is the
+                         * argument's, written or not. */
+                        if (p->cls == Kl && srcslot == dstslot
+                            && high_written(p->arg[n]))
+                            note_high_written(p->to);
                         /* If same slot, no copy needed (coalesced) — a Kl temp
                          * owns both slots, so the high half is shared too. */
                     }
@@ -5346,6 +5413,7 @@ w65816_emitfn(Fn *fn, FILE *f)
     mark_high_zero(fn);
     mark_far_decomp(fn);        /* B2: before addr_only (feeds it) */
     mark_addr_only_kl(fn);
+    memset(temp_high_written, 0, sizeof(temp_high_written));
     r9_invalidate();
     caller_param_bytes = count_fn_param_bytes(fn);
 
