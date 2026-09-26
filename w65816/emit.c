@@ -711,9 +711,10 @@ mark_high_zero(Fn *fn)
             if (idx < 0 || idx >= MAX_ALIAS_TEMPS) continue;
             /* any zero-extension into Kl — cproc widens a u8/u16 index
              * with extub/extuh, not only extuw */
-            if (i->op == Oextub)
-                nb = 8;
-            else if (i->op == Oextuh || i->op == Oextuw)
+            if (i->op == Oextub || i->op == Oloadub)
+                nb = 8;         /* a zero-extending byte load into Kl too:
+                                 * QBE folds `loadub` + `extub` into it */
+            else if (i->op == Oextuh || i->op == Oextuw || i->op == Oloaduh)
                 nb = 16;
             else if ((i->op == Oshl || i->op == Omul)
                      && rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0
@@ -729,6 +730,13 @@ mark_high_zero(Fn *fn)
                          && (v & (v - 1)) == 0) {
                     cnt = 0;
                     while ((1 << cnt) < v) cnt++;
+                } else if (i->op == Omul && v > 0 && v < 65536) {
+                    /* Any constant (2026-09-26): x < 2^b and v < 2^len
+                     * give x*v < 2^(b+len). Lets `board[row][col]` with a
+                     * byte row keep a zero high half, so the multiply by
+                     * the row size inlines instead of calling tcc_mul32. */
+                    cnt = 0;
+                    while ((1LL << cnt) <= v) cnt++;
                 }
                 if (cnt >= 0 && bits[i->arg[0].val - Tmp0] + cnt <= 16)
                     nb = bits[i->arg[0].val - Tmp0] + cnt;
@@ -2846,6 +2854,37 @@ emitins(Ins *i, Fn *fn)
                         fprintf(outf, "\trol a\n");
                         emit_store_high(i->to, fn);
                     }
+                }
+                acache_invalidate();
+                break;
+            }
+        }
+        /* === Kl by a non-power-of-2 constant, product known to fit in 16
+         * bits (or its high half dead) — 2026-09-26 ===
+         * The low 16 bits of x*v depend only on the low 16 bits of x, so
+         * the 16-bit shift-add sequence of the Kw path gives the low half.
+         * The high half is 0 when mark_high_zero proved x*v < 2^16 (a byte
+         * index times a row size: `board[row][col]`), and is not needed at
+         * all for an addr_only destination. Before this, both went through
+         * `jsl tcc_mul32` (~250 cycles; 60 call sites in the corpus). */
+        if (i->cls == Kl && rtype(r1) == RCon
+            && fn->con[r1.val].type == CBits) {
+            int64_t val = fn->con[r1.val].bits.i;
+            int skip_high = ref_to_is_addr_only(i->to);
+            if (val > 2 && val < 32768 && (val & (val - 1)) != 0
+                && is_inline_mul_const((int)val)
+                && (skip_high || ref_is_high_zero(i->to, fn))) {
+                int base = (int)val, k = 0;
+                while ((base & 1) == 0) { base >>= 1; k++; }
+                emitload(r0, fn);
+                fprintf(outf, "\tsta.b tcc__r9\n");
+                emit_mul_body(outf, base);
+                for (int j = 0; j < k; j++)
+                    fprintf(outf, "\tasl a\n");
+                emitstore(i->to, fn);
+                if (!skip_high) {
+                    fprintf(outf, "\tlda.w #0\n");
+                    emit_store_high(i->to, fn);
                 }
                 acache_invalidate();
                 break;
