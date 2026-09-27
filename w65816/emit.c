@@ -122,6 +122,8 @@ static void acache_invalidate(void);
 static void note_high_written(Ref r);
 static int high_written(Ref r);
 static void check_high_read(Ref r, Fn *fn);
+static void slot_wrote(Ref r, int half);
+static void slot_read(Ref r, int half, Fn *fn);
 
 /* === Kl-class high-half helpers (chantiers A6 + A7) ===
  *
@@ -156,6 +158,7 @@ emit_load_high(Ref r, Fn *fn, int sp_adjust)
                 break;
             }
             check_high_read(r, fn);
+            slot_read(r, 1, fn);
             slot = fn->tmp[r.val].slot;
             if (slot >= 0)
                 emit_stack_load((slot + 1) * 2 + 2, sp_adjust);
@@ -207,6 +210,7 @@ emit_store_high(Ref r, Fn *fn)
 
     if (rtype(r) == RTmp && r.val >= Tmp0) {
         note_high_written(r);
+        slot_wrote(r, 1);
         slot = fn->tmp[r.val].slot;
         if (slot >= 0)
             emit_stack_store((slot + 1) * 2 + 2, 0);
@@ -230,6 +234,7 @@ emitop2_high(char *op, Ref r, Fn *fn)
     case RTmp:
         if (r.val >= Tmp0) {
             check_high_read(r, fn);
+            slot_read(r, 1, fn);
             slot = fn->tmp[r.val].slot;
             if (slot >= 0)
                 emit_stack_op(op, (slot + 1) * 2 + 2, 0);
@@ -496,6 +501,59 @@ check_high_read(Ref r, Fn *fn)
     err("internal compiler error: the high word of the 32-bit value %%%s "
         "is read in %s but no instruction wrote it (Kl high-half invariant, "
         "compiler/qbe/w65816/emit.c)", fn->tmp[r.val].name, fn->name);
+}
+
+/* Slot-ownership check (2026-09-27), the net under the slot colouring:
+ * temps with disjoint lives now share slots, so a read must find the slot
+ * last written by the same temp. Tracked per slot word within a block in
+ * emission order (reset at each block: across blocks, layout order is not
+ * execution order). A mismatch means an operand was read after a
+ * co-slotted temp overwrote it — a fold or deferral the interference graph
+ * did not model. Internal compiler error; QBE_SLOT_CHECK_WARN=1 lists all. */
+#define SLOT_OWN_MAX 4096
+static int slot_owner[SLOT_OWN_MAX];
+static Fn *slot_fn;
+
+static void
+slot_owner_reset(void)
+{
+    int k;
+    for (k = 0; k < SLOT_OWN_MAX; k++)
+        slot_owner[k] = -1;
+}
+
+static void
+slot_wrote(Ref r, int half)
+{
+    int s;
+    if (!slot_fn || rtype(r) != RTmp || r.val < Tmp0)
+        return;
+    s = slot_fn->tmp[r.val].slot;
+    if (s < 0 || s + half >= SLOT_OWN_MAX)
+        return;
+    slot_owner[s + half] = r.val;
+}
+
+static void
+slot_read(Ref r, int half, Fn *fn)
+{
+    int s, o;
+    if (rtype(r) != RTmp || r.val < Tmp0)
+        return;
+    s = fn->tmp[r.val].slot;
+    if (s < 0 || s + half >= SLOT_OWN_MAX)
+        return;
+    o = slot_owner[s + half];
+    if (o < 0 || o == (int)r.val)
+        return;
+    if (getenv("QBE_SLOT_CHECK_WARN")) {
+        fprintf(stderr, "qbe: %%%s read from slot %d last written by %%%s in %s\n",
+                fn->tmp[r.val].name, s + half, fn->tmp[o].name, fn->name);
+        return;
+    }
+    err("internal compiler error: %%%s is read from stack slot %d, which %%%s "
+        "overwrote in %s (slot-ownership check, compiler/qbe/w65816/emit.c)",
+        fn->tmp[r.val].name, s + half, fn->tmp[o].name, fn->name);
 }
 
 /* #121 + B2: the access target's bank is not $00 — a const object (ROM,
@@ -2266,6 +2324,176 @@ coalescephi(Phi *p, Fn *fn)
 }
 
 /*
+ * Slot colouring (2026-09-27). Until then every temp owned its own slot for
+ * the whole function, so a frame was the sum of every temp that ever
+ * existed: median 38 bytes, sprite_swarm's main 518, six functions past the
+ * 256-byte direct stack-relative reach (large_frame_mode). Temps whose live
+ * ranges never overlap can share a slot.
+ *
+ * Interference, from QBE's liveness (filllive, run before emission):
+ *   - a definition interferes with everything live after it;
+ *   - and with its own operands: the Kl lowerings write the low half of
+ *     the result, then read the operands' high halves (and several ops
+ *     read an operand again after a partial write), so a result sharing
+ *     an operand's slot would clobber it;
+ *   - a phi result interferes with the other phis of its block and with
+ *     everything live at the end of each predecessor, where the phi moves
+ *     are emitted one after the other (no parallel-copy hazard; the moves
+ *     are the same as before, never skipped by an accidental share);
+ *   - a Kl add may be folded into its far accesses and not emitted
+ *     (far_decomp_all): its operands are then read at the loads, after
+ *     the point where the IR sees them die. Conservatively, the operands
+ *     of every Kl add inherit all of the add's interferences.
+ * Greedy first fit in definition order, Kl temps two slots wide.
+ * QBE_NO_SLOT_COLOR=1 falls back to one slot per temp (A/B comparisons).
+ */
+static void
+slot_edge(unsigned long long *adj, int words, int a, int b)
+{
+    if (a == b || a < Tmp0 || b < Tmp0)
+        return;
+    adj[(size_t)a * words + b / 64] |= 1ull << (b % 64);
+    adj[(size_t)b * words + a / 64] |= 1ull << (a % 64);
+}
+
+static int
+color_slots(Fn *fn, int base)
+{
+    int nt = fn->ntmp, words = (nt + 63) / 64;
+    unsigned long long *adj;
+    int *order, norder = 0, *start, maxslot = base;
+    char *seen, *occ;
+    BSet live[1];
+    Blk *b, *pb;
+    Ins *i;
+    Phi *p, *q;
+    int t, u, k, a, n, w, s, changed, pass;
+
+    adj = calloc((size_t)nt * words, sizeof *adj);
+    seen = calloc(nt, 1);
+    order = calloc(nt, sizeof *order);
+    start = calloc(nt, sizeof *start);
+    if (!adj || !seen || !order || !start)
+        die("out of memory");
+    bsinit(live, nt);
+
+#define NOTE(r) do { if (rtype(r) == RTmp && (r).val >= Tmp0 && !seen[(r).val]) \
+        { seen[(r).val] = 1; order[norder++] = (r).val; } } while (0)
+    /* definition order, the order the old allocator used */
+    for (b = fn->start; b; b = b->link) {
+        for (p = b->phi; p; p = p->link) {
+            NOTE(p->to);
+            for (n = 0; n < (int)p->narg; n++)
+                NOTE(p->arg[n]);
+        }
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            NOTE(i->to);
+            NOTE(i->arg[0]);
+            NOTE(i->arg[1]);
+        }
+        NOTE(b->jmp.arg);
+    }
+#undef NOTE
+
+    for (b = fn->start; b; b = b->link) {
+        bscopy(live, b->out);
+        if (rtype(b->jmp.arg) == RTmp)
+            bsset(live, b->jmp.arg.val);
+        for (i = &b->ins[b->nins]; i != b->ins;) {
+            i--;
+            if (rtype(i->to) == RTmp && i->to.val >= Tmp0) {
+                t = i->to.val;
+                for (u = 0; bsiter(live, &u); u++)
+                    slot_edge(adj, words, t, u);
+                for (k = 0; k < 2; k++)
+                    if (rtype(i->arg[k]) == RTmp)
+                        slot_edge(adj, words, t, i->arg[k].val);
+                bsclr(live, t);
+            }
+            for (k = 0; k < 2; k++)
+                if (rtype(i->arg[k]) == RTmp)
+                    bsset(live, i->arg[k].val);
+        }
+        /* live now holds what is live on entry, phi results included */
+        for (p = b->phi; p; p = p->link) {
+            if (rtype(p->to) != RTmp)
+                continue;
+            for (q = b->phi; q; q = q->link)
+                if (rtype(q->to) == RTmp)
+                    slot_edge(adj, words, p->to.val, q->to.val);
+            for (u = 0; bsiter(live, &u); u++)
+                slot_edge(adj, words, p->to.val, u);
+            for (a = 0; a < (int)p->narg; a++) {
+                pb = p->blk[a];
+                for (u = 0; bsiter(pb->out, &u); u++)
+                    slot_edge(adj, words, p->to.val, u);
+            }
+        }
+    }
+
+    /* Kl adds: operands inherit the add's interferences (folded far adds) */
+    for (pass = 0, changed = 1; changed && pass < 8; pass++) {
+        changed = 0;
+        for (b = fn->start; b; b = b->link)
+            for (i = b->ins; i < &b->ins[b->nins]; i++) {
+                if (i->op != Oadd || i->cls != Kl || rtype(i->to) != RTmp
+                    || i->to.val < Tmp0)
+                    continue;
+                t = i->to.val;
+                for (k = 0; k < 2; k++) {
+                    if (rtype(i->arg[k]) != RTmp || i->arg[k].val < Tmp0)
+                        continue;
+                    u = i->arg[k].val;
+                    for (n = 0; n < words; n++) {
+                        unsigned long long add = adj[(size_t)t * words + n]
+                                                 & ~adj[(size_t)u * words + n];
+                        if (add) {
+                            int x;
+                            for (x = n * 64; x < n * 64 + 64 && x < nt; x++)
+                                if (add >> (x % 64) & 1)
+                                    slot_edge(adj, words, u, x);
+                            changed = 1;
+                        }
+                    }
+                }
+            }
+    }
+
+    occ = calloc((size_t)(base + 2 * nt + 4), 1);
+    if (!occ)
+        die("out of memory");
+    for (n = 0; n < norder; n++) {
+        t = order[n];
+        if (fn->tmp[t].slot >= 0) {
+            start[t] = fn->tmp[t].slot;
+            continue;
+        }
+        w = fn->tmp[t].cls == Kl ? 2 : 1;
+        memset(occ, 0, (size_t)(base + 2 * nt + 4));
+        for (k = 0; k < n; k++) {
+            u = order[k];
+            if (adj[(size_t)t * words + u / 64] >> (u % 64) & 1) {
+                int su = fn->tmp[u].slot, wu = fn->tmp[u].cls == Kl ? 2 : 1;
+                if (su >= 0)
+                    for (a = 0; a < wu; a++)
+                        occ[su + a] = 1;
+            }
+        }
+        for (s = base; occ[s] || (w == 2 && occ[s + 1]); s++)
+            ;
+        fn->tmp[t].slot = s;
+        if (s + w > maxslot)
+            maxslot = s + w;
+    }
+    free(occ);
+    free(adj);
+    free(seen);
+    free(order);
+    free(start);
+    return maxslot;
+}
+
+/*
  * Assign stack slots to all unassigned temps.
  * Called before emission when skiprega is set.
  * Must handle ALL refs (destinations and operands) since
@@ -2282,6 +2510,9 @@ assignslots(Fn *fn)
     Phi *p;
     int n;
     int maxslot = fn->slot;
+
+    if (!getenv("QBE_NO_SLOT_COLOR"))
+        return color_slots(fn, fn->slot);
 
     /* First pass: coalesce phi arguments with their results */
     for (b = fn->start; b; b = b->link) {
@@ -2345,6 +2576,7 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
             } else {
                 /* Spilled temp */
                 slot = fn->tmp[r.val].slot;
+                slot_read(r, 0, fn);
                 if (slot >= 0)
                     emit_stack_load((slot + 1) * 2, sp_adjust);
                 else
@@ -2462,6 +2694,7 @@ emitstore(Ref r, Fn *fn)
             slot = fn->tmp[r.val].slot;
             if (slot >= 0) {
                 emit_stack_store((slot + 1) * 2, 0);
+                slot_wrote(r, 0);
                 stored = 1;
             } else if (getenv("QBE_DBG_DEAD")) {
                 fprintf(stderr, "SILENT-NOSLOT tmp%d\n", r.val - Tmp0);
@@ -2505,6 +2738,7 @@ emitop2(char *op, Ref r, Fn *fn)
                 emit_stack_op(op, framesize + PARAM_OFFSET + (-neg_slot), 0);
             } else {
                 slot = fn->tmp[r.val].slot;
+                slot_read(r, 0, fn);
                 if (slot >= 0)
                     emit_stack_op(op, (slot + 1) * 2, 0);
             }
@@ -5139,11 +5373,13 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
                     /* Constant: load and store to phi slot (low half) */
                     emitload(p->arg[n], fn);
                     emit_stack_store((dstslot + 1) * 2, 0);
+                    slot_wrote(p->to, 0);
                     if (p->cls == Kl) {
                         /* High/bank half: `lda.w #:sym` (CAddr) or the top
                          * 16 bits (CBits), then store to the high slot. */
                         emit_load_high(p->arg[n], fn, 0);
                         emit_stack_store((dstslot + 1) * 2 + 2, 0);
+                        slot_wrote(p->to, 1);
                         note_high_written(p->to);
                     }
                 } else if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
@@ -5160,23 +5396,28 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
                             acache_set(p->arg[n]);
                         }
                         emit_stack_store((dstslot + 1) * 2, 0);
+                        slot_wrote(p->to, 0);
                     } else {
                         /* Temp: check if we need to copy */
                         int srcslot = fn->tmp[p->arg[n].val].slot;
                         if (srcslot >= 0 && srcslot != dstslot) {
                             /* Different slots - need to copy */
                             if (!acache_has(p->arg[n])) {
+                                slot_read(p->arg[n], 0, fn);
                                 emit_stack_load((srcslot + 1) * 2, 0);
                                 acache_set(p->arg[n]);
                             }
                             emit_stack_store((dstslot + 1) * 2, 0);
+                            slot_wrote(p->to, 0);
                             if (p->cls == Kl) {
                                 /* Copy the high/bank half too. This clobbers A
                                  * (which held the low half), so drop the cache
                                  * afterward. */
                                 check_high_read(p->arg[n], fn);
+                                slot_read(p->arg[n], 1, fn);
                                 emit_stack_load((srcslot + 1) * 2 + 2, 0);
                                 emit_stack_store((dstslot + 1) * 2 + 2, 0);
+                                slot_wrote(p->to, 1);
                                 note_high_written(p->to);
                                 acache_invalidate();
                             }
@@ -5414,6 +5655,8 @@ w65816_emitfn(Fn *fn, FILE *f)
     mark_far_decomp(fn);        /* B2: before addr_only (feeds it) */
     mark_addr_only_kl(fn);
     memset(temp_high_written, 0, sizeof(temp_high_written));
+    slot_fn = fn;
+    slot_owner_reset();
     r9_invalidate();
     caller_param_bytes = count_fn_param_bytes(fn);
 
@@ -5519,6 +5762,7 @@ w65816_emitfn(Fn *fn, FILE *f)
         fprintf(outf, "@%s:\n", b->name);
         r9_invalidate();        /* B2: control-flow merge */
         acache_invalidate();
+        slot_owner_reset();
 
         fused_cmp = 0;
         detect_block_tail_call(b, fn);
