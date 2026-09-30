@@ -5694,7 +5694,21 @@ w65816_emitfn(Fn *fn, FILE *f)
             fprintf(outf, "; @dbglocal %s %d\n", nm, (aslot + 1) * 2);
         }
     }
-    fprintf(outf, ".SECTION \".text.%s\" SUPERFREE\n", fn->name);
+    if (fn->lnk.sec && (strcmp(fn->lnk.sec, ".ram_code") == 0
+                        || strcmp(fn->lnk.sec, "\".ram_code\"") == 0)) {
+        /* OpenSNES: a C `__ramcode` function joins the RAM code window
+         * (templates/ram_code_start.asm): stored at the top of ROM bank 1,
+         * BASE $7D makes its labels $7E:xxxx, crt0 copies it at boot.
+         * Without a window (RAM_CODE_SIZE = 0) wlalink would only warn
+         * and place the section as a plain one with $7D-shifted labels —
+         * so the assembler stops the build instead. */
+        fprintf(outf, ".IFNDEF RAM_CODE\n"
+                      ".FAIL \"%s is __ramcode but the project has no RAM code window: set RAM_CODE_SIZE in the Makefile\"\n"
+                      ".ENDIF\n", fn->name);
+        fprintf(outf, ".SECTION \"ram_code.%s\" BASE $7D APPENDTO \".ram_code\"\n", fn->name);
+    } else {
+        fprintf(outf, ".SECTION \".text.%s\" SUPERFREE\n", fn->name);
+    }
     /* Tell WLA-DX that registers are 16-bit (65816 native mode ABI).
      * Without these, WLA-DX defaults to 8-bit and misassembles
      * index-register immediates like cpx #0 (2 bytes vs 3 bytes). */
