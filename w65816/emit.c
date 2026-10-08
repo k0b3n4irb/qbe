@@ -125,6 +125,9 @@ static void check_high_read(Ref r, Fn *fn);
 static void slot_wrote(Ref r, int half);
 static void slot_read(Ref r, int half, Fn *fn);
 
+/* 32-bit temps that take ONE word of frame (S5, see emitfn) */
+static unsigned char temp_narrow[MAX_ALLOC_TEMPS];
+
 /* === Kl-class high-half helpers (chantiers A6 + A7) ===
  *
  * A Kl temp owns 2 consecutive slots: low 16 at byte (slot+1)*2, high 16 at
@@ -209,6 +212,10 @@ emit_store_high(Ref r, Fn *fn)
     acache_invalidate();
 
     if (rtype(r) == RTmp && r.val >= Tmp0) {
+        /* a narrow temp has no high word on the stack: the word after its
+         * slot belongs to another temp */
+        if (r.val - Tmp0 < MAX_ALLOC_TEMPS && temp_narrow[r.val - Tmp0])
+            return;
         note_high_written(r);
         slot_wrote(r, 1);
         slot = fn->tmp[r.val].slot;
@@ -469,6 +476,7 @@ static int alias_opt;
 /* temps that get no stack slot (see emitfn): reading one from the stack is
  * an internal error, never a silent read of nothing */
 static unsigned char temp_noslot[MAX_ALLOC_TEMPS];
+
 
 /* Dead return store elimination */
 static int temp_use_count[MAX_ALIAS_TEMPS];
@@ -2759,6 +2767,29 @@ slot_edge(unsigned long long *adj, int words, int a, int b)
     adj[(size_t)b * words + a / 64] |= 1ull << (a % 64);
 }
 
+/* Can the result of `op` be narrow? Only where the emitter never reads
+ * back the high half of the temp it is defining: a right shift, a divide,
+ * a remainder build their result in place over both halves and stay two
+ * words wide (found by the high-half invariant on the first hunt). */
+static int
+narrow_ok(int op)
+{
+    switch (op) {
+    case Oadd: case Osub: case Oand: case Oor: case Oxor: case Oneg:
+    case Omul: case Oshl: case Ocopy:
+    case Oextsb: case Oextub: case Oextsh: case Oextuh:
+    case Oextsw: case Oextuw:
+    case Oload: case Oloadsw: case Oloaduw:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* words of frame a temp takes: 2 for a 32-bit one, unless narrow */
+#define SLOT_WORDS(fn, t) ((fn)->tmp[t].cls == Kl \
+    && !((t) - Tmp0 < MAX_ALLOC_TEMPS && temp_narrow[(t) - Tmp0]) ? 2 : 1)
+
 static int
 color_slots(Fn *fn, int base)
 {
@@ -2872,12 +2903,12 @@ color_slots(Fn *fn, int base)
             start[t] = fn->tmp[t].slot;
             continue;
         }
-        w = fn->tmp[t].cls == Kl ? 2 : 1;
+        w = SLOT_WORDS(fn, t);
         memset(occ, 0, (size_t)(base + 2 * nt + 4));
         for (k = 0; k < n; k++) {
             u = order[k];
             if (adj[(size_t)t * words + u / 64] >> (u % 64) & 1) {
-                int su = fn->tmp[u].slot, wu = fn->tmp[u].cls == Kl ? 2 : 1;
+                int su = fn->tmp[u].slot, wu = SLOT_WORDS(fn, u);
                 if (su >= 0)
                     for (a = 0; a < wu; a++)
                         occ[su + a] = 1;
@@ -4232,6 +4263,41 @@ emitins(Ins *i, Fn *fn)
          * shifts fall through to the Kw path (which truncates) — no
          * shipping code currently produces them; covered when cproc
          * starts emitting Kl for `long` (Session 7). */
+        if (i->cls == Kl && ref_to_is_addr_only(i->to)) {
+            /* S5 (2026-10-09): only the low half of the result is ever
+             * read (an index, an address): shift the low word alone. The
+             * paths below build the result in place, re-reading its own
+             * high half at each step — a half a narrow temp does not
+             * have. Bits never move down in a left shift, so r0's high
+             * half does not matter either. */
+            if (rtype(r1) == RCon) {
+                int cnt = (int)fn->con[r1.val].bits.i;
+                if (cnt >= 16) {
+                    fprintf(outf, "\tlda.w #0\n");
+                } else {
+                    emitload(r0, fn);
+                    for (int j = 0; j < cnt; j++)
+                        fprintf(outf, "\tasl a\n");
+                }
+                emitstore(i->to, fn);
+            } else {
+                int lbl = ++var_shift_seq;
+                emitload(r0, fn);
+                emitstore(i->to, fn);
+                emitload(r1, fn);
+                fprintf(outf, "\ttax\n");
+                fprintf(outf, "\tbeq @vsh_done.%d\n", lbl);
+                fprintf(outf, "@vsh_loop.%d:\n", lbl);
+                emitload(i->to, fn);
+                fprintf(outf, "\tasl a\n");
+                emitstore(i->to, fn);
+                fprintf(outf, "\tdex\n");
+                fprintf(outf, "\tbne @vsh_loop.%d\n", lbl);
+                fprintf(outf, "@vsh_done.%d:\n", lbl);
+            }
+            acache_invalidate();
+            break;
+        }
         if (i->cls == Kl && rtype(r1) == RCon) {
             c = &fn->con[r1.val];
             int cnt = (int)c->bits.i;
@@ -6391,6 +6457,27 @@ w65816_emitfn(Fn *fn, FILE *f)
     mark_near_indexed(fn);      /* S4: is_far() reads it, so first */
     build_alias_table(fn);
     mark_dead_stores(fn);
+    mark_high_zero(fn);
+    mark_far_decomp(fn);        /* B2: before addr_only (feeds it) */
+    mark_addr_only_kl(fn);
+    /* S5 (2026-10-09): a 32-bit temp of which only the low half is ever
+     * read — an address, an index — is one word wide on the stack. Its
+     * high half is neither computed (the skip_high paths) nor stored
+     * (emit_store_high returns at once), and a read of it is the
+     * high-half invariant's internal error. Not for a phi result: the
+     * edge moves write both halves of their destination directly. */
+    memset(temp_narrow, 0, sizeof(temp_narrow));
+    if (!getenv("QBE_NO_NARROW_KL")) {
+        Blk *nb; Ins *ni;
+        for (nb = fn->start; nb; nb = nb->link)
+            for (ni = nb->ins; ni < &nb->ins[nb->nins]; ni++)
+                if (rtype(ni->to) == RTmp && ni->to.val >= Tmp0
+                    && ni->to.val - Tmp0 < MAX_ALLOC_TEMPS
+                    && fn->tmp[ni->to.val].cls == Kl
+                    && ref_to_is_addr_only(ni->to)
+                    && narrow_ok(ni->op))
+                    temp_narrow[ni->to.val - Tmp0] = 1;
+    }
     memset(temp_noslot, 0, sizeof(temp_noslot));
     if (!getenv("QBE_SLOT_FOR_ALL"))
         for (int t = Tmp0; t < fn->ntmp && t - Tmp0 < MAX_ALIAS_TEMPS; t++)
@@ -6440,9 +6527,6 @@ w65816_emitfn(Fn *fn, FILE *f)
      * touch their slot are computed above, before the slots are assigned
      * (S5, 2026-10-08). */
     skip_dead_retstore_temp = -1;
-    mark_high_zero(fn);
-    mark_far_decomp(fn);        /* B2: before addr_only (feeds it) */
-    mark_addr_only_kl(fn);
     memset(temp_high_written, 0, sizeof(temp_high_written));
     slot_fn = fn;
     slot_owner_reset();
