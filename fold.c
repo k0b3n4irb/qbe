@@ -2,17 +2,6 @@
 
 /* boring folding code */
 
-static int
-iscon(Con *c, int w, uint64_t k)
-{
-	if (c->type != CBits)
-		return 0;
-	if (w)
-		return (uint64_t)c->bits.i == k;
-	else
-		return (uint32_t)c->bits.i == (uint32_t)k;
-}
-
 int
 foldint(Con *res, int op, int w, Con *cl, Con *cr)
 {
@@ -24,12 +13,24 @@ foldint(Con *res, int op, int w, Con *cl, Con *cr)
 	} l, r;
 	uint64_t x;
 	Sym sym;
-	int typ;
+	int typ, bits;
 
 	memset(&sym, 0, sizeof sym);
 	typ = CBits;
 	l.s = cl->bits.i;
 	r.s = cr->bits.i;
+	/* w65816 fork: on this target Kw is 16 bits wide and Kl 32 (T.wordsz;
+	 * it has no 64-bit integer), while a constant sits in 64 bits in no single form: the
+	 * front end prints a negative int sign-extended to 64 bits, an
+	 * unsigned long zero-extended, and `neg`, `sub` or `mul` folded below
+	 * leave whatever the 64-bit operation gave. Upstream divided, shifted
+	 * right and compared at 32 and 64 bits, so -(4294967291UL) == 5 folded
+	 * to 0 (the 64-bit value is -4294967291). Every operation whose result
+	 * depends on the bits above the class width takes its operands through
+	 * SX / ZX at the real width. (difftest, 2026-10-08) */
+	bits = (w ? 16 : 8) * T.wordsz;   /* 16 and 32 here, 32 and 64 elsewhere */
+#define SX(v, b) ((int64_t)((uint64_t)(v) << (64 - (b))) >> (64 - (b)))
+#define ZX(v, b) ((b) >= 64 ? (uint64_t)(v) : (uint64_t)(v) & (((uint64_t)1 << (b)) - 1))
 	if (op == Oadd) {
 		if (cl->type == CAddr) {
 			if (cr->type == CAddr)
@@ -56,12 +57,12 @@ foldint(Con *res, int op, int w, Con *cl, Con *cr)
 	else if (cl->type == CAddr || cr->type == CAddr)
 		return 1;
 	if (op == Odiv || op == Orem || op == Oudiv || op == Ourem) {
-		if (iscon(cr, w, 0))
+		if (cr->type == CBits && ZX(r.u, bits) == 0)
 			return 1;
 		if (op == Odiv || op == Orem) {
-			x = w ? INT64_MIN : INT32_MIN;
-			if (iscon(cr, w, -1))
-			if (iscon(cl, w, x))
+			if (cr->type == CBits && SX(r.u, bits) == -1)
+			if (cl->type == CBits
+			&& SX(l.u, bits) == SX((uint64_t)1 << (bits - 1), bits))
 				return 1;
 		}
 	}
@@ -69,22 +70,17 @@ foldint(Con *res, int op, int w, Con *cl, Con *cr)
 	case Oadd:  x = l.u + r.u; break;
 	case Osub:  x = l.u - r.u; break;
 	case Oneg:  x = -l.u; break;
-	case Odiv:  x = w ? l.s / r.s : (int32_t)l.s / (int32_t)r.s; break;
-	case Orem:  x = w ? l.s % r.s : (int32_t)l.s % (int32_t)r.s; break;
-	case Oudiv: x = w ? l.u / r.u : (uint32_t)l.u / (uint32_t)r.u; break;
-	case Ourem: x = w ? l.u % r.u : (uint32_t)l.u % (uint32_t)r.u; break;
+	case Odiv:  x = SX(l.u, bits) / SX(r.u, bits); break;
+	case Orem:  x = SX(l.u, bits) % SX(r.u, bits); break;
+	case Oudiv: x = ZX(l.u, bits) / ZX(r.u, bits); break;
+	case Ourem: x = ZX(l.u, bits) % ZX(r.u, bits); break;
 	case Omul:  x = l.u * r.u; break;
 	case Oand:  x = l.u & r.u; break;
 	case Oor:   x = l.u | r.u; break;
 	case Oxor:  x = l.u ^ r.u; break;
-	/* w65816 fork: Kl is 32-bit (the target has no 64-bit integer) but QBE marks
-	 * Kl as w=1. A negative 32-bit constant is stored zero-extended in the 64-bit
-	 * con, so the upstream `w ? l.s : (int32_t)l.s` arithmetic-shifts a *positive*
-	 * 64-bit value and drops the sign — e.g. (s32)-256 >> 4 folded to 0x0FFFFFF0
-	 * instead of 0xFFFFFFF0. Force 32-bit signed semantics. (chantier A7 Phase 1) */
-	case Osar:  x = (int32_t)l.s >> (r.u & 31); break;
-	case Oshr:  x = (w ? l.u : (uint32_t)l.u) >> (r.u & (31|w<<5)); break;
-	case Oshl:  x = l.u << (r.u & (31|w<<5)); break;
+	case Osar:  x = SX(l.u, bits) >> (r.u & (bits - 1)); break;
+	case Oshr:  x = ZX(l.u, bits) >> (r.u & (bits - 1)); break;
+	case Oshl:  x = l.u << (r.u & (bits - 1)); break;
 	case Oextsb: x = (int8_t)l.u;   break;
 	case Oextub: x = (uint8_t)l.u;  break;
 	case Oextsh: x = (int16_t)l.u;  break;
@@ -104,11 +100,22 @@ foldint(Con *res, int op, int w, Con *cl, Con *cr)
 		break;
 	default:
 		if (Ocmpw <= op && op <= Ocmpl1) {
-			if (op <= Ocmpw1) {
-				l.u = (int32_t)l.u;
-				r.u = (int32_t)r.u;
-			} else
+			if (op <= Ocmpw1)
+				bits = 8 * T.wordsz;
+			else {
+				bits = 16 * T.wordsz;
 				op -= Ocmpl - Ocmpw;
+			}
+			/* signed compares read .s, unsigned ones .u */
+			switch (op - Ocmpw) {
+			case Cisle: case Cislt: case Cisgt: case Cisge:
+				l.s = SX(l.u, bits);
+				r.s = SX(r.u, bits);
+				break;
+			default:
+				l.u = ZX(l.u, bits);
+				r.u = ZX(r.u, bits);
+			}
 			switch (op - Ocmpw) {
 			case Ciule: x = l.u <= r.u; break;
 			case Ciult: x = l.u < r.u;  break;
@@ -152,6 +159,13 @@ foldint(Con *res, int op, int w, Con *cl, Con *cr)
 		else
 			die("unreachable");
 	}
+	/* ...and the result is cut to its class: `-22016 * 256U` is 0 in 16
+	 * bits, and left as 0xAA0000 a `jnz` on it took the true branch. An
+	 * address keeps its (possibly negative) offset. */
+	if (typ == CBits)
+		x = ZX(x, (w ? 16 : 8) * T.wordsz);
+#undef SX
+#undef ZX
 	*res = (Con){.type=typ, .sym=sym, .bits={.i=x}};
 	return 0;
 }

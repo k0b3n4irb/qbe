@@ -729,6 +729,7 @@ far_decomp_of(Ref r)
  * we skip boolean materialization (0/1) and emit a direct compare+branch.
  */
 static int fused_cmp;       /* 1 if a fused comparison is pending */
+static int fused_nz32;      /* 1 if a `cnel x, 0` is folded into the jnz (fused_cmp_r0 = x) */
 static int fused_cmp_op;    /* the comparison opcode */
 static Ref fused_cmp_r0;    /* first operand */
 static Ref fused_cmp_r1;    /* second operand */
@@ -1616,6 +1617,11 @@ static int
 is_inline_mul_const(int val)
 {
     int k, base;
+    /* A Kw constant can arrive wider than 16 bits (a narrowed long
+     * literal): `1 << k` below then ran past bit 30 and the loop never
+     * ended — qbe hung on `(s16)2141188073UL * x`. Such a value is not
+     * inlined; the __mul16 path masks it. (difftest, 2026-10-08) */
+    if (val <= 0 || val > 65535) return 0;
     if (val >= 1 && val <= 15) return 1;
     /* Powers of 2 up to 16384 */
     if (val > 0 && (val & (val - 1)) == 0 && val <= 16384) return 1;
@@ -1846,6 +1852,17 @@ can_be_frameless(Fn *fn)
         if (fn->tmp[t].cls == Kl)
             return 0;
     }
+
+    /* A phi result always owns a slot (coalescephi) and every edge into its
+     * block stores to it (emitphimoves). The walk below only sees temps an
+     * instruction defines; when the phi's arguments are all constants —
+     * `return 1 && 1;` after folding — no instruction is left, the function
+     * went frameless and the edge store landed on the return address
+     * (`sta 2,s` with no frame: the function never came back).
+     * (difftest, 2026-10-08) */
+    for (b = fn->start; b; b = b->link)
+        if (b->phi)
+            return 0;
 
     /* Check alloc slots: allow param-shadow allocs (fully optimized away),
      * but reject allocs used for other purposes */
@@ -5517,15 +5534,20 @@ emitjmp(Blk *b, Fn *fn)
             }
             fused_cmp = 0;
         } else {
-            /* A 32-bit condition (`if (long_var)`) is nonzero when EITHER
-             * half is: OR the high half in before testing Z. Testing the
-             * low word alone made `if (x)` false for x = 0x10000
-             * (c_features ROM, 2026-09-13). */
-            int kl = rtype(b->jmp.arg) == RTmp && b->jmp.arg.val >= Tmp0
-                     && fn->tmp[b->jmp.arg.val].cls == Kl;
-            emitload(b->jmp.arg, fn);
+            /* `jnz` tests a word (16 bits), whatever the class of its
+             * argument: the front end compares a 32-bit condition with
+             * zero first (`cnel x, 0`), and that compare is folded in
+             * here — nonzero when EITHER half is, so OR the high half in
+             * before testing Z (c_features ROM, 2026-09-13). Until
+             * 2026-10-08 the test was 32-bit whenever the argument was a
+             * Kl temp, which the optimizer could make of a 16-bit
+             * condition (difftest). */
+            Ref jarg = fused_nz32 ? fused_cmp_r0 : b->jmp.arg;
+            int kl = fused_nz32;
+            fused_nz32 = 0;
+            emitload(jarg, fn);
             if (kl) {
-                emitop2_high("ora", b->jmp.arg, fn);
+                emitop2_high("ora", jarg, fn);
                 acache_invalidate();
             }
             /* Only emit cmp.w #0 when A-cache hit skipped the lda.
@@ -5779,8 +5801,28 @@ w65816_emitfn(Fn *fn, FILE *f)
         slot_owner_reset();
 
         fused_cmp = 0;
+        fused_nz32 = 0;
         detect_block_tail_call(b, fn);
         for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            /* `cnel x, 0` used only by this block's jnz, x a Kl temp:
+             * the branch tests both halves of x itself (emitjmp). */
+            if (i == &b->ins[b->nins] - 1
+                && b->jmp.type == Jjnz && i->op == Ocnel
+                && rtype(i->to) == RTmp && i->to.val >= Tmp0
+                && req(i->to, b->jmp.arg)
+                && rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0
+                && fn->tmp[i->arg[0].val].cls == Kl
+                && rtype(i->arg[1]) == RCon
+                && fn->con[i->arg[1].val].type == CBits
+                && (fn->con[i->arg[1].val].bits.i & 0xFFFFFFFF) == 0) {
+                int cidx = i->to.val - Tmp0;
+                if (cidx >= 0 && cidx < MAX_ALIAS_TEMPS
+                    && temp_use_count[cidx] == 0) {
+                    fused_nz32 = 1;
+                    fused_cmp_r0 = i->arg[0];
+                    continue;
+                }
+            }
             /* Comparison+branch fusion: if the last instruction is a
              * comparison whose result is used only by this block's jnz,
              * skip boolean materialization and let emitjmp emit

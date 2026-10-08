@@ -217,8 +217,13 @@ assoccon(Fn *fn, Blk *b, Ins *i1)
 		return;
 
 	if (op == Oadd && c.type == CBits)
-	if ((i1->cls == Kl  && c.bits.i < 0)
-	|| (i1->cls == Kw && (int32_t)c.bits.i < 0)) {
+	/* w65816: Kw is 16 bits and Kl 32, and foldint() returns the
+	 * constant cut to its class — read its sign at that width. */
+	if (T.wordsz == 2
+	? ((i1->cls == Kl && (int32_t)c.bits.i < 0)
+	  || (i1->cls == Kw && (int16_t)c.bits.i < 0))
+	: ((i1->cls == Kl && c.bits.i < 0)
+	  || (i1->cls == Kw && (int32_t)c.bits.i < 0))) {
 		fail = negcon(i1->cls, &c);
 		assert(fail == 0);
 		op = Osub;
@@ -409,8 +414,12 @@ dedupjmp(Fn *fn, Blk *b)
 	/* collapse trivial/constant jnz to jmp */
 	v = 1;
 	z = 0;
+	/* w65816: jnz tests a word, 16 bits here; a constant argument may
+	 * carry more (a long narrowed to 16 bits: `(u16)0x80000000 && x`
+	 * took the true branch). */
 	if (b->s1 == b->s2
-	|| isconbits(fn, b->jmp.arg, &v)
+	|| (isconbits(fn, b->jmp.arg, &v)
+	   && ((v = T.wordsz == 2 ? (uint16_t)v : v), 1))
 	|| zeroval(fn, b, b->jmp.arg, Kw, &z)) {
 		if (v == 0 || z)
 			b->s1 = b->s2;
