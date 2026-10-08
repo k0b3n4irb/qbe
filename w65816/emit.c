@@ -69,10 +69,31 @@ static int large_frame_mode;       /* 1 = use indirect via tcc__fp */
  * Y-index is just frame_off. The pushed args are at SP positions
  * BELOW tcc__fp's reference and never need indirect access (they're
  * touched via PHA from accumulator only). */
+/* S5 (2026-10-09): the frame of a leaf function in the direct page.
+ * A function that calls nothing, has no stack-allocated object and needs
+ * at most DPF_WORDS words keeps its temps at tcc__lf..tcc__lf+31 instead
+ * of in a stack frame: no prologue, no epilogue, `lda.b` (3 cycles) for
+ * `lda n,s` (4), and nothing on the stack below the return address.
+ * Safe because a leaf cannot be re-entered: it calls nothing, the NMI
+ * handler runs on its own direct page (tcc__nmi_registers, which mirrors
+ * this block), and an IRQ handler is assembly that owns what it touches.
+ * The runtime helpers (tcc_mul32, __div16...) use tcc__r0..r3, r9, r10 —
+ * not this block. SOFF() turns a slot index into either a stack offset or
+ * a marked direct-page offset; the three helpers below are the only
+ * places that print an operand. */
+#define DPF_WORDS 16
+#define DPF_BASE 0x4000
+static int dp_frame;
+#define SOFF(slot) (dp_frame ? DPF_BASE + (slot) * 2 : ((slot) + 1) * 2)
+
 static void
 emit_stack_load(int frame_off, int sp_adjust)
 {
     int direct_off = frame_off + sp_adjust;
+    if (frame_off >= DPF_BASE) {
+        fprintf(outf, "\tlda.b tcc__lf+%d\n", frame_off - DPF_BASE);
+        return;
+    }
     if (!large_frame_mode || direct_off <= 255) {
         fprintf(outf, "\tlda %d,s\n", direct_off);
     } else {
@@ -85,6 +106,10 @@ static void
 emit_stack_store(int frame_off, int sp_adjust)
 {
     int direct_off = frame_off + sp_adjust;
+    if (frame_off >= DPF_BASE) {
+        fprintf(outf, "\tsta.b tcc__lf+%d\n", frame_off - DPF_BASE);
+        return;
+    }
     if (!large_frame_mode || direct_off <= 255) {
         fprintf(outf, "\tsta %d,s\n", direct_off);
     } else {
@@ -97,6 +122,10 @@ static void
 emit_stack_op(const char *op, int frame_off, int sp_adjust)
 {
     int direct_off = frame_off + sp_adjust;
+    if (frame_off >= DPF_BASE) {
+        fprintf(outf, "\t%s.b tcc__lf+%d\n", op, frame_off - DPF_BASE);
+        return;
+    }
     if (!large_frame_mode || direct_off <= 255) {
         fprintf(outf, "\t%s %d,s\n", op, direct_off);
     } else {
@@ -164,7 +193,7 @@ emit_load_high(Ref r, Fn *fn, int sp_adjust)
             slot_read(r, 1, fn);
             slot = fn->tmp[r.val].slot;
             if (slot >= 0)
-                emit_stack_load((slot + 1) * 2 + 2, sp_adjust);
+                emit_stack_load(SOFF(slot) + 2, sp_adjust);
             else
                 fprintf(outf, "\t; unallocated temp high %u\n", r.val);
         } else {
@@ -186,7 +215,7 @@ emit_load_high(Ref r, Fn *fn, int sp_adjust)
         if (slot < 0)
             emit_stack_load(framesize + PARAM_OFFSET + (-slot) + 2, sp_adjust);
         else
-            emit_stack_load((slot + 1) * 2 + 2, sp_adjust);
+            emit_stack_load(SOFF(slot) + 2, sp_adjust);
         break;
     default:
         fprintf(outf, "\t; emit_load_high: unknown ref type %d\n", rtype(r));
@@ -220,13 +249,13 @@ emit_store_high(Ref r, Fn *fn)
         slot_wrote(r, 1);
         slot = fn->tmp[r.val].slot;
         if (slot >= 0)
-            emit_stack_store((slot + 1) * 2 + 2, 0);
+            emit_stack_store(SOFF(slot) + 2, 0);
     } else if (rtype(r) == RSlot) {
         slot = rsval(r);
         if (slot < 0)
             emit_stack_store(framesize + PARAM_OFFSET + (-slot) + 2, 0);
         else
-            emit_stack_store((slot + 1) * 2 + 2, 0);
+            emit_stack_store(SOFF(slot) + 2, 0);
     }
 }
 
@@ -254,7 +283,7 @@ emitop2_high(char *op, Ref r, Fn *fn)
             slot_read(r, 1, fn);
             slot = fn->tmp[r.val].slot;
             if (slot >= 0)
-                emit_stack_op(op, (slot + 1) * 2 + 2, 0);
+                emit_stack_op(op, SOFF(slot) + 2, 0);
         } else {
             /* R0-R7 vregs are 16-bit only */
             fprintf(outf, "\t%s.w #0\n", op);
@@ -274,7 +303,7 @@ emitop2_high(char *op, Ref r, Fn *fn)
         if (slot < 0)
             emit_stack_op(op, framesize + PARAM_OFFSET + (-slot) + 2, 0);
         else
-            emit_stack_op(op, (slot + 1) * 2 + 2, 0);
+            emit_stack_op(op, SOFF(slot) + 2, 0);
         break;
     default:
         break;
@@ -3013,7 +3042,7 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
                 slot = fn->tmp[r.val].slot;
                 slot_read(r, 0, fn);
                 if (slot >= 0)
-                    emit_stack_load((slot + 1) * 2, sp_adjust);
+                    emit_stack_load(SOFF(slot), sp_adjust);
                 else if (idx >= 0 && idx < MAX_ALLOC_TEMPS && temp_noslot[idx])
                     err("internal compiler error: %%%s has no stack slot and is "
                         "read from the stack in %s (its value was expected in A; "
@@ -3054,7 +3083,7 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
             emit_stack_load(framesize + PARAM_OFFSET + (-slot), sp_adjust);
         } else {
             /* Positive slot = local variable in our frame */
-            emit_stack_load((slot + 1) * 2, sp_adjust);
+            emit_stack_load(SOFF(slot), sp_adjust);
         }
         break;
     default:
@@ -3133,7 +3162,7 @@ emitstore(Ref r, Fn *fn)
         } else if (r.val >= Tmp0) {
             slot = fn->tmp[r.val].slot;
             if (slot >= 0) {
-                emit_stack_store((slot + 1) * 2, 0);
+                emit_stack_store(SOFF(slot), 0);
                 slot_wrote(r, 0);
                 stored = 1;
             } else if (getenv("QBE_DBG_DEAD")) {
@@ -3146,7 +3175,7 @@ emitstore(Ref r, Fn *fn)
         if (slot < 0)
             emit_stack_store(framesize + PARAM_OFFSET + (-slot), 0);
         else
-            emit_stack_store((slot + 1) * 2, 0);
+            emit_stack_store(SOFF(slot), 0);
         stored = 1;
         break;
     default:
@@ -3180,7 +3209,7 @@ emitop2(char *op, Ref r, Fn *fn)
                 slot = fn->tmp[r.val].slot;
                 slot_read(r, 0, fn);
                 if (slot >= 0)
-                    emit_stack_op(op, (slot + 1) * 2, 0);
+                    emit_stack_op(op, SOFF(slot), 0);
                 else if (idx >= 0 && idx < MAX_ALLOC_TEMPS && temp_noslot[idx])
                     err("internal compiler error: %%%s has no stack slot and is "
                         "an operand read from the stack in %s "
@@ -3205,7 +3234,7 @@ emitop2(char *op, Ref r, Fn *fn)
         if (slot < 0)
             emit_stack_op(op, framesize + PARAM_OFFSET + (-slot), 0);
         else
-            emit_stack_op(op, (slot + 1) * 2, 0);
+            emit_stack_op(op, SOFF(slot), 0);
         break;
     default:
         break;
@@ -5282,7 +5311,7 @@ emitins(Ins *i, Fn *fn)
                 int s = rsval(r0);
                 int low_off = (s < 0)
                     ? framesize + PARAM_OFFSET + (-s)
-                    : (s + 1) * 2;
+                    : SOFF(s);
                 emit_stack_load(low_off, 0);
                 emitstore(i->to, fn);
                 if (!skip_high) {
@@ -5942,11 +5971,11 @@ emit_one_phimove(Phi *p, Ref arg, int parked, Fn *fn)
      * .claude/notes/tech/ternary_addr_const_bank_drop.md. */
     if (parked) {
         fprintf(outf, "\tlda.b tcc__r10\n");
-        emit_stack_store((dstslot + 1) * 2, 0);
+        emit_stack_store(SOFF(dstslot), 0);
         slot_wrote(p->to, 0);
         if (p->cls == Kl) {
             fprintf(outf, "\tlda.b tcc__r10h\n");
-            emit_stack_store((dstslot + 1) * 2 + 2, 0);
+            emit_stack_store(SOFF(dstslot) + 2, 0);
             slot_wrote(p->to, 1);
             note_high_written(p->to);
         }
@@ -5954,13 +5983,13 @@ emit_one_phimove(Phi *p, Ref arg, int parked, Fn *fn)
     } else if (rtype(arg) == RCon) {
         /* Constant: load and store to phi slot (low half) */
         emitload(arg, fn);
-        emit_stack_store((dstslot + 1) * 2, 0);
+        emit_stack_store(SOFF(dstslot), 0);
         slot_wrote(p->to, 0);
         if (p->cls == Kl) {
             /* High/bank half: `lda.w #:sym` (CAddr) or the top 16 bits
              * (CBits), then store to the high slot. */
             emit_load_high(arg, fn, 0);
-            emit_stack_store((dstslot + 1) * 2 + 2, 0);
+            emit_stack_store(SOFF(dstslot) + 2, 0);
             slot_wrote(p->to, 1);
             note_high_written(p->to);
         }
@@ -5981,17 +6010,17 @@ emit_one_phimove(Phi *p, Ref arg, int parked, Fn *fn)
                 emit_stack_load(framesize + PARAM_OFFSET + (-neg_slot), 0);
                 acache_set(arg);
             }
-            emit_stack_store((dstslot + 1) * 2, 0);
+            emit_stack_store(SOFF(dstslot), 0);
             slot_wrote(p->to, 0);
         } else if (widen) {
             int srcslot = fn->tmp[arg.val].slot;
             if (srcslot >= 0 && srcslot != dstslot) {
                 if (!acache_has(arg)) {
                     slot_read(arg, 0, fn);
-                    emit_stack_load((srcslot + 1) * 2, 0);
+                    emit_stack_load(SOFF(srcslot), 0);
                     acache_set(arg);
                 }
-                emit_stack_store((dstslot + 1) * 2, 0);
+                emit_stack_store(SOFF(dstslot), 0);
                 slot_wrote(p->to, 0);
             }
         } else {
@@ -6000,18 +6029,18 @@ emit_one_phimove(Phi *p, Ref arg, int parked, Fn *fn)
                 /* Different slots - need to copy */
                 if (!acache_has(arg)) {
                     slot_read(arg, 0, fn);
-                    emit_stack_load((srcslot + 1) * 2, 0);
+                    emit_stack_load(SOFF(srcslot), 0);
                     acache_set(arg);
                 }
-                emit_stack_store((dstslot + 1) * 2, 0);
+                emit_stack_store(SOFF(dstslot), 0);
                 slot_wrote(p->to, 0);
                 if (p->cls == Kl) {
                     /* Copy the high/bank half too. This clobbers A (which
                      * held the low half), so drop the cache afterward. */
                     check_high_read(arg, fn);
                     slot_read(arg, 1, fn);
-                    emit_stack_load((srcslot + 1) * 2 + 2, 0);
-                    emit_stack_store((dstslot + 1) * 2 + 2, 0);
+                    emit_stack_load(SOFF(srcslot) + 2, 0);
+                    emit_stack_store(SOFF(dstslot) + 2, 0);
                     slot_wrote(p->to, 1);
                     note_high_written(p->to);
                     acache_invalidate();
@@ -6025,7 +6054,7 @@ emit_one_phimove(Phi *p, Ref arg, int parked, Fn *fn)
         }
         if (widen) {
             fprintf(outf, "\tlda.w #0\n");
-            emit_stack_store((dstslot + 1) * 2 + 2, 0);
+            emit_stack_store(SOFF(dstslot) + 2, 0);
             slot_wrote(p->to, 1);
             note_high_written(p->to);
             acache_invalidate();
@@ -6126,12 +6155,12 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
                         "on the edge %s -> %s in %s (compiler/qbe/w65816/emit.c)",
                         from->name, to->name, fn->name);
             slot_read(arg[cur], 0, fn);
-            emit_stack_load((fn->tmp[arg[cur].val].slot + 1) * 2, 0);
+            emit_stack_load(SOFF(fn->tmp[arg[cur].val].slot), 0);
             fprintf(outf, "\tsta.b tcc__r10\n");
             if (fn->tmp[arg[cur].val].cls == Kl) {
                 check_high_read(arg[cur], fn);
                 slot_read(arg[cur], 1, fn);
-                emit_stack_load((fn->tmp[arg[cur].val].slot + 1) * 2 + 2, 0);
+                emit_stack_load(SOFF(fn->tmp[arg[cur].val].slot) + 2, 0);
                 fprintf(outf, "\tsta.b tcc__r10h\n");
             } else {
                 /* a Kw value read by a Kl phi is zero-extended */
@@ -6491,6 +6520,13 @@ w65816_emitfn(Fn *fn, FILE *f)
 
     /* Total frame size: alloc slots + temp slots + 1 for alignment */
     framesize = (fn->slot + 1) * 2;
+    dp_frame = 0;
+    if (fn->leaf && !fn->dynalloc && w65816_alloc_slots == 0
+        && fn->slot >= 1 && fn->slot <= DPF_WORDS
+        && !getenv("QBE_NO_DP_FRAME")) {
+        dp_frame = 1;       /* SOFF() now names tcc__lf */
+        framesize = 0;      /* nothing on the stack: parameters at 4,s */
+    }
     /* No slot at all: no frame, and the frame size is 0, not the 2 bytes
      * of alignment. The prologue already allocates nothing below 4 bytes
      * (`framesize > 2`), but a parameter is read at framesize +
