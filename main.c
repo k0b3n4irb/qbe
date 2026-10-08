@@ -115,6 +115,70 @@ static Target *tlist[] = {
 static FILE *outf;
 static int dbg;
 
+/* OpenSNES (S5, 2026-10-09): the functions whose ADDRESS is used — in a
+ * data item, or anywhere in code but as the target of a direct call. A
+ * function that is neither exported nor in this set can only be entered by
+ * a call this translation unit compiled, which lets the w65816 backend
+ * drop the `rep #$20` it otherwise opens every function with (a callback
+ * handed to the NMI or IRQ dispatcher, to the object engine, is entered
+ * from assembly in whatever mode that code is in: its address is taken,
+ * it keeps the instruction). */
+static char **taken_name;
+static int taken_n, taken_cap;
+
+static void
+addrtaken_note(const char *name)
+{
+	int i;
+
+	for (i = 0; i < taken_n; i++)
+		if (strcmp(taken_name[i], name) == 0)
+			return;
+	if (taken_n == taken_cap) {
+		taken_cap = taken_cap ? taken_cap * 2 : 64;
+		taken_name = realloc(taken_name, taken_cap * sizeof *taken_name);
+		if (!taken_name)
+			die("out of memory");
+	}
+	taken_name[taken_n] = emalloc(strlen(name) + 1);
+	strcpy(taken_name[taken_n++], name);
+}
+
+int
+addrtaken(const char *name)
+{
+	int i;
+
+	for (i = 0; i < taken_n; i++)
+		if (strcmp(taken_name[i], name) == 0)
+			return 1;
+	return 0;
+}
+
+static void
+addrtaken_scan(Fn *fn)
+{
+	Blk *b;
+	Ins *i;
+	Phi *p;
+	uint n;
+	int a;
+
+#define NOTE(r) do { if (rtype(r) == RCon && fn->con[(r).val].type == CAddr) \
+	addrtaken_note(str(fn->con[(r).val].sym.id)); } while (0)
+	for (b = fn->start; b; b = b->link) {
+		for (p = b->phi; p; p = p->link)
+			for (n = 0; n < p->narg; n++)
+				NOTE(p->arg[n]);
+		for (i = b->ins; i < &b->ins[b->nins]; i++)
+			for (a = 0; a < 2; a++)
+				if (!(i->op == Ocall && a == 0))
+					NOTE(i->arg[a]);
+		NOTE(b->jmp.arg);
+	}
+#undef NOTE
+}
+
 static void
 data(Dat *d)
 {
@@ -136,8 +200,10 @@ data(Dat *d)
 	 * the lookup on a payload-bearing data type so we never trust the
 	 * isref byte during the DStart/DEnd bookends. */
 	if (d->type != DStart && d->type != DEnd
-	&&  d->isref && d->u.ref.name)
+	&&  d->isref && d->u.ref.name) {
 		inline_record_dat_ref(d->u.ref.name);
+		addrtaken_note(d->u.ref.name);
+	}
 	emitdat(d, outf);
 	if (d->type == DEnd) {
 		fputs("/* end data */\n\n", outf);
@@ -310,6 +376,11 @@ emit_collected(FILE *out)
 	/* Pass 1.b: module-wide inline_check phase */
 	for (c = collected_head; c; c = c->next)
 		inline_check(c->fn);
+
+	/* the address-taken set, over the code as it stands after inlining
+	 * (no later pass creates a reference to a function) */
+	for (c = collected_head; c; c = c->next)
+		addrtaken_scan(c->fn);
 
 	/* Pass 2: finalize + emit, skipping fully-consumed inline bodies */
 	for (c = collected_head; c; c = c->next) {

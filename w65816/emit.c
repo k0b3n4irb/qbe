@@ -6617,6 +6617,16 @@ w65816_emitfn(Fn *fn, FILE *f)
         tail_call_all_args_same_pos = 0;
     }
 
+    /* S5 (2026-10-09): a function that is not exported and whose address
+     * is never used can only be entered by a call compiled in this unit,
+     * and compiled code is in 16-bit A at every call (emitins() restores
+     * it before any instruction that is not a byte access). Its
+     * `rep #$20` is 3 cycles and 2 bytes for nothing. An exported
+     * function, or one handed to someone as a pointer, keeps it: the
+     * calling convention seen from assembly does not change. */
+    if (!fn->lnk.export && !addrtaken(fn->name) && !getenv("QBE_KEEP_REP"))
+        skip_prologue_rep = 1;
+
     /* Prologue — no php/plp (PARAM_OFFSET=2 assumes no P byte on stack).
      * rep #$20 ensures 16-bit A: assembly callers (NMI handler, mode7)
      * may call C functions after sep #$20 (8-bit A mode).
