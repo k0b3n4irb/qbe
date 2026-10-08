@@ -1716,6 +1716,14 @@ is_inline_mul_const(int val)
 static int
 consumes_r0_via_emitload(Ins *i, Fn *fn)
 {
+    /* Every 32-bit compare loads the HIGH half of r0 first (which drops
+     * the A-cache), then reads the low half from the slot. With a Kw
+     * temp as r0 — `cnel %w, 0`, which gvn makes of a boolean compared
+     * again — the store of that temp was skipped as dead and the compare
+     * read another temp's value; the slot-ownership check stopped the
+     * build (difftest_stmt seed 19645, 2026-10-08). */
+    if (is_kl_cmp(i->op))
+        return 0;
     switch (i->op) {
     /* Swapped comparisons: r0 goes through emitop2 (slot read, not A-cache) */
     case Ocsgtw: case Ocsgtl:
