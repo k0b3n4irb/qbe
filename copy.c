@@ -395,10 +395,15 @@ phicopyref(Fn *fn, Blk *b, Phi *p)
 	if (n == p->narg-1)
 		return p->arg[n];
 
-	/* same as a previous phi */
+	/* same as a previous phi — of the same class. OpenSNES
+	 * (2026-10-09): the arguments alone do not make two phis equal. A
+	 * `w` phi may take `l` arguments (it reads their low half), so
+	 * `j = v0` (a u8) and `v0` itself (a long) gave two phis with the
+	 * same arguments, and the `l` one was replaced by the `w` one: every
+	 * later use of v0 saw 16 bits (difftest_stmt seed 124152). */
 	for (p1=b->phi; p1!=p; p1=p1->link) {
 		assert(p1);
-		if (phieq(p1, p))
+		if (p1->cls == p->cls && phieq(p1, p))
 			return p1->to;
 	}
 
