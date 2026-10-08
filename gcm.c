@@ -384,7 +384,7 @@ cheap(Ins *i)
 static void
 sinkref(Fn *fn, Blk *b, Ref *pr)
 {
-	Ins i;
+	Ins i, *e;
 	Tmp *t;
 	Ref r;
 
@@ -405,8 +405,49 @@ sinkref(Fn *fn, Blk *b, Ref *pr)
 	i.to = r;
 	fn->tmp[r.val].gcmbid = b->id;
 	emiti(i);
-	sinkref(fn, b, &i.arg[0]);
-	sinkref(fn, b, &i.arg[1]);
+	/* Sink the operands of the copy that was EMITTED (curi points at it;
+	 * insb is filled backwards, so what is emitted next comes before it).
+	 * Upstream recurses on the local `i`: the emitted copy then keeps the
+	 * original operands, and the sunk operands are referenced by nothing.
+	 * Harmless where a register allocator drops dead definitions; this
+	 * target has none (T.skiprega) and emitted them all. (OpenSNES,
+	 * 2026-10-08) */
+	e = curi;
+	sinkref(fn, b, &e->arg[0]);
+	sinkref(fn, b, &e->arg[1]);
+}
+
+/* Remove what sink() left without a use: the original of an instruction
+ * whose every use was sunk, and anything that only fed it. Upstream leaves
+ * them to spill/rega; a target that skips those passes would emit them —
+ * on w65816, 258 of the 496 cycles of an insertion sort's inner iteration
+ * were 32-bit index and address values stored and never read. Same
+ * predicate as gcmmove() for what may go (a call, a store, a volatile load
+ * stay). An alloc stays too: the w65816 abi0 pass has already recorded its
+ * size. requires use; maintains use. (OpenSNES, 2026-10-08) */
+static void
+sweepdead(Fn *fn)
+{
+	Blk *b;
+	Ins *i;
+	int again;
+
+	do {
+		again = 0;
+		for (b=fn->start; b; b=b->link)
+			for (i=b->ins; i<&b->ins[b->nins]; i++) {
+				if (i->op == Onop || rtype(i->to) != RTmp)
+					continue;
+				if (fn->tmp[i->to.val].nuse != 0)
+					continue;
+				if (isalloc(i->op) || (pinned(i) && !canelim(i)))
+					continue;
+				*i = (Ins){.op = Onop};
+				again = 1;
+			}
+		if (again)
+			filluse(fn);
+	} while (again);
 }
 
 /* redistribute trivial ops to point of
@@ -457,6 +498,7 @@ gcm(Fn *fn)
 	curi = &insb[NIns];
 	sink(fn);
 	filluse(fn);
+	sweepdead(fn);
 	schedblk(fn);
 	
 	if (debug['G']) {
