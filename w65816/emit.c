@@ -590,10 +590,34 @@ slot_read(Ref r, int half, Fn *fn)
  * `lda.l/sta.l sym,x` (indexed long, bank carries included), or a
  * `[tcc__r9]` deref through the staged 24-bit pointer. Everything else
  * keeps the bank-$00-implicit forms. */
+/* S4 (2026-10-08): ...and a NEAR access whose address is `$sym + index`
+ * takes the same indexed-long form, `lda.l sym,x`: it is as right for a
+ * bank-$00 symbol as for a far one (the linker supplies the bank), and it
+ * replaces `clc / adc #sym / sta / lda / tax / lda.l $0000,x`. Such an
+ * access is "far" for every path below. near_indexed[] is filled by
+ * mark_near_indexed() before any other analysis of the function. */
+static unsigned char near_indexed[MAX_ALLOC_TEMPS];
+
 static int
 is_far(Ins *i)
 {
-    return (i->volat & 6) != 0;
+    Ref a;
+
+    if ((i->volat & 6) != 0)
+        return 1;
+    switch (i->op) {
+    case Oloadsb: case Oloadub: case Oloadsh: case Oloaduh:
+    case Oloadsw: case Oloaduw: case Oload:
+        a = i->arg[0];
+        break;
+    case Ostoreb: case Ostoreh: case Ostorew: case Ostorel:
+        a = i->arg[1];
+        break;
+    default:
+        return 0;
+    }
+    return rtype(a) == RTmp && a.val >= Tmp0
+        && a.val - Tmp0 < MAX_ALLOC_TEMPS && near_indexed[a.val - Tmp0];
 }
 
 /* B2: far address decomposition. A far load/store whose address temp is
@@ -715,6 +739,44 @@ idx_nonneg(Fn *fn, Ref r, int depth)
     return 0;   /* a phi, a parameter: unknown */
 }
 
+/* `%a =l add $sym, %idx` (either order) with an index the short form is
+ * right for: returns 1 and sets base / idx. Shared by mark_near_indexed
+ * and mark_far_decomp so that both always agree. */
+static int
+sym_idx_form(Fn *fn, Ins *i, Ref *base, Ref *idx)
+{
+    if (i->op != Oadd || i->cls != Kl || far_addr_idx(i->to) < 0)
+        return 0;
+    if (rtype(i->arg[0]) == RCon && fn->con[i->arg[0].val].type == CAddr
+        && far_addr_idx(i->arg[1]) >= 0) {
+        *base = i->arg[0]; *idx = i->arg[1];
+    } else if (rtype(i->arg[1]) == RCon
+               && fn->con[i->arg[1].val].type == CAddr
+               && far_addr_idx(i->arg[0]) >= 0) {
+        *base = i->arg[1]; *idx = i->arg[0];
+    } else
+        return 0;
+    /* a possibly negative index needs the full sum — except straight off
+     * a symbol with no offset, where it would be below the object */
+    return idx_nonneg(fn, *idx, 0) || fn->con[base->val].bits.i == 0;
+}
+
+static void
+mark_near_indexed(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    Ref base, idx;
+
+    memset(near_indexed, 0, sizeof(near_indexed));
+    if (getenv("QBE_NO_NEAR_INDEXED"))
+        return;
+    for (b = fn->start; b; b = b->link)
+        for (i = b->ins; i < &b->ins[b->nins]; i++)
+            if (sym_idx_form(fn, i, &base, &idx))
+                near_indexed[far_addr_idx(i->to)] = 1;
+}
+
 static void
 mark_far_decomp(Fn *fn)
 {
@@ -735,13 +797,13 @@ mark_far_decomp(Fn *fn)
                 continue;
             k = FAR_NONE;
             base = R; idx = R;
-            if (rtype(i->arg[0]) == RCon && fn->con[i->arg[0].val].type == CAddr
-                && far_addr_idx(i->arg[1]) >= 0) {
-                k = FAR_SYM_IDX; base = i->arg[0]; idx = i->arg[1];
-            } else if (rtype(i->arg[1]) == RCon
-                       && fn->con[i->arg[1].val].type == CAddr
-                       && far_addr_idx(i->arg[0]) >= 0) {
-                k = FAR_SYM_IDX; base = i->arg[1]; idx = i->arg[0];
+            if (sym_idx_form(fn, i, &base, &idx)) {
+                k = FAR_SYM_IDX;
+            } else if ((rtype(i->arg[0]) == RCon
+                        && fn->con[i->arg[0].val].type == CAddr)
+                       || (rtype(i->arg[1]) == RCon
+                           && fn->con[i->arg[1].val].type == CAddr)) {
+                /* sym + a possibly negative index: no short form */
             } else if (far_addr_idx(i->arg[0]) >= 0
                        && fn->tmp[i->arg[0].val].cls == Kl
                        && rtype(i->arg[1]) == RCon
@@ -763,11 +825,9 @@ mark_far_decomp(Fn *fn)
             }
             if (k == FAR_NONE)
                 continue;
-            /* a possibly negative index needs the full 24-bit sum. One
-             * exception: straight off a symbol with no offset, a negative
-             * index is below the object — not a valid access. */
-            if (k != FAR_BASE_CON && !idx_nonneg(fn, idx, 0)
-                && !(k == FAR_SYM_IDX && fn->con[base.val].bits.i == 0))
+            /* a possibly negative index needs the full 24-bit sum
+             * (sym_idx_form has already decided for FAR_SYM_IDX) */
+            if (k == FAR_BASE_IDX && !idx_nonneg(fn, idx, 0))
                 continue;
             far_decomp_kind[aidx] = k;
             far_decomp_base[aidx] = base;
@@ -3335,6 +3395,42 @@ emitins(Ins *i, Fn *fn)
                 acache_invalidate();
                 break;
             }
+        }
+        /* === Kl by a small constant, 16-bit source, full 32-bit product
+         * (2026-10-08) === `&nodes[k]` kept as a pointer: the element
+         * size is not a power of two and the product may pass 16 bits,
+         * so neither path above applies and each one cost a call to
+         * tcc_mul32 (~250 cycles). x's high half is zero, so the product
+         * is built by shift-and-add over the constant's bits, most
+         * significant first: low in A, high in tcc__r9h, x in tcc__r9. */
+        if (i->cls == Kl && rtype(r1) == RCon
+            && fn->con[r1.val].type == CBits
+            && fn->con[r1.val].bits.i > 2 && fn->con[r1.val].bits.i < 256
+            && ref_is_high_zero(r0, fn)) {
+            int val = (int)fn->con[r1.val].bits.i, bit = 7, lbl;
+            while (!(val & (1 << bit)))
+                bit--;
+            emitload(r0, fn);
+            fprintf(outf, "\tsta.b tcc__r9\n");
+            fprintf(outf, "\tstz.b tcc__r9h\n");
+            for (bit--; bit >= 0; bit--) {
+                fprintf(outf, "\tasl a\n");
+                fprintf(outf, "\trol.b tcc__r9h\n");
+                if (val & (1 << bit)) {
+                    lbl = ++scmp_seq;
+                    fprintf(outf, "\tclc\n");
+                    fprintf(outf, "\tadc.b tcc__r9\n");
+                    fprintf(outf, "\tbcc @mulc.%d\n", lbl);
+                    fprintf(outf, "\tinc.b tcc__r9h\n");
+                    fprintf(outf, "@mulc.%d:\n", lbl);
+                }
+            }
+            emitstore(i->to, fn);
+            fprintf(outf, "\tlda.b tcc__r9h\n");
+            emit_store_high(i->to, fn);
+            acache_invalidate();
+            r9_invalidate();
+            break;
         }
         if (i->cls == Kl) {
             emit_load_high(r1, fn, 0);
@@ -6082,6 +6178,7 @@ w65816_emitfn(Fn *fn, FILE *f)
     leaf_opt = (fn->leaf || all_calls_are_tail(fn)) && !fn->dynalloc;
     skip_dead_retstore_temp = -1;
     count_temp_uses(fn);
+    mark_near_indexed(fn);      /* S4: is_far() reads it, so first */
     build_alias_table(fn);
     mark_dead_stores(fn);
     mark_high_zero(fn);
