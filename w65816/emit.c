@@ -5738,7 +5738,17 @@ emitjmp(Blk *b, Fn *fn)
              * C functions that return s32/u32.
              *
              * For Kw / Kh / Kb returns, only A is used. */
-            if (b->jmp.type == Jretl) {
+            if (b->jmp.type == Jretl && rtype(b->jmp.arg) == RTmp
+                && fn->tmp[b->jmp.arg.val].cls != Kl) {
+                /* A Kw temp returned as a 32-bit value (the optimizer
+                 * returns the condition itself for `x ? 1 : 0`): its high
+                 * half is 0, and its low half may be in A only — the store
+                 * to its slot is elided when the temp is just the return
+                 * value. `lda #0; sta` lost it and the reload read a slot
+                 * nobody wrote; stz leaves A alone.
+                 * (difftest_stmt, seed 3797, 2026-10-08) */
+                fprintf(outf, "\tstz.b tcc__retval_hi\n");
+            } else if (b->jmp.type == Jretl) {
                 emit_load_high(b->jmp.arg, fn, 0);
                 fprintf(outf, "\tsta.b tcc__retval_hi\n");
             }
@@ -5906,6 +5916,32 @@ w65816_emitfn(Fn *fn, FILE *f)
      * LAST function's data. Restore this fn's snapshot before we read. */
     w65816_restore_alloc_state(fn);
     w65816_check_temps(fn);   /* later passes add temps */
+
+    /* No FPU and no soft-float library. Only conversions and compares
+     * stopped the build until 2026-10-08: `a * 2.5f` was emitted as a
+     * 16-bit integer multiply of the low word, `a + b` as an integer add.
+     * Whatever floating-point value is still here after constant folding
+     * is refused; `(int)(1.5 * 256)` was folded and is not. */
+    {
+        Blk *fb;
+        Ins *fi;
+        Phi *fp;
+        int isflt = 0;
+        for (fb = fn->start; fb && !isflt; fb = fb->link) {
+            for (fp = fb->phi; fp; fp = fp->link)
+                isflt |= KBASE(fp->cls) == 1;
+            for (fi = fb->ins; fi < &fb->ins[fb->nins]; fi++)
+                isflt |= KBASE(fi->cls) == 1
+                      || fi->op == Ostores || fi->op == Ostored;
+        }
+        if (isflt)
+            err("function %s uses floating-point arithmetic, which this target "
+                "does not have (no FPU, no soft-float library): use the "
+                "fixed-point types, fixed in <snes/math.h> or fixed32 in "
+                "<snes/fixed32.h>. A floating constant is "
+                "fine where the compiler can fold it, e.g. (int)(1.5 * 256)",
+                fn->name);
+    }
 
     /*
      * Compute allocslot[] offsets from w65816_alloc_size[] (set by abi0)
