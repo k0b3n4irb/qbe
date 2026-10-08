@@ -2157,6 +2157,23 @@ mark_dead_stores(Fn *fn)
                 }
             }
 
+            /* Case R (S5, 2026-10-08): the value a block returns, produced
+             * by the block's last instruction. The return takes it from A;
+             * the slot is never read. This was done at emission time and
+             * for leaf functions only (skip_dead_retstore_temp), which left
+             * the slot in the frame; decided here, the temp gets none, in
+             * any function. Kl excluded: the high half goes through the
+             * slot. */
+            if (temp_use_count[idx] == 1 && temp_is_retval[idx]
+                && !temp_is_dead_store[idx]
+                && i == &b->ins[b->nins] - 1 && isret(b->jmp.type)
+                && req(i->to, b->jmp.arg)
+                && fn->tmp[i->to.val].cls != Kl
+                && !getenv("QBE_NO_RETSTORE_ALL")) {
+                if (getenv("QBE_DBG_DEAD")) fprintf(stderr, "DEADSTORE caseR tmp%d\n", idx);
+                temp_is_dead_store[idx] = 1;
+            }
+
             /* Case 3: used once as arg[1] of immediately next commutative instruction.
              * The commutative swap will load r1 from A-cache (since we just produced it)
              * and use r0 as the emitop2 operand, so the slot store is never read. */
