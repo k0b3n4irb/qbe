@@ -233,11 +233,24 @@ emitop2_high(char *op, Ref r, Fn *fn)
     switch (rtype(r)) {
     case RTmp:
         if (r.val >= Tmp0) {
+            /* A Kw temp used as a Kl operand is zero-extended and owns one
+             * slot word only (see emit_load_high): its high half is the
+             * literal 0, not the next temp's slot. The optimizer puts a Kw
+             * temp there when it replaces a Kl phi of 0 and 1 by the
+             * condition it copies — `(c ? 1 : x) > y` then compared a
+             * neighbour's slot. (difftest_stmt, seed 2630, 2026-10-08) */
+            if (fn->tmp[r.val].cls != Kl) {
+                fprintf(outf, "\t%s.w #0\n", op);
+                break;
+            }
             check_high_read(r, fn);
             slot_read(r, 1, fn);
             slot = fn->tmp[r.val].slot;
             if (slot >= 0)
                 emit_stack_op(op, (slot + 1) * 2 + 2, 0);
+        } else {
+            /* R0-R7 vregs are 16-bit only */
+            fprintf(outf, "\t%s.w #0\n", op);
         }
         break;
     case RCon:
@@ -3031,10 +3044,12 @@ emitins(Ins *i, Fn *fn)
             fprintf(outf, "\tclc\n");
             fprintf(outf, "\tadc.w #1\n");
             emitstore(i->to, fn);
-            emit_load_high(r0, fn, 0);
-            fprintf(outf, "\teor.w #$FFFF\n");
-            fprintf(outf, "\tadc.w #0\n");
-            emit_store_high(i->to, fn);
+            if (!ref_to_is_addr_only(i->to)) {   /* see Oand */
+                emit_load_high(r0, fn, 0);
+                fprintf(outf, "\teor.w #$FFFF\n");
+                fprintf(outf, "\tadc.w #0\n");
+                emit_store_high(i->to, fn);
+            }
             acache_invalidate();
             break;
         }
@@ -3701,9 +3716,16 @@ emitins(Ins *i, Fn *fn)
             emitload(r0, fn);
             emitop2("and", r1, fn);
             emitstore(i->to, fn);
-            emit_load_high(r0, fn, 0);
-            emitop2_high("and", r1, fn);
-            emit_store_high(i->to, fn);
+            /* addr_only dest: its high half is never read, and
+             * mark_addr_only_kl let the operands skip theirs on that
+             * promise (is_high_dead_propagating). Computing it anyway
+             * read a high word nobody wrote — the Kl invariant stopped
+             * the build on `a[x & 7]` with a long x (difftest, 2026-10-08). */
+            if (!ref_to_is_addr_only(i->to)) {
+                emit_load_high(r0, fn, 0);
+                emitop2_high("and", r1, fn);
+                emit_store_high(i->to, fn);
+            }
             acache_invalidate();
             break;
         }
@@ -3722,9 +3744,16 @@ emitins(Ins *i, Fn *fn)
             emitload(r0, fn);
             emitop2("ora", r1, fn);
             emitstore(i->to, fn);
-            emit_load_high(r0, fn, 0);
-            emitop2_high("ora", r1, fn);
-            emit_store_high(i->to, fn);
+            /* addr_only dest: its high half is never read, and
+             * mark_addr_only_kl let the operands skip theirs on that
+             * promise (is_high_dead_propagating). Computing it anyway
+             * read a high word nobody wrote — the Kl invariant stopped
+             * the build on `a[x & 7]` with a long x (difftest, 2026-10-08). */
+            if (!ref_to_is_addr_only(i->to)) {
+                emit_load_high(r0, fn, 0);
+                emitop2_high("ora", r1, fn);
+                emit_store_high(i->to, fn);
+            }
             acache_invalidate();
             break;
         }
@@ -3743,9 +3772,16 @@ emitins(Ins *i, Fn *fn)
             emitload(r0, fn);
             emitop2("eor", r1, fn);
             emitstore(i->to, fn);
-            emit_load_high(r0, fn, 0);
-            emitop2_high("eor", r1, fn);
-            emit_store_high(i->to, fn);
+            /* addr_only dest: its high half is never read, and
+             * mark_addr_only_kl let the operands skip theirs on that
+             * promise (is_high_dead_propagating). Computing it anyway
+             * read a high word nobody wrote — the Kl invariant stopped
+             * the build on `a[x & 7]` with a long x (difftest, 2026-10-08). */
+            if (!ref_to_is_addr_only(i->to)) {
+                emit_load_high(r0, fn, 0);
+                emitop2_high("eor", r1, fn);
+                emit_store_high(i->to, fn);
+            }
             acache_invalidate();
             break;
         }
@@ -5350,106 +5386,266 @@ emitins(Ins *i, Fn *fn)
 
 /*
  * Emit phi moves for a jump from 'from' to 'to'.
- * For each phi in 'to', find the argument from 'from' and:
- * - If constant: store constant to phi result's slot
- * - If temp with different slot: copy to phi result's slot
- *   (With coalescing, temps should already share slots)
+ *
+ * The phis of a block take their values together: every argument is the
+ * value it had BEFORE any of them is written. Until 2026-10-08 the moves
+ * were emitted one after the other in list order, so a phi whose argument
+ * is another phi's result read the new value —
+ *
+ *     for (...) { prev = cur; cur += d; }      // prev ended equal to cur
+ *
+ * (the lost-copy problem; a rotation `t = a; a = b; b = t` is the swap
+ * problem). The moves are now ordered: one whose destination no pending
+ * move still reads goes first; when every destination is still read — a
+ * cycle — one value of the cycle is parked in tcc__r10 / tcc__r10h and its
+ * readers take it from there. (difftest_stmt, seed 51)
+ *
+ * For each phi: a constant is stored to the result's slot, a temp in
+ * another slot is copied, a temp in the same slot (coalesced) needs nothing.
  */
+#define PHI_MAX 64
+
+/* Slots [lo, hi) a temp occupies: a Kl temp owns two words. */
+static void
+phi_span(Fn *fn, Ref r, int *lo, int *hi)
+{
+    *lo = *hi = -1;
+    if (rtype(r) != RTmp || r.val < Tmp0 || fn->tmp[r.val].slot < 0)
+        return;
+    *lo = fn->tmp[r.val].slot;
+    *hi = *lo + (fn->tmp[r.val].cls == Kl ? 2 : 1);
+}
+
+/* Does this argument live in a stack slot of this frame? A constant and a
+ * leaf-opt parameter alias (caller's frame) are never overwritten here. */
+static int
+phi_arg_in_slot(Fn *fn, Ref arg)
+{
+    int idx;
+    if (rtype(arg) != RTmp || arg.val < Tmp0)
+        return 0;
+    idx = arg.val - Tmp0;
+    if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS
+        && temp_alias[idx] != 0 && fn->tmp[arg.val].cls != Kl)
+        return 0;
+    return fn->tmp[arg.val].slot >= 0;
+}
+
+/* One move. `parked`: the argument's value is in tcc__r10 / tcc__r10h. */
+static void
+emit_one_phimove(Phi *p, Ref arg, int parked, Fn *fn)
+{
+    int dstslot = fn->tmp[p->to.val].slot;
+
+    /* Kl (4-byte far pointer / 32-bit) phi args must move BOTH halves: the
+     * low/offset word at (slot+1)*2 and the high/bank word at
+     * (slot+1)*2 + 2. The historical code moved only the low word, so a
+     * phi of address constants (`x ? "A" : "B"`) or of Kl temps left the
+     * result's bank half as stack garbage. See
+     * .claude/notes/tech/ternary_addr_const_bank_drop.md. */
+    if (parked) {
+        fprintf(outf, "\tlda.b tcc__r10\n");
+        emit_stack_store((dstslot + 1) * 2, 0);
+        slot_wrote(p->to, 0);
+        if (p->cls == Kl) {
+            fprintf(outf, "\tlda.b tcc__r10h\n");
+            emit_stack_store((dstslot + 1) * 2 + 2, 0);
+            slot_wrote(p->to, 1);
+            note_high_written(p->to);
+        }
+        acache_invalidate();
+    } else if (rtype(arg) == RCon) {
+        /* Constant: load and store to phi slot (low half) */
+        emitload(arg, fn);
+        emit_stack_store((dstslot + 1) * 2, 0);
+        slot_wrote(p->to, 0);
+        if (p->cls == Kl) {
+            /* High/bank half: `lda.w #:sym` (CAddr) or the top 16 bits
+             * (CBits), then store to the high slot. */
+            emit_load_high(arg, fn, 0);
+            emit_stack_store((dstslot + 1) * 2 + 2, 0);
+            slot_wrote(p->to, 1);
+            note_high_written(p->to);
+        }
+    } else if (rtype(arg) == RTmp && arg.val >= Tmp0) {
+        int idx = arg.val - Tmp0;
+        /* A Kw temp feeding a Kl phi is zero-extended (the convention of
+         * emit_load_high): it owns one slot word, so the phi's high word
+         * is written 0 here — reading `srcslot + 1` took the next temp's. */
+        int widen = p->cls == Kl && fn->tmp[arg.val].cls != Kl;
+        /* The leaf-opt param alias slot is 16-bit and cannot carry a Kl
+         * high half — mirror emitload_adj's `cls != Kl` guard so Kl temps
+         * fall through to the two-half spilled copy. */
+        if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS
+            && temp_alias[idx] != 0 && fn->tmp[arg.val].cls != Kl) {
+            /* Aliased to param slot — load from caller frame */
+            if (!acache_has(arg)) {
+                int neg_slot = temp_alias[idx];
+                emit_stack_load(framesize + PARAM_OFFSET + (-neg_slot), 0);
+                acache_set(arg);
+            }
+            emit_stack_store((dstslot + 1) * 2, 0);
+            slot_wrote(p->to, 0);
+        } else if (widen) {
+            int srcslot = fn->tmp[arg.val].slot;
+            if (srcslot >= 0 && srcslot != dstslot) {
+                if (!acache_has(arg)) {
+                    slot_read(arg, 0, fn);
+                    emit_stack_load((srcslot + 1) * 2, 0);
+                    acache_set(arg);
+                }
+                emit_stack_store((dstslot + 1) * 2, 0);
+                slot_wrote(p->to, 0);
+            }
+        } else {
+            int srcslot = fn->tmp[arg.val].slot;
+            if (srcslot >= 0 && srcslot != dstslot) {
+                /* Different slots - need to copy */
+                if (!acache_has(arg)) {
+                    slot_read(arg, 0, fn);
+                    emit_stack_load((srcslot + 1) * 2, 0);
+                    acache_set(arg);
+                }
+                emit_stack_store((dstslot + 1) * 2, 0);
+                slot_wrote(p->to, 0);
+                if (p->cls == Kl) {
+                    /* Copy the high/bank half too. This clobbers A (which
+                     * held the low half), so drop the cache afterward. */
+                    check_high_read(arg, fn);
+                    slot_read(arg, 1, fn);
+                    emit_stack_load((srcslot + 1) * 2 + 2, 0);
+                    emit_stack_store((dstslot + 1) * 2 + 2, 0);
+                    slot_wrote(p->to, 1);
+                    note_high_written(p->to);
+                    acache_invalidate();
+                }
+            }
+            /* Coalesced slot: the phi's high word is the argument's,
+             * written or not. A Kl temp owns both slots, so the high half
+             * is shared too. */
+            if (p->cls == Kl && srcslot == dstslot && high_written(arg))
+                note_high_written(p->to);
+        }
+        if (widen) {
+            fprintf(outf, "\tlda.w #0\n");
+            emit_stack_store((dstslot + 1) * 2 + 2, 0);
+            slot_wrote(p->to, 1);
+            note_high_written(p->to);
+            acache_invalidate();
+        }
+    }
+}
+
 static void
 emitphimoves(Blk *from, Blk *to, Fn *fn)
 {
-    Phi *p;
-    int n;
-    int dstslot;
+    Phi *p, *mv[PHI_MAX];
+    Ref arg[PHI_MAX];
+    char done[PHI_MAX], parked[PHI_MAX];
+    int n, k, j, nmv = 0, left, dlo, dhi, slo, shi;
 
     if (!to)
         return;
 
     for (p = to->phi; p; p = p->link) {
-        /* Find the argument corresponding to 'from' */
-        for (n = 0; n < (int)p->narg; n++) {
-            if (p->blk[n] == from) {
-                /* Get destination slot (phi result) */
-                if (rtype(p->to) != RTmp || p->to.val < Tmp0)
-                    continue;
-                dstslot = fn->tmp[p->to.val].slot;
-                if (dstslot < 0)
-                    continue;
-
-                /* Handle the argument.
-                 *
-                 * Kl (4-byte far pointer / 32-bit) phi args must move BOTH
-                 * halves: the low/offset word at (slot+1)*2 and the high/bank
-                 * word at (slot+1)*2 + 2. The historical code moved only the
-                 * low word, so a phi of address constants (`x ? "A" : "B"`) or
-                 * of Kl temps left the result's bank half as stack garbage —
-                 * consumers (arg push, pointer return, store) then read a
-                 * corrupt far pointer. See
-                 * .claude/notes/tech/ternary_addr_const_bank_drop.md. */
-                if (rtype(p->arg[n]) == RCon) {
-                    /* Constant: load and store to phi slot (low half) */
-                    emitload(p->arg[n], fn);
-                    emit_stack_store((dstslot + 1) * 2, 0);
-                    slot_wrote(p->to, 0);
-                    if (p->cls == Kl) {
-                        /* High/bank half: `lda.w #:sym` (CAddr) or the top
-                         * 16 bits (CBits), then store to the high slot. */
-                        emit_load_high(p->arg[n], fn, 0);
-                        emit_stack_store((dstslot + 1) * 2 + 2, 0);
-                        slot_wrote(p->to, 1);
-                        note_high_written(p->to);
-                    }
-                } else if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
-                    int idx = p->arg[n].val - Tmp0;
-                    /* The leaf-opt param alias slot is 16-bit and cannot carry
-                     * a Kl high half — mirror emitload_adj's `cls != Kl` guard
-                     * so Kl temps fall through to the two-half spilled copy. */
-                    if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS
-                        && temp_alias[idx] != 0 && fn->tmp[p->arg[n].val].cls != Kl) {
-                        /* Aliased to param slot — load from caller frame */
-                        if (!acache_has(p->arg[n])) {
-                            int neg_slot = temp_alias[idx];
-                            emit_stack_load(framesize + PARAM_OFFSET + (-neg_slot), 0);
-                            acache_set(p->arg[n]);
-                        }
-                        emit_stack_store((dstslot + 1) * 2, 0);
-                        slot_wrote(p->to, 0);
-                    } else {
-                        /* Temp: check if we need to copy */
-                        int srcslot = fn->tmp[p->arg[n].val].slot;
-                        if (srcslot >= 0 && srcslot != dstslot) {
-                            /* Different slots - need to copy */
-                            if (!acache_has(p->arg[n])) {
-                                slot_read(p->arg[n], 0, fn);
-                                emit_stack_load((srcslot + 1) * 2, 0);
-                                acache_set(p->arg[n]);
-                            }
-                            emit_stack_store((dstslot + 1) * 2, 0);
-                            slot_wrote(p->to, 0);
-                            if (p->cls == Kl) {
-                                /* Copy the high/bank half too. This clobbers A
-                                 * (which held the low half), so drop the cache
-                                 * afterward. */
-                                check_high_read(p->arg[n], fn);
-                                slot_read(p->arg[n], 1, fn);
-                                emit_stack_load((srcslot + 1) * 2 + 2, 0);
-                                emit_stack_store((dstslot + 1) * 2 + 2, 0);
-                                slot_wrote(p->to, 1);
-                                note_high_written(p->to);
-                                acache_invalidate();
-                            }
-                        }
-                        /* Coalesced slot: the phi's high word is the
-                         * argument's, written or not. */
-                        if (p->cls == Kl && srcslot == dstslot
-                            && high_written(p->arg[n]))
-                            note_high_written(p->to);
-                        /* If same slot, no copy needed (coalesced) — a Kl temp
-                         * owns both slots, so the high half is shared too. */
-                    }
-                }
+        if (rtype(p->to) != RTmp || p->to.val < Tmp0
+            || fn->tmp[p->to.val].slot < 0)
+            continue;
+        for (n = 0; n < (int)p->narg; n++)
+            if (p->blk[n] == from)
                 break;
+        if (n == (int)p->narg)
+            continue;
+        if (nmv == PHI_MAX)
+            err("internal compiler error: more than %d phis on the edge %s -> %s "
+                "in %s (compiler/qbe/w65816/emit.c, PHI_MAX)",
+                PHI_MAX, from->name, to->name, fn->name);
+        mv[nmv] = p;
+        arg[nmv] = p->arg[n];
+        done[nmv] = parked[nmv] = 0;
+        nmv++;
+    }
+
+    if (nmv && getenv("QBE_DBG_PHI"))
+        for (k = 0; k < nmv; k++)
+            fprintf(stderr, "PHI %s: %s -> %s: %%%s (slot %d) <- %s%s (slot %d)\n",
+                    fn->name, from->name, to->name,
+                    fn->tmp[mv[k]->to.val].name, fn->tmp[mv[k]->to.val].slot,
+                    rtype(arg[k]) == RTmp ? "%" : "const",
+                    rtype(arg[k]) == RTmp ? fn->tmp[arg[k].val].name : "",
+                    rtype(arg[k]) == RTmp ? fn->tmp[arg[k].val].slot : -1);
+
+    for (left = nmv; left > 0; ) {
+        /* A move is free when no other pending move reads its destination
+         * from the frame. */
+        for (k = 0; k < nmv; k++) {
+            if (done[k])
+                continue;
+            phi_span(fn, mv[k]->to, &dlo, &dhi);
+            for (j = 0; j < nmv; j++) {
+                if (j == k || done[j] || parked[j] || !phi_arg_in_slot(fn, arg[j]))
+                    continue;
+                phi_span(fn, arg[j], &slo, &shi);
+                if (slo < dhi && dlo < shi)
+                    break;
             }
+            if (j == nmv)
+                break;
+        }
+        if (k < nmv) {
+            emit_one_phimove(mv[k], arg[k], parked[k], fn);
+            done[k] = 1;
+            left--;
+            continue;
+        }
+        /* Every destination is still read: a cycle. Walk reader to reader
+         * from any pending move until one comes round again — that one is
+         * on the cycle — and park its argument. */
+        {
+            char seen[PHI_MAX];
+            int cur = -1, guard;
+            memset(seen, 0, sizeof seen);
+            for (k = 0; k < nmv; k++)
+                if (!done[k]) { cur = k; break; }
+            for (guard = 0; guard <= nmv && !seen[cur]; guard++) {
+                seen[cur] = 1;
+                phi_span(fn, mv[cur]->to, &dlo, &dhi);
+                for (j = 0; j < nmv; j++) {
+                    if (j == cur || done[j] || parked[j] || !phi_arg_in_slot(fn, arg[j]))
+                        continue;
+                    phi_span(fn, arg[j], &slo, &shi);
+                    if (slo < dhi && dlo < shi)
+                        break;
+                }
+                if (j == nmv)   /* cannot be: nothing is free */
+                    err("internal compiler error: phi ordering lost its cycle on "
+                        "the edge %s -> %s in %s (compiler/qbe/w65816/emit.c)",
+                        from->name, to->name, fn->name);
+                cur = j;
+            }
+            for (j = 0; j < nmv; j++)
+                if (!done[j] && parked[j])
+                    err("internal compiler error: two phi cycles to break at once "
+                        "on the edge %s -> %s in %s (compiler/qbe/w65816/emit.c)",
+                        from->name, to->name, fn->name);
+            slot_read(arg[cur], 0, fn);
+            emit_stack_load((fn->tmp[arg[cur].val].slot + 1) * 2, 0);
+            fprintf(outf, "\tsta.b tcc__r10\n");
+            if (fn->tmp[arg[cur].val].cls == Kl) {
+                check_high_read(arg[cur], fn);
+                slot_read(arg[cur], 1, fn);
+                emit_stack_load((fn->tmp[arg[cur].val].slot + 1) * 2 + 2, 0);
+                fprintf(outf, "\tsta.b tcc__r10h\n");
+            } else {
+                /* a Kw value read by a Kl phi is zero-extended */
+                fprintf(outf, "\tstz.b tcc__r10h\n");
+            }
+            acache_invalidate();
+            /* every pending reader of that temp takes the parked value */
+            for (j = 0; j < nmv; j++)
+                if (!done[j] && j != cur && req(arg[j], arg[cur]))
+                    parked[j] = 1;
+            parked[cur] = 1;
         }
     }
 }
