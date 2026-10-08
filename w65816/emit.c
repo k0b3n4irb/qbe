@@ -440,7 +440,7 @@ cmp_branch_info(int op, int *swap, const char **bt, const char **bf)
 }
 
 /* Leaf function optimization: parameter alias propagation + dead return store */
-#define MAX_ALIAS_TEMPS 256
+#define MAX_ALIAS_TEMPS MAX_ALLOC_TEMPS   /* one limit, checked: see all.h */
 static int temp_alias[MAX_ALIAS_TEMPS];    /* 0 = no alias, negative = param slot */
 static int alloc_param[MAX_ALIAS_TEMPS];   /* 0 = no param, negative = param slot for alloc */
 static int leaf_opt;                        /* 1 = leaf optimizations active */
@@ -1164,6 +1164,50 @@ build_alias_table(Fn *fn)
                 }
             }
 
+    /* A param shadow is read back through the alias, never from its slot,
+     * so its one store is not emitted. That only holds while EVERY use of
+     * the alloc is that store's address or the address of a load the alias
+     * rule below covers. Any other use — its address stored, added to,
+     * passed, a `loadsh` / `loadub`, a phi or a jump argument — reads or
+     * writes the slot itself: count it as a second store. (Added
+     * 2026-10-08 while chasing a parameter read back as 0; that one turned
+     * out to be the table limit, see MAX_ALLOC_TEMPS, but a parameter whose
+     * address is taken must not depend on which other rule saves it.) */
+    for (b = fn->start; b; b = b->link) {
+        Phi *p;
+        int a, n;
+        for (i = b->ins; i < &b->ins[b->nins]; i++)
+            for (a = 0; a < 2; a++) {
+                Ref r = i->arg[a];
+                if (rtype(r) != RTmp || r.val < Tmp0)
+                    continue;
+                idx = r.val - Tmp0;
+                if (idx < 0 || idx >= MAX_ALIAS_TEMPS || w65816_alloc_size[idx] <= 0)
+                    continue;
+                if (a == 1 && (i->op == Ostorew || i->op == Ostoreh
+                               || i->op == Ostoreb || i->op == Ostorel))
+                    continue;
+                /* a load widened into Kl (`=l loadsw`, what the optimizer
+                 * makes of a load and its extension) reads the slot too */
+                if (a == 0 && i->cls == Kw
+                    && (i->op == Oloadsw || i->op == Oloaduw || i->op == Oload))
+                    continue;
+                alloc_store_count[idx] += 2;
+            }
+        for (p = b->phi; p; p = p->link)
+            for (n = 0; n < (int)p->narg; n++)
+                if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
+                    idx = p->arg[n].val - Tmp0;
+                    if (idx >= 0 && idx < MAX_ALIAS_TEMPS && w65816_alloc_size[idx] > 0)
+                        alloc_store_count[idx] += 2;
+                }
+        if (rtype(b->jmp.arg) == RTmp && b->jmp.arg.val >= Tmp0) {
+            idx = b->jmp.arg.val - Tmp0;
+            if (idx >= 0 && idx < MAX_ALIAS_TEMPS && w65816_alloc_size[idx] > 0)
+                alloc_store_count[idx] += 2;
+        }
+    }
+
     for (b = fn->start; b; b = b->link) {
         for (i = b->ins; i < &b->ins[b->nins]; i++) {
             r0 = i->arg[0];
@@ -1228,6 +1272,11 @@ build_alias_table(Fn *fn)
             }
         }
     }
+    if (getenv("QBE_DBG_ALIAS"))
+        for (idx = 0; idx < MAX_ALIAS_TEMPS && Tmp0 + idx < fn->ntmp; idx++)
+            if (w65816_alloc_size[idx] > 0)
+                fprintf(stderr, "ALIAS %s: alloc %%%s uses=%d param=%d\n", fn->name,
+                        fn->tmp[Tmp0 + idx].name, alloc_store_count[idx], alloc_param[idx]);
 }
 
 /* Check if instruction is a no-op (emits no real code) given current alias/param state.
@@ -5650,6 +5699,25 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
     }
 }
 
+/* A conditional branch followed by the phi moves of both ways out:
+ *
+ *         bxx +
+ *         <moves of one edge>
+ *         jmp @there
+ *     +
+ *         <moves of the other edge>
+ *
+ * The code after `+` is reached from the branch, not through the first
+ * moves, so what those left in A is not there. The A-cache used to carry
+ * over: `do { if (g) break; } while (++j < 3);` stored the compare's
+ * leftover to j on the way back up. branch_fork() keeps the cache as it is
+ * at the branch, branch_join() puts it back at the label.
+ * (difftest_stmt, seed 3, 2026-10-08) */
+static int fork_valid;
+static Ref fork_ref;
+static void branch_fork(void) { fork_valid = acache_valid; fork_ref = acache_ref; }
+static void branch_join(void) { acache_valid = fork_valid; acache_ref = fork_ref; }
+
 /*
  * Emit jump/return
  */
@@ -5707,24 +5775,30 @@ emitjmp(Blk *b, Fn *fn)
             acache_invalidate();
             if (b->s1 == b->link) {
                 /* True falls through: skip false path on TRUE */
+                branch_fork();
                 fprintf(outf, "\t%s +\n", bt);
                 emitphimoves(b, b->s2, fn);
                 fprintf(outf, "\tjmp @%s\n", b->s2->name);
                 fprintf(outf, "+\n");
+                branch_join();
                 emitphimoves(b, b->s1, fn);
             } else if (b->s2 == b->link) {
                 /* False falls through: skip true path on FALSE */
+                branch_fork();
                 fprintf(outf, "\t%s +\n", bf);
                 emitphimoves(b, b->s1, fn);
                 fprintf(outf, "\tjmp @%s\n", b->s1->name);
                 fprintf(outf, "+\n");
+                branch_join();
                 emitphimoves(b, b->s2, fn);
             } else {
                 /* Neither falls through */
+                branch_fork();
                 fprintf(outf, "\t%s +\n", bt);
                 emitphimoves(b, b->s2, fn);
                 fprintf(outf, "\tjmp @%s\n", b->s2->name);
                 fprintf(outf, "+\n");
+                branch_join();
                 emitphimoves(b, b->s1, fn);
                 fprintf(outf, "\tjmp @%s\n", b->s1->name);
             }
@@ -5753,24 +5827,30 @@ emitjmp(Blk *b, Fn *fn)
                 fprintf(outf, "\tcmp.w #0\n");
             if (b->s1 == b->link) {
                 /* True branch falls through - invert: branch on zero to s2 */
+                branch_fork();
                 fprintf(outf, "\tbne +\n");
                 emitphimoves(b, b->s2, fn);
                 fprintf(outf, "\tjmp @%s\n", b->s2->name);
                 fprintf(outf, "+\n");
+                branch_join();
                 emitphimoves(b, b->s1, fn);
             } else if (b->s2 == b->link) {
                 /* False branch falls through - branch on nonzero to s1 */
+                branch_fork();
                 fprintf(outf, "\tbeq +\n");
                 emitphimoves(b, b->s1, fn);
                 fprintf(outf, "\tjmp @%s\n", b->s1->name);
                 fprintf(outf, "+\n");
+                branch_join();
                 emitphimoves(b, b->s2, fn);
             } else {
                 /* Neither falls through */
+                branch_fork();
                 fprintf(outf, "\tbne +\n");
                 emitphimoves(b, b->s2, fn);
                 fprintf(outf, "\tjmp @%s\n", b->s2->name);
                 fprintf(outf, "+\n");
+                branch_join();
                 emitphimoves(b, b->s1, fn);
                 fprintf(outf, "\tjmp @%s\n", b->s1->name);
             }
@@ -5782,22 +5862,28 @@ emitjmp(Blk *b, Fn *fn)
             if (!last_load_emitted)
                 fprintf(outf, "\tcmp.w #0\n");
             if (b->s1 == b->link) {
+                branch_fork();
                 fprintf(outf, "\tbne +\n");
                 emitphimoves(b, b->s2, fn);
                 fprintf(outf, "\tjmp @%s\n", b->s2->name);
                 fprintf(outf, "+\n");
+                branch_join();
                 emitphimoves(b, b->s1, fn);
             } else if (b->s2 == b->link) {
+                branch_fork();
                 fprintf(outf, "\tbeq +\n");
                 emitphimoves(b, b->s1, fn);
                 fprintf(outf, "\tjmp @%s\n", b->s1->name);
                 fprintf(outf, "+\n");
+                branch_join();
                 emitphimoves(b, b->s2, fn);
             } else {
+                branch_fork();
                 fprintf(outf, "\tbne +\n");
                 emitphimoves(b, b->s2, fn);
                 fprintf(outf, "\tjmp @%s\n", b->s2->name);
                 fprintf(outf, "+\n");
+                branch_join();
                 emitphimoves(b, b->s1, fn);
                 fprintf(outf, "\tjmp @%s\n", b->s1->name);
             }
@@ -5819,6 +5905,7 @@ w65816_emitfn(Fn *fn, FILE *f)
      * so the w65816_alloc_size[] / w65816_alloc_slots globals hold the
      * LAST function's data. Restore this fn's snapshot before we read. */
     w65816_restore_alloc_state(fn);
+    w65816_check_temps(fn);   /* later passes add temps */
 
     /*
      * Compute allocslot[] offsets from w65816_alloc_size[] (set by abi0)

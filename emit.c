@@ -512,15 +512,19 @@ wla_emitdat(Dat *d, FILE *f)
 		break;
 
 	case DZ:
-		/* Zero-fill - accumulate size */
-		if (has_nonzero_data) {
-			/* Already have non-zero data, buffer this zero-fill */
-			if (init_count >= MAX_INIT_ITEMS)
-				die("too many data items");
-			init_items[init_count].type = -3;
-			init_items[init_count].num = d->u.num;
-			init_count++;
-		}
+		/* Zero-fill: buffered like any other item. An object of zeros
+		 * only never reads the buffer (pure BSS at DEnd), but a zero-fill
+		 * that comes BEFORE the first value is part of the object: it was
+		 * skipped until 2026-10-08, so `int t[4] = { [2] = 7 };` or a
+		 * struct starting with zero bit-fields was emitted short — the
+		 * values moved to the front, and for a RAM object the init record
+		 * announced more bytes than it carried, shifting every record
+		 * after it. (difftest_stmt, seed 62) */
+		if (init_count >= MAX_INIT_ITEMS)
+			die("too many data items");
+		init_items[init_count].type = -3;
+		init_items[init_count].num = d->u.num;
+		init_count++;
 		init_total_size += d->u.num;
 		break;
 

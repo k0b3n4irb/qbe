@@ -39,6 +39,16 @@
 int w65816_alloc_size[MAX_ALLOC_TEMPS];
 int w65816_alloc_slots;
 
+/* See MAX_ALLOC_TEMPS: refuse what the tables cannot hold. */
+void
+w65816_check_temps(Fn *fn)
+{
+    if (fn->ntmp - Tmp0 > MAX_ALLOC_TEMPS)
+        err("function %s is too large for the w65816 backend: %d temporaries, "
+            "the limit is %d — split it into smaller functions",
+            fn->name, fn->ntmp - Tmp0, MAX_ALLOC_TEMPS);
+}
+
 typedef struct AllocSnap AllocSnap;
 struct AllocSnap {
     Fn *fn;
@@ -84,6 +94,8 @@ scanallocations(Fn *fn)
     Blk *b;
     Ins *i;
     int totalslots = 0;
+
+    w65816_check_temps(fn);
 
     /* Reset alloc tracking */
     for (int j = 0; j < MAX_ALLOC_TEMPS; j++)

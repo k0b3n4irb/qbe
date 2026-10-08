@@ -55,8 +55,16 @@ void w65816_abi0(Fn *);
 void w65816_abi(Fn *);
 
 /* Alloc tracking - set by abi0, used by emit */
-#define MAX_ALLOC_TEMPS 256
+/* Size of the backend's per-temp tables, indexed by temp number - Tmp0.
+ * It was 256 until 2026-10-08, and a function with more temps than that
+ * was not refused: every `idx < MAX` guard just stopped tracking, each on
+ * its own side. The store of a parameter into its shadow slot was skipped
+ * (the slot's index was low) while a load numbered past the limit could
+ * not be aliased and read the slot — never written. A function past the
+ * limit is now an error (w65816_check_temps). */
+#define MAX_ALLOC_TEMPS 2048
 extern int w65816_alloc_size[MAX_ALLOC_TEMPS];  /* size in words, 0 if not alloc */
+void w65816_check_temps(Fn *fn);
 extern int w65816_alloc_slots;                   /* total slots reserved for allocs */
 
 /* Restore the per-fn alloc snapshot saved by abi0 into the globals above.
