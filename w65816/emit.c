@@ -664,6 +664,57 @@ is_far_access_of(Ins *i, Ref r)
     }
 }
 
+/* Is the 32-bit value of r known to be >= 0? The decomposed forms add
+ * only the LOW word of the index, as an unsigned 16-bit offset, to a
+ * 24-bit base (`sym,x` and `[tcc__r9],y` both carry into the bank byte):
+ * right for an index in 0..65535, one bank too high for a negative one.
+ * `(far_arr + 8)[j]` with j = -1 read bank $7F (2026-10-08; luna: 0x0000
+ * for 0x1007). An index is non-negative when it comes from a zero
+ * extension or a Kw temp (zero-extended where a Kl is expected), through
+ * multiplications, shifts and additions by non-negative constants. */
+static int
+idx_nonneg(Fn *fn, Ref r, int depth)
+{
+    Blk *b;
+    Ins *i;
+    Con *c;
+
+    if (rtype(r) == RCon) {
+        c = &fn->con[r.val];
+        return c->type == CBits && c->bits.i >= 0 && c->bits.i <= 0xFFFF;
+    }
+    if (rtype(r) != RTmp || r.val < Tmp0 || depth > 6)
+        return 0;
+    if (fn->tmp[r.val].cls == Kw)
+        return 1;
+    for (b = fn->start; b; b = b->link)
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (!req(i->to, r))
+                continue;
+            switch (i->op) {
+            case Oextub: case Oextuh: case Oextuw:
+                return 1;
+            case Ocopy:
+                return idx_nonneg(fn, i->arg[0], depth + 1);
+            case Omul: case Oadd:
+                return idx_nonneg(fn, i->arg[0], depth + 1)
+                    && idx_nonneg(fn, i->arg[1], depth + 1);
+            case Oshl:
+                return idx_nonneg(fn, i->arg[0], depth + 1)
+                    && rtype(i->arg[1]) == RCon
+                    && fn->con[i->arg[1].val].type == CBits
+                    && fn->con[i->arg[1].val].bits.i >= 0
+                    && fn->con[i->arg[1].val].bits.i < 16;
+            case Oand:
+                return idx_nonneg(fn, i->arg[0], depth + 1)
+                    || idx_nonneg(fn, i->arg[1], depth + 1);
+            default:
+                return 0;
+            }
+        }
+    return 0;   /* a phi, a parameter: unknown */
+}
+
 static void
 mark_far_decomp(Fn *fn)
 {
@@ -711,6 +762,12 @@ mark_far_decomp(Fn *fn)
                 }
             }
             if (k == FAR_NONE)
+                continue;
+            /* a possibly negative index needs the full 24-bit sum. One
+             * exception: straight off a symbol with no offset, a negative
+             * index is below the object — not a valid access. */
+            if (k != FAR_BASE_CON && !idx_nonneg(fn, idx, 0)
+                && !(k == FAR_SYM_IDX && fn->con[base.val].bits.i == 0))
                 continue;
             far_decomp_kind[aidx] = k;
             far_decomp_base[aidx] = base;
