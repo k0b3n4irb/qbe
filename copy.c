@@ -167,15 +167,24 @@ defwidthle(Fn *fn, Ref r, int w)
 	if (i->op == Ocopy)
                 return defwidthle(fn, i->arg[0], w);
 	if (i->op == Oshr || i->op == Osar) {
+		/* OpenSNES (2026-10-08): at the width of a `w`, not at 32
+		 * (t is a Kw temp: checked above). With 32 here and 16-bit
+		 * words, `sar x, 15` was "one bit wide" as soon as x had
+		 * 16 bits or fewer — but then bit 15 is the sign, the result
+		 * is 0 or -1, and the `& 1` dropped after it was not
+		 * redundant: sa[(v >> 15) & 1] indexed sa[-1], and
+		 * ((s16)(a & 0xFF00) >> 8) & 0xFF kept its sign bits. */
+		int W = 8 * T.wordsz;
+
 		if (isconbits(fn, i->arg[1], &v))
-		if (0 < v && v <= 32) {
-			if (i->op == Oshr && w+v >= 32)
+		if (0 < v && v < W) {
+			if (i->op == Oshr && w+v >= W)
 				return 1;
-			if (w < 32) {
+			if (w < W) {
 				if (i->op == Osar)
-					w = min(31, w+v);
+					w = min(W-1, w+v);
 				else
-					w = min(32, w+v);
+					w = min(W, w+v);
 			}
 		}
 		return defwidthle(fn, i->arg[0], w);
