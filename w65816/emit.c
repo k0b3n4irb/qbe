@@ -596,6 +596,7 @@ slot_read(Ref r, int half, Fn *fn)
  * replaces `clc / adc #sym / sta / lda / tax / lda.l $0000,x`. Such an
  * access is "far" for every path below. near_indexed[] is filled by
  * mark_near_indexed() before any other analysis of the function. */
+enum { NEAR_SYM = 1, NEAR_PTR = 2, NEAR_DEREF = 3 };
 static unsigned char near_indexed[MAX_ALLOC_TEMPS];
 
 static int
@@ -640,7 +641,8 @@ is_far(Ins *i)
  * the index is the one whose high half is statically zero
  * (temp_high_zero, i.e. an Oextuw result); otherwise no decomposition.
  * This generalises the #121 single-use indexed-long load fusion. */
-enum { FAR_NONE = 0, FAR_SYM_IDX, FAR_BASE_CON, FAR_BASE_IDX };
+enum { FAR_NONE = 0, FAR_SYM_IDX, FAR_BASE_CON, FAR_BASE_IDX,
+       FAR_NEAR_DEREF /* S4: a near pointer in a temp, `$000000,x` */ };
 static int far_decomp_kind[MAX_ALIAS_TEMPS];
 static Ref far_decomp_base[MAX_ALIAS_TEMPS];   /* $sym con or base temp */
 static Ref far_decomp_idx[MAX_ALIAS_TEMPS];    /* index temp or CBits con */
@@ -657,6 +659,20 @@ static void
 r9_invalidate(void)
 {
     r9_valid = 0;
+}
+
+/* S4: which ref's low word X holds. Set only by x_load(); dropped at
+ * every block label and before every instruction that is not an indexed
+ * access (x_keeps() in the block loop of emitfn) — those are the only
+ * instructions known not to write X. A temp is SSA, so while the entry
+ * stands X is that temp's value: `p->a; p->b` loads X once. */
+static Ref x_ref;
+static int x_valid;
+
+static void
+x_invalidate(void)
+{
+    x_valid = 0;
 }
 
 static int
@@ -739,6 +755,21 @@ idx_nonneg(Fn *fn, Ref r, int depth)
     return 0;   /* a phi, a parameter: unknown */
 }
 
+/* The address operand of a load or store, R for anything else. */
+static Ref
+access_addr(Ins *i)
+{
+    switch (i->op) {
+    case Oloadsb: case Oloadub: case Oloadsh: case Oloaduh:
+    case Oloadsw: case Oloaduw: case Oload:
+        return i->arg[0];
+    case Ostoreb: case Ostoreh: case Ostorew: case Ostorel:
+        return i->arg[1];
+    default:
+        return R;
+    }
+}
+
 /* `%a =l add $sym, %idx` (either order) with an index the short form is
  * right for: returns 1 and sets base / idx. Shared by mark_near_indexed
  * and mark_far_decomp so that both always agree. */
@@ -772,9 +803,55 @@ mark_near_indexed(Fn *fn)
     if (getenv("QBE_NO_NEAR_INDEXED"))
         return;
     for (b = fn->start; b; b = b->link)
-        for (i = b->ins; i < &b->ins[b->nins]; i++)
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
             if (sym_idx_form(fn, i, &base, &idx))
-                near_indexed[far_addr_idx(i->to)] = 1;
+                near_indexed[far_addr_idx(i->to)] = NEAR_SYM;
+            /* `%a =l add %p, N`: a field through a pointer. The same
+             * test as mark_far_decomp's FAR_BASE_CON. */
+            else if (i->op == Oadd && i->cls == Kl
+                     && far_addr_idx(i->to) >= 0
+                     && far_addr_idx(i->arg[0]) >= 0
+                     && fn->tmp[i->arg[0].val].cls == Kl
+                     && rtype(i->arg[1]) == RCon
+                     && fn->con[i->arg[1].val].type == CBits
+                     && fn->con[i->arg[1].val].bits.i >= 0
+                     && fn->con[i->arg[1].val].bits.i < 0xFFFE
+                     && !getenv("QBE_NO_NEAR_FIELD"))
+                near_indexed[far_addr_idx(i->to)] = NEAR_PTR;
+        }
+    /* Any other address held in a temp: X = the address, `$000000,x`.
+     * What the six `$0000,x` sites did, through the one path that knows
+     * the X cache and loads a stored value AFTER the address. Not for
+     * the address of a stack local (an alloc: direct stack access). */
+    if (!getenv("QBE_NO_NEAR_DEREF")) {
+        static unsigned char is_alloc[MAX_ALLOC_TEMPS];
+        memset(is_alloc, 0, sizeof(is_alloc));
+        for (b = fn->start; b; b = b->link)
+            for (i = b->ins; i < &b->ins[b->nins]; i++)
+                if ((i->op == Oalloc4 || i->op == Oalloc8 || i->op == Oalloc16)
+                    && far_addr_idx(i->to) >= 0)
+                    is_alloc[far_addr_idx(i->to)] = 1;
+        for (b = fn->start; b; b = b->link)
+            for (i = b->ins; i < &b->ins[b->nins]; i++) {
+                Ref a = access_addr(i);
+                int x = far_addr_idx(a);
+                if (x >= 0 && !near_indexed[x] && !is_alloc[x])
+                    near_indexed[x] = NEAR_DEREF;
+            }
+    }
+    /* NEAR_PTR and NEAR_DEREF address bank $00: not for an address that
+     * a genuinely far access (const / FAR object) also goes through, nor
+     * for one a 32-bit LOAD goes through — that load has always read
+     * through the full 24-bit pointer (`lda [tcc__r9]`), and keeps to. */
+    for (b = fn->start; b; b = b->link)
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            Ref a = access_addr(i);
+            if ((i->volat & 6) == 0 && !(i->op == Oload && i->cls == Kl))
+                continue;
+            if (far_addr_idx(a) >= 0
+                && near_indexed[far_addr_idx(a)] != NEAR_SYM)
+                near_indexed[far_addr_idx(a)] = 0;
+        }
 }
 
 static void
@@ -835,6 +912,15 @@ mark_far_decomp(Fn *fn)
         }
     }
 
+    /* S4: an address temp marked NEAR_DEREF takes the `$000000,x` form
+     * whatever an add that defines it looks like (a base + index add
+     * would otherwise stage a near pointer's garbage bank in tcc__r9). */
+    for (k = 0; k < MAX_ALIAS_TEMPS && k < MAX_ALLOC_TEMPS; k++)
+        if (near_indexed[k] == NEAR_DEREF) {
+            far_decomp_kind[k] = FAR_NEAR_DEREF;
+            far_decomp_base[k] = TMP(Tmp0 + k);
+        }
+
     /* far_decomp_all: every use of the add's result is a far access with
      * it as the address (then the add need not be emitted at all). */
     for (b = fn->start; b; b = b->link) {
@@ -842,8 +928,9 @@ mark_far_decomp(Fn *fn)
             if (i->op != Oadd || i->cls != Kl)
                 continue;
             aidx = far_addr_idx(i->to);
-            if (aidx < 0 || far_decomp_kind[aidx] == FAR_NONE)
-                continue;
+            if (aidx < 0 || far_decomp_kind[aidx] == FAR_NONE
+                || far_decomp_kind[aidx] == FAR_NEAR_DEREF)
+                continue;   /* NEAR_DEREF reads the temp: the add stays */
             if (temp_is_retval[aidx] || temp_use_count[aidx] == 0)
                 continue;
             {
@@ -1155,11 +1242,11 @@ mark_addr_only_kl(Fn *fn)
                         /* #121 / B2: a far-tainted load READS the
                          * address's bank byte ([tcc__r9] deref) — the
                          * high half is live, not discardable. */
-                        if (!is_far(i))
+                        if ((i->volat & 6) == 0)   /* near-indexed: X only */
                             is_addr_use = 1;
                         break;
                     case Oloadsw: case Oloaduw: case Oload:
-                        if (i->cls != Kl && !is_far(i))
+                        if (i->cls != Kl && (i->volat & 6) == 0)
                             is_addr_use = 1;
                         break;
                     case Oextuw: case Oextsw:
@@ -1173,7 +1260,7 @@ mark_addr_only_kl(Fn *fn)
                     case Ostorel:
                         /* B2: a far store goes through [tcc__r9] and
                          * needs the bank byte — a blocking use. */
-                        if (!is_far(i))
+                        if ((i->volat & 6) == 0)
                             is_addr_use = 1;
                         break;
                     default: break;
@@ -1234,6 +1321,16 @@ mark_addr_only_kl(Fn *fn)
                 int dst_idx = i->to.val - Tmp0;
                 if (dst_idx < 0 || dst_idx >= MAX_ALIAS_TEMPS) continue;
                 if (!temp_addr_only[dst_idx]) continue;
+                /* A Kl add folded into its accesses was classified above
+                 * operand by operand (index: address use, base: blocking)
+                 * and added nothing to prop_use: it must add nothing
+                 * here either. Since S4 its result can be addr_only (a
+                 * near-indexed access does not read the bank), and
+                 * counting it made an index that another 32-bit
+                 * operation also reads lose its high half — the
+                 * high-half invariant stopped the build (difftest_stmt
+                 * seed 44157, 2026-10-08). */
+                if (i->op == Oadd && far_decomp_all[dst_idx]) continue;
                 /* dst is addr_only — its prop operands count toward
                  * prop_to_addr_only of their own indices. */
                 for (a = 0; a < 2; a++) {
@@ -1538,6 +1635,49 @@ emit_cst_ptr_setup(Ref r0, Fn *fn)
  * caller sets 8-bit afterwards if it needs to. Clobbers A — load the
  * stored value AFTER calling this. */
 static void
+x_load(Ref r, Fn *fn)
+{
+    if (x_valid && req(x_ref, r) && !getenv("QBE_NO_X_CACHE"))
+        return;
+    emit_rep20();
+    emitload(r, fn);
+    fprintf(outf, "\ttax\n");
+    acache_invalidate();
+    x_ref = r;
+    x_valid = 1;
+}
+
+/* Does emitting `i` leave X alone? Only an access that takes one of the
+ * two X-indexed forms; everything else drops the X cache first. */
+static int
+x_keeps(Ins *i)
+{
+    Ref a;
+    int k;
+
+    switch (i->op) {
+    case Oloadsb: case Oloadub: case Oloadsh: case Oloaduh:
+    case Oloadsw: case Oloaduw: case Oload:
+        a = i->arg[0]; break;
+    case Ostoreb: case Ostoreh: case Ostorew: case Ostorel:
+        a = i->arg[1]; break;
+    case Onop:
+        return 1;                       /* emits nothing */
+    case Oadd:
+        /* folded into its accesses: emits nothing */
+        return i->cls == Kl && far_addr_idx(i->to) >= 0
+            && far_decomp_all[far_addr_idx(i->to)];
+    default:
+        return 0;
+    }
+    if (!is_far(i) || far_addr_idx(a) < 0)
+        return 0;
+    k = far_decomp_kind[far_addr_idx(a)];
+    return k == FAR_SYM_IDX || k == FAR_NEAR_DEREF
+        || (k == FAR_BASE_CON && near_indexed[far_addr_idx(a)] == NEAR_PTR);
+}
+
+static void
 emit_far_decomp_operand(Ref a, Fn *fn, char *buf, size_t n)
 {
     int idx = far_addr_idx(a);
@@ -1546,10 +1686,7 @@ emit_far_decomp_operand(Ref a, Fn *fn, char *buf, size_t n)
     switch (far_decomp_kind[idx]) {
     case FAR_SYM_IDX:
         c = &fn->con[far_decomp_base[idx].val];
-        emit_rep20();
-        emitload(far_decomp_idx[idx], fn);      /* low 16 bits of the index */
-        fprintf(outf, "\ttax\n");
-        acache_invalidate();
+        x_load(far_decomp_idx[idx], fn);        /* low 16 bits of the index */
         if ((int)c->bits.i)
             snprintf(buf, n, "%s+%d,x", stripsym(str(c->sym.id)),
                      (int)c->bits.i);
@@ -1557,8 +1694,15 @@ emit_far_decomp_operand(Ref a, Fn *fn, char *buf, size_t n)
             snprintf(buf, n, "%s,x", stripsym(str(c->sym.id)));
         break;
     case FAR_BASE_CON:
-        emit_cst_ptr_setup(far_decomp_base[idx], fn);
         c = &fn->con[far_decomp_idx[idx].val];
+        if (near_indexed[idx] == NEAR_PTR) {
+            /* a near pointer's field: X = the pointer, the offset is
+             * the operand (bank $00, as `$0000,x` was) */
+            x_load(far_decomp_base[idx], fn);
+            snprintf(buf, n, "$%06X,x", (unsigned)c->bits.i);
+            break;
+        }
+        emit_cst_ptr_setup(far_decomp_base[idx], fn);
         if ((int)c->bits.i) {
             emit_rep20();
             fprintf(outf, "\tldy.w #%d\n", (int)c->bits.i);
@@ -1566,6 +1710,10 @@ emit_far_decomp_operand(Ref a, Fn *fn, char *buf, size_t n)
         } else {
             snprintf(buf, n, "[tcc__r9]");
         }
+        break;
+    case FAR_NEAR_DEREF:
+        x_load(a, fn);
+        snprintf(buf, n, "$000000,x");
         break;
     case FAR_BASE_IDX:
         emit_cst_ptr_setup(far_decomp_base[idx], fn);
@@ -1597,8 +1745,15 @@ emit_far_decomp_operand_hi(Ref a, Fn *fn, char *buf, size_t n)
         break;
     case FAR_BASE_CON:
         c = &fn->con[far_decomp_idx[idx].val];
+        if (near_indexed[idx] == NEAR_PTR) {
+            snprintf(buf, n, "$%06X,x", (unsigned)c->bits.i + 2);
+            break;
+        }
         fprintf(outf, "\tldy.w #%d\n", (int)c->bits.i + 2);
         snprintf(buf, n, "[tcc__r9],y");
+        break;
+    case FAR_NEAR_DEREF:
+        snprintf(buf, n, "$000002,x");
         break;
     case FAR_BASE_IDX:
         fprintf(outf, "\tiny\n");
@@ -1623,7 +1778,9 @@ emit_far_operand(Ref a, Fn *fn, char *buf, size_t n, const char **sfx)
         emit_cst_ptr_setup(a, fn);
         snprintf(buf, n, "[tcc__r9]");
     }
-    *sfx = (k == FAR_SYM_IDX) ? ".l" : "";
+    *sfx = (k == FAR_SYM_IDX || k == FAR_NEAR_DEREF
+            || (k == FAR_BASE_CON
+                && near_indexed[far_addr_idx(a)] == NEAR_PTR)) ? ".l" : "";
     return k;
 }
 
@@ -6305,6 +6462,7 @@ w65816_emitfn(Fn *fn, FILE *f)
         emit_rep20();
         fprintf(outf, "@%s:\n", b->name);
         r9_invalidate();        /* B2: control-flow merge */
+        x_invalidate();
         acache_invalidate();
         slot_owner_reset();
 
@@ -6312,6 +6470,8 @@ w65816_emitfn(Fn *fn, FILE *f)
         fused_nz32 = 0;
         detect_block_tail_call(b, fn);
         for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (!x_keeps(i))
+                x_invalidate();     /* S4: anything else may write X */
             /* `cnel x, 0` used only by this block's jnz, x a Kl temp:
              * the branch tests both halves of x itself (emitjmp). */
             if (i == &b->ins[b->nins] - 1
