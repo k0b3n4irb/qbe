@@ -6262,6 +6262,30 @@ w65816_emitfn(Fn *fn, FILE *f)
     w65816_restore_alloc_state(fn);
     w65816_check_temps(fn);   /* later passes add temps */
 
+    /* S5 (2026-10-08): abi0 photographed the size of every alloc before
+     * the optimizer ran. A local or a parameter that `promote` then turned
+     * into temps has no alloc instruction left, and still got its words
+     * of frame: 2 to 4 bytes per promoted variable in every call. Keep
+     * only the allocs that are still defined. */
+    if (!getenv("QBE_KEEP_DEAD_ALLOCS")) {
+        static unsigned char live_alloc[MAX_ALLOC_TEMPS];
+        Blk *ab;
+        Ins *ai;
+        memset(live_alloc, 0, sizeof(live_alloc));
+        for (ab = fn->start; ab; ab = ab->link)
+            for (ai = ab->ins; ai < &ab->ins[ab->nins]; ai++)
+                if ((ai->op == Oalloc4 || ai->op == Oalloc8
+                     || ai->op == Oalloc16)
+                    && rtype(ai->to) == RTmp && ai->to.val >= Tmp0
+                    && ai->to.val - Tmp0 < MAX_ALLOC_TEMPS)
+                    live_alloc[ai->to.val - Tmp0] = 1;
+        for (int j = 0; j < MAX_ALLOC_TEMPS; j++)
+            if (w65816_alloc_size[j] > 0 && !live_alloc[j]) {
+                w65816_alloc_slots -= w65816_alloc_size[j];
+                w65816_alloc_size[j] = 0;
+            }
+    }
+
     /* No FPU and no soft-float library. Only conversions and compares
      * stopped the build until 2026-10-08: `a * 2.5f` was emitted as a
      * 16-bit integer multiply of the low word, `a + b` as an integer add.
