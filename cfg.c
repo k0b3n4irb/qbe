@@ -396,3 +396,336 @@ reachesnotvia(Fn *fn, Blk *b, Blk *to, Blk *excl)
 	excl->visit = 1;
 	return reaches(fn, b, to);
 }
+
+/* OpenSNES (2026-10-08): thread jumps through a block that only chooses.
+ *
+ * `a && b` in a condition reaches us as
+ *
+ *     @p1   jnz %a, @p2, @j
+ *     @p2   %c =w cugtw ...        ; b
+ *           jmp @j
+ *     @j    %p =w phi @p1 0, @p2 %c
+ *           jnz %p, @then, @else
+ *
+ * A target with a register allocator pays little for %p. One without
+ * (w65816: every temp is a stack slot) stores 0 or 1 in each predecessor
+ * and tests it again in @j, and %c can no longer be fused with a branch.
+ * When @j holds nothing but that phi and the jnz on it, each predecessor
+ * can take @j's decision itself: a constant argument goes straight to
+ * @then or @else, a temp argument of a predecessor that ends in `jmp @j`
+ * becomes that predecessor's own `jnz`. @j disappears when every
+ * predecessor is gone (fillcfg prunes it).
+ *
+ * The phis of @then / @else gain, for each new predecessor, the value they
+ * had for @j — which dominates the predecessor because it dominates @j and
+ * is not defined in it.
+ *
+ * requires rpo pred use; breaks them (call fillcfg and filluse after) */
+static Ref
+phival(Phi *p, Blk *b)
+{
+	uint n;
+
+	for (n=0; n<p->narg; n++)
+		if (p->blk[n] == b)
+			return p->arg[n];
+	return R;
+}
+
+static void
+phiadd(Phi *p, Blk *b, Ref r)
+{
+	p->narg++;
+	vgrow(&p->arg, p->narg);
+	vgrow(&p->blk, p->narg);
+	p->arg[p->narg-1] = r;
+	p->blk[p->narg-1] = b;
+}
+
+/* can the edge b->j be replaced by b->t (t a successor of j)? */
+static int
+canretarget(Blk *b, Blk *j, Blk *t)
+{
+	Phi *p;
+
+	if (b->s1 != t && b->s2 != t)
+		return 1;
+	/* b already reaches t: one phi argument per predecessor, so the
+	 * value arriving through j must be the one arriving directly */
+	for (p=t->phi; p; p=p->link)
+		if (!req(phival(p, b), phival(p, j)))
+			return 0;
+	return 1;
+}
+
+static void
+retarget(Blk *b, Blk *j, Blk *t)
+{
+	Phi *p;
+
+	if (b->s1 != t && b->s2 != t)
+		for (p=t->phi; p; p=p->link)
+			phiadd(p, b, phival(p, j));
+	if (b->s1 == j)
+		b->s1 = t;
+	if (b->s2 == j)
+		b->s2 = t;
+	if (b->jmp.type == Jjnz && b->s1 == b->s2) {
+		b->jmp.type = Jjmp;
+		b->jmp.arg = R;
+		b->s2 = 0;
+	}
+}
+
+/* A phi whose arguments are all the same value (or itself) is that
+ * value: remove it and rename its uses. Promotion leaves such phis at
+ * the join of an `a || b` for every variable live across it, and one of
+ * them is enough to hide a block that only chooses from threadjnz.
+ * (gvn would remove them, but it runs after.) Returns the number removed. */
+static void
+rename1(Fn *fn, Ref from, Ref to)
+{
+	Blk *b;
+	Phi *p;
+	Ins *i;
+	uint n;
+
+	for (b=fn->start; b; b=b->link) {
+		for (p=b->phi; p; p=p->link)
+			for (n=0; n<p->narg; n++)
+				if (req(p->arg[n], from))
+					p->arg[n] = to;
+		for (i=b->ins; i<&b->ins[b->nins]; i++)
+			for (n=0; n<2; n++)
+				if (req(i->arg[n], from))
+					i->arg[n] = to;
+		if (req(b->jmp.arg, from))
+			b->jmp.arg = to;
+	}
+}
+
+static int
+trivphis(Fn *fn)
+{
+	Blk *b;
+	Phi *p, **pp;
+	Ref r;
+	uint n;
+	int removed;
+
+	removed = 0;
+	for (b=fn->start; b; b=b->link)
+		for (pp=&b->phi; (p=*pp);) {
+			r = R;
+			for (n=0; n<p->narg; n++) {
+				if (req(p->arg[n], p->to))
+					continue;
+				if (req(r, R))
+					r = p->arg[n];
+				else if (!req(r, p->arg[n]))
+					break;
+			}
+			if (n < p->narg || req(r, R)) {
+				pp = &p->link;
+				continue;
+			}
+			*pp = p->link;
+			rename1(fn, p->to, r);
+			removed++;
+		}
+	return removed;
+}
+
+/* The decision of j, when j only chooses: its one phi, and the two
+ * targets for phi != 0 and phi == 0. j may hold the front end's boolean
+ * conversion of the phi (`%c =w cnew %p, 0` or `ceqw`, then `jnz %c`). */
+static Phi *
+chooser(Fn *fn, Blk *j, Blk **pnz, Blk **pz)
+{
+	Phi *p;
+	Ins *i, *d;
+	Con *c;
+
+	p = j->phi;
+	if (!p || p->link || p->cls != Kw
+	|| j->jmp.type != Jjnz || rtype(j->jmp.arg) != RTmp
+	|| j->s1 == j || j->s2 == j || j->s1 == j->s2)
+		return 0;
+	d = 0;
+	for (i=j->ins; i<&j->ins[j->nins]; i++) {
+		if (i->op == Onop)
+			continue;
+		if (d)
+			return 0;
+		d = i;
+	}
+	if (!d) {
+		if (!req(j->jmp.arg, p->to)
+		|| fn->tmp[p->to.val].nuse != 1)
+			return 0;
+		*pnz = j->s1;
+		*pz = j->s2;
+		return p;
+	}
+	if ((d->op != Ocnew && d->op != Oceqw)
+	|| !req(d->to, j->jmp.arg)
+	|| !req(d->arg[0], p->to)
+	|| rtype(d->arg[1]) != RCon
+	|| fn->tmp[p->to.val].nuse != 1
+	|| fn->tmp[d->to.val].nuse != 1)
+		return 0;
+	c = &fn->con[d->arg[1].val];
+	if (c->type != CBits
+	|| (T.wordsz == 2 ? (uint16_t)c->bits.i : (uint32_t)c->bits.i) != 0)
+		return 0;
+	*pnz = d->op == Ocnew ? j->s1 : j->s2;
+	*pz = d->op == Ocnew ? j->s2 : j->s1;
+	return p;
+}
+
+/* Runs on plain SSA, before gvn: after gvn a definition may sit in a
+ * block this pass cuts off while its uses live on (gcm then asserts). */
+int
+threadjnz(Fn *fn)
+{
+	Blk *j, *b, *t, *snz, *sz;
+	Phi *p, *q;
+	Con *c;
+	Ref a;
+	uint n;
+	int64_t v;
+	int changed, done;
+
+	if (trivphis(fn))
+		return 1; /* use counts changed: come back */
+	changed = 0;
+	for (j=fn->start; j; j=j->link) {
+		p = chooser(fn, j, &snz, &sz);
+		if (getenv("QBE_DBG_THREAD") && j->phi && j->jmp.type == Jjnz)
+			fprintf(stderr, "THREAD %s @%s: %s (phis=%d nins=%u nuse=%u)\n",
+				fn->name, j->name, p ? "chooser" : "no",
+				j->phi->link ? 2 : 1, j->nins,
+				fn->tmp[j->phi->to.val].nuse);
+		if (!p)
+			continue;
+		for (n=0; n<p->narg;) {
+			b = p->blk[n];
+			a = p->arg[n];
+			done = 0;
+			if (b == j || (b->s1 == j && b->s2 == j)) {
+				n++;
+				continue;
+			}
+			if (rtype(a) == RCon) {
+				c = &fn->con[a.val];
+				if (c->type == CBits) {
+					v = c->bits.i;
+					/* jnz tests a word */
+					if (T.wordsz == 2)
+						v = (uint16_t)v;
+					else
+						v = (uint32_t)v;
+					t = v ? snz : sz;
+					if (canretarget(b, j, t)) {
+						retarget(b, j, t);
+						done = 1;
+					}
+				}
+			}
+			else if (rtype(a) == RTmp
+			&& b->jmp.type == Jjmp && b->s1 == j) {
+				for (q=snz->phi; q; q=q->link)
+					phiadd(q, b, phival(q, j));
+				for (q=sz->phi; q; q=q->link)
+					phiadd(q, b, phival(q, j));
+				b->jmp.type = Jjnz;
+				b->jmp.arg = a;
+				b->s1 = snz;
+				b->s2 = sz;
+				done = 1;
+			}
+			if (done) {
+				p->narg--;
+				p->arg[n] = p->arg[p->narg];
+				p->blk[n] = p->blk[p->narg];
+				changed = 1;
+			} else
+				n++;
+		}
+		/* use counts are stale once a phi gained an argument */
+		if (changed)
+			return 1;
+	}
+	return 0;
+}
+
+/* OpenSNES (2026-10-08): `jnz (x != 0)` is `jnz x`, `jnz (x == 0)` is
+ * `jnz x` with the targets swapped. The front end converts a condition to
+ * a boolean before it branches on it; where the conversion survives, a
+ * target without registers materialises 0 or 1 and tests it again.
+ * Word compares only: jnz tests a word. The compare, left without a use,
+ * is removed by gcm's sweep. requires use (for Tmp.def). */
+void
+simpljnz(Fn *fn)
+{
+	Blk *b, *t;
+	Tmp *tmp;
+	Ins *d;
+	Con *c;
+
+	for (b=fn->start; b; b=b->link) {
+		for (;;) {
+			if (b->jmp.type != Jjnz || rtype(b->jmp.arg) != RTmp)
+				break;
+			tmp = &fn->tmp[b->jmp.arg.val];
+			d = tmp->def;
+			if (!d || (d->op != Ocnew && d->op != Oceqw)
+			|| rtype(d->arg[1]) != RCon)
+				break;
+			c = &fn->con[d->arg[1].val];
+			if (c->type != CBits
+			|| (T.wordsz == 2 ? (uint16_t)c->bits.i : (uint32_t)c->bits.i) != 0)
+				break;
+			if (rtype(d->arg[0]) != RTmp
+			|| fn->tmp[d->arg[0].val].cls != Kw)
+				break;
+			b->jmp.arg = d->arg[0];
+			if (d->op == Oceqw) {
+				t = b->s1;
+				b->s1 = b->s2;
+				b->s2 = t;
+			}
+		}
+	}
+}
+
+/* OpenSNES (2026-10-08): the compare a block branches on goes last in it.
+ * gcm schedules a block by dependencies only, so the compare may be
+ * followed by instructions hoisted from the successors; a backend that
+ * fuses compare and branch only when they are adjacent (w65816) then
+ * materialises 0 or 1 and tests it. Moving an instruction down its own
+ * block is always valid when its one use is the block's jump.
+ * requires use. */
+void
+cmplast(Fn *fn)
+{
+	Blk *b;
+	Ins *i, *e, c;
+	int x;
+
+	for (b=fn->start; b; b=b->link) {
+		if (b->jmp.type != Jjnz || rtype(b->jmp.arg) != RTmp
+		|| b->nins < 2
+		|| fn->tmp[b->jmp.arg.val].nuse != 1)
+			continue;
+		e = &b->ins[b->nins];
+		for (i=b->ins; i<e-1; i++)
+			if (req(i->to, b->jmp.arg))
+				break;
+		if (i == e-1 || !iscmp(i->op, &x, &x))
+			continue;
+		c = *i;
+		memmove(i, i+1, (e-1-i) * sizeof *i);
+		e[-1] = c;
+	}
+}

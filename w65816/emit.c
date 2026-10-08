@@ -299,10 +299,24 @@ is_kl_cmp(int op)
 static void emitload(Ref, Fn *);
 static void emitop2(char *, Ref, Fn *);
 static void acache_invalidate(void);
+static int last_load_emitted;
 static void
 emit_scmp_w(Ref a, Ref b, Fn *fn)
 {
-    int lbl = ++scmp_seq;
+    int lbl;
+
+    /* Against the constant 0 the sign of `a - 0` is the sign of a and
+     * cannot overflow: N after the load is the answer (`cmp #0` sets it
+     * when the A-cache spared the load). Was sec / sbc #0 / bvc / eor
+     * #$8000 for every `x < 0` and `x >= 0`. (2026-10-08) */
+    if (rtype(b) == RCon && fn->con[b.val].type == CBits
+        && (fn->con[b.val].bits.i & 0xFFFF) == 0) {
+        emitload(a, fn);
+        if (!last_load_emitted)
+            fprintf(outf, "\tcmp.w #0\n");
+        return;
+    }
+    lbl = ++scmp_seq;
     emitload(a, fn);
     fprintf(outf, "\tsec\n");
     emitop2("sbc", b, fn);
@@ -5768,6 +5782,19 @@ emitjmp(Blk *b, Fn *fn)
             int swap;
             const char *bt, *bf;
             cmp_branch_info(fused_cmp_op, &swap, &bt, &bf);
+            if (fused_cmp_op == Oceql || fused_cmp_op == Ocnel) {
+                /* 32-bit equality: Z = both halves equal. A low-half
+                 * difference skips the high compare with Z clear.
+                 * (`p != end` of every pointer loop; was a 0/1 in A,
+                 * then `cmp #0`.) (2026-10-08) */
+                int lbl = ++scmp_seq;
+                emitload(fused_cmp_r0, fn);
+                emitop2("cmp", fused_cmp_r1, fn);
+                fprintf(outf, "\tbne @lcmp.%d\n", lbl);
+                emit_load_high(fused_cmp_r0, fn, 0);
+                emitop2_high("cmp", fused_cmp_r1, fn);
+                fprintf(outf, "@lcmp.%d:\n", lbl);
+            } else
             if (fused_cmp_op == Ocsltw || fused_cmp_op == Ocsgtw
                 || fused_cmp_op == Ocslew || fused_cmp_op == Ocsgew) {
                 /* signed: N must include the overflow bit */
@@ -6148,7 +6175,10 @@ w65816_emitfn(Fn *fn, FILE *f)
              * a direct compare+conditional branch instead. */
             if (i == &b->ins[b->nins] - 1
                 && b->jmp.type == Jjnz
-                && is_cmp_op(i->op) && !is_kl_cmp(i->op)
+                && is_cmp_op(i->op)
+                /* of the 32-bit compares, equality only: Z over both
+                 * halves is two compares and a skip (emitjmp) */
+                && (!is_kl_cmp(i->op) || i->op == Oceql || i->op == Ocnel)
                 && rtype(i->to) == RTmp && i->to.val >= Tmp0
                 && req(i->to, b->jmp.arg)) {
                 int cidx = i->to.val - Tmp0;

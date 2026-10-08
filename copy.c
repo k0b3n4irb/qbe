@@ -412,7 +412,13 @@ phicopyref(Fn *fn, Blk *b, Phi *p)
 	 * without the jump type checks */
 	if (d->s1 == s[1] && d->s2 == s[0]
 	&& d->s1->jmp.type == Jjmp
-	&& d->s2->jmp.type == Jjmp)
+	&& d->s2->jmp.type == Jjmp
+	/* OpenSNES (2026-10-08): ...and without checking that both do
+	 * jump to b. gvn folds `jnz 1, @x, @b` to `jmp @x` in this same
+	 * pass and the phi keeps its argument for the dead edge until
+	 * the next fillcfg: `(y || K) && 1` returned `y != 0`. */
+	&& d->s1->s1 == b
+	&& d->s2->s1 == b)
 		return d->jmp.arg;
 
 	return R;

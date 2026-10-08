@@ -157,8 +157,22 @@ finalize_and_emit(Fn *fn, FILE *out)
 {
 	uint n;
 
+	/* OpenSNES: jump threading through blocks that only choose (cfg.c).
+	 * BEFORE gvn, on plain SSA: gvn keeps one definition per value
+	 * wherever it first met it, so after it a block this pass makes
+	 * unreachable may hold the only definition of a value used elsewhere
+	 * (gcm then asserts). To a fixed point, one block per round. */
+	fillcfg(fn);
+	filluse(fn);
+	while (threadjnz(fn)) {
+		fillcfg(fn);
+		filluse(fn);
+	}
+	filldom(fn);
 	gvn(fn);
 	fillcfg(fn);
+	filluse(fn);
+	simpljnz(fn);
 	filluse(fn);
 	filldom(fn);
 	gcm(fn);
@@ -170,6 +184,12 @@ finalize_and_emit(Fn *fn, FILE *out)
 	filluse(fn);
 	T.isel(fn);
 	fillcfg(fn);
+	if (T.skiprega) {
+		/* OpenSNES: see cmplast() — only where compare and branch
+		 * must be adjacent to be fused */
+		filluse(fn);
+		cmplast(fn);
+	}
 	filllive(fn);
 	fillloop(fn);
 	fillcost(fn);
@@ -232,13 +252,25 @@ func(Fn *fn)
 		 * per-pass `debug[...]` traces fire in their natural order. No
 		 * asm output is expected. */
 		inline_check(fn);
+		/* keep this copy of the pipeline in step with
+		 * finalize_and_emit(): a trace must show what is emitted */
+		fillcfg(fn); filluse(fn);
+		while (threadjnz(fn)) {
+			fillcfg(fn); filluse(fn);
+		}
+		filldom(fn);
 		gvn(fn);
-		fillcfg(fn); filluse(fn); filldom(fn); gcm(fn);
+		fillcfg(fn); filluse(fn); simpljnz(fn); filluse(fn);
+		filldom(fn); gcm(fn);
 		filluse(fn); ssacheck(fn);
 		T.abi1(fn); simpl(fn);
 		fillcfg(fn); filluse(fn);
 		T.isel(fn);
-		fillcfg(fn); filllive(fn); fillloop(fn); fillcost(fn);
+		fillcfg(fn);
+		if (T.skiprega) {
+			filluse(fn); cmplast(fn);
+		}
+		filllive(fn); fillloop(fn); fillcost(fn);
 		if (!T.skiprega) {
 			spill(fn); rega(fn);
 			fillcfg(fn); simpljmp(fn);
