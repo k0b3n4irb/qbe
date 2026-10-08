@@ -458,6 +458,17 @@ cmp_branch_info(int op, int *swap, const char **bt, const char **bf)
 static int temp_alias[MAX_ALIAS_TEMPS];    /* 0 = no alias, negative = param slot */
 static int alloc_param[MAX_ALIAS_TEMPS];   /* 0 = no param, negative = param slot for alloc */
 static int leaf_opt;                        /* 1 = leaf optimizations active */
+/* S5 (2026-10-08): parameter ALIASING — a temp that is just a parameter is
+ * read from the caller's argument area instead of being copied into the
+ * frame — does not need a leaf: the argument area lies above the frame and
+ * no call this function makes writes it (a tail call does, and
+ * detect_block_tail_call only accepts one whose arguments are already in
+ * place, or a single argument). leaf_opt keeps the two things that do need
+ * one: going frameless, and skipping the store before a return. */
+static int alias_opt;
+/* temps that get no stack slot (see emitfn): reading one from the stack is
+ * an internal error, never a silent read of nothing */
+static unsigned char temp_noslot[MAX_ALLOC_TEMPS];
 
 /* Dead return store elimination */
 static int temp_use_count[MAX_ALIAS_TEMPS];
@@ -1371,7 +1382,7 @@ build_alias_table(Fn *fn)
 
     memset(temp_alias, 0, sizeof(temp_alias));
     memset(alloc_param, 0, sizeof(alloc_param));
-    if (!leaf_opt)
+    if (!alias_opt)
         return;
 
     /* First: count stores to each alloc slot.
@@ -1535,7 +1546,7 @@ is_nop_instruction(Ins *i)
         return 0;
 
     /* Copy with aliased source → skipped at emission under leaf_opt. */
-    if (leaf_opt && i->op == Ocopy
+    if (alias_opt && i->op == Ocopy
         && rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0) {
         idx = i->arg[0].val - Tmp0;
         if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0)
@@ -1543,7 +1554,7 @@ is_nop_instruction(Ins *i)
     }
 
     /* Store into param-shadow alloc → skipped at emission under leaf_opt. */
-    if (leaf_opt && (i->op == Ostorew || i->op == Ostoreh)
+    if (alias_opt && (i->op == Ostorew || i->op == Ostoreh)
         && rtype(i->arg[1]) == RTmp && i->arg[1].val >= Tmp0) {
         idx = i->arg[1].val - Tmp0;
         if (idx >= 0 && idx < MAX_ALIAS_TEMPS && alloc_param[idx] != 0)
@@ -1554,7 +1565,7 @@ is_nop_instruction(Ins *i)
      * emission under leaf_opt. The Kl pair-load path (Oload with
      * cls == Kl) runs BEFORE the alias skips at emission and always
      * emits — exclude it. */
-    if (leaf_opt && (i->op == Oloadsw || i->op == Oloaduw
+    if (alias_opt && (i->op == Oloadsw || i->op == Oloaduw
                      || (i->op == Oload && i->cls != Kl))) {
         if (rtype(i->arg[0]) == RSlot && rsval(i->arg[0]) < 0)
             return 1;
@@ -1569,7 +1580,7 @@ is_nop_instruction(Ins *i)
      * leaf_opt AND ONLY for non-Kl results (a Kl ext materialises the
      * low half + zero/sign high — real code). Oextub/Oextsb excluded —
      * they emit real code (AND/sign-extend) in every class. */
-    if (leaf_opt && i->cls != Kl
+    if (alias_opt && i->cls != Kl
         && (i->op == Oextuh || i->op == Oextsh
             || i->op == Oextsw || i->op == Oextuw)
         && rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0) {
@@ -2752,7 +2763,8 @@ color_slots(Fn *fn, int base)
         die("out of memory");
     bsinit(live, nt);
 
-#define NOTE(r) do { if (rtype(r) == RTmp && (r).val >= Tmp0 && !seen[(r).val]) \
+#define NOTE(r) do { if (rtype(r) == RTmp && (r).val >= Tmp0 && !seen[(r).val] \
+        && !((r).val - Tmp0 < MAX_ALLOC_TEMPS && temp_noslot[(r).val - Tmp0])) \
         { seen[(r).val] = 1; order[norder++] = (r).val; } } while (0)
     /* definition order, the order the old allocator used */
     for (b = fn->start; b; b = b->link) {
@@ -2944,7 +2956,7 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
             /* Check for leaf-opt alias to param slot. Disabled for Kl —
              * the alias slot is 16-bit, can't carry the high half. */
             int idx = r.val - Tmp0;
-            if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS
+            if (alias_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS
                 && temp_alias[idx] != 0 && fn->tmp[r.val].cls != Kl) {
                 int neg_slot = temp_alias[idx];
                 emit_stack_load(framesize + PARAM_OFFSET + (-neg_slot), sp_adjust);
@@ -2954,6 +2966,11 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
                 slot_read(r, 0, fn);
                 if (slot >= 0)
                     emit_stack_load((slot + 1) * 2, sp_adjust);
+                else if (idx >= 0 && idx < MAX_ALLOC_TEMPS && temp_noslot[idx])
+                    err("internal compiler error: %%%s has no stack slot and is "
+                        "read from the stack in %s (its value was expected in A; "
+                        "compiler/qbe/w65816/emit.c, temp_noslot)",
+                        fn->tmp[r.val].name, fn->name);
                 else
                     fprintf(outf, "\t; unallocated temp %u\n", r.val);
             }
@@ -3026,7 +3043,7 @@ emitstore(Ref r, Fn *fn)
     /* Leaf opt: skip store to aliased temp (A already has the value).
      * Disabled for Kl — the alias mechanism tracks a single 16-bit slot
      * and can't represent the high half of a 4-byte value. */
-    if (leaf_opt && rtype(r) == RTmp && r.val >= Tmp0
+    if (alias_opt && rtype(r) == RTmp && r.val >= Tmp0
         && fn->tmp[r.val].cls != Kl) {
         int idx = r.val - Tmp0;
         if (idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
@@ -3108,7 +3125,7 @@ emitop2(char *op, Ref r, Fn *fn)
         } else if (r.val >= Tmp0) {
             /* Check for leaf-opt alias to param slot */
             int idx = r.val - Tmp0;
-            if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
+            if (alias_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS && temp_alias[idx] != 0) {
                 int neg_slot = temp_alias[idx];
                 emit_stack_op(op, framesize + PARAM_OFFSET + (-neg_slot), 0);
             } else {
@@ -3116,6 +3133,11 @@ emitop2(char *op, Ref r, Fn *fn)
                 slot_read(r, 0, fn);
                 if (slot >= 0)
                     emit_stack_op(op, (slot + 1) * 2, 0);
+                else if (idx >= 0 && idx < MAX_ALLOC_TEMPS && temp_noslot[idx])
+                    err("internal compiler error: %%%s has no stack slot and is "
+                        "an operand read from the stack in %s "
+                        "(compiler/qbe/w65816/emit.c, temp_noslot)",
+                        fn->tmp[r.val].name, fn->name);
             }
         }
         break;
@@ -3493,11 +3515,22 @@ emitins(Ins *i, Fn *fn)
                      * and emit narrowed codegen — same shape as the matching
                      * branch in case Oshl: asl × cnt on low, then xba+and+
                      * lsr × (8-cnt) for the high half (= low_orig >> (16-cnt)). */
+                    /* ONE load of r0, kept in tcc__r0 for the high half
+                     * (2026-10-08) — what the Oshl twin of this path has
+                     * done since 2026-05-22 (fix32Sin(64) returned 0).
+                     * Here there were still two loads, the second from
+                     * r0's slot, while consumes_r0_via_emitload()
+                     * promises a single read from A and the store of r0
+                     * is skipped on that promise: the high half of
+                     * `(u32)w * 2..256` came from whatever the slot held.
+                     * Found the day such a temp stopped getting a slot
+                     * at all (difftest_stmt seed 74144). */
                     emitload(r0, fn);
+                    fprintf(outf, "\tsta.b tcc__r0\n");
                     for (int j = 0; j < cnt; j++)
                         fprintf(outf, "\tasl a\n");
                     emitstore(i->to, fn);
-                    emitload(r0, fn);
+                    fprintf(outf, "\tlda.b tcc__r0\n");
                     fprintf(outf, "\txba\n");
                     fprintf(outf, "\tand.w #$00FF\n");
                     for (int j = 0; j < 8 - cnt; j++)
@@ -4607,7 +4640,7 @@ emitins(Ins *i, Fn *fn)
 
     case Ocopy:
         /* Leaf opt: propagate alias through copy chains */
-        if (leaf_opt && rtype(r0) == RTmp && r0.val >= Tmp0) {
+        if (alias_opt && rtype(r0) == RTmp && r0.val >= Tmp0) {
             int src_idx = r0.val - Tmp0;
             if (src_idx >= 0 && src_idx < MAX_ALIAS_TEMPS && temp_alias[src_idx] != 0) {
                 int dst_idx = (rtype(i->to) == RTmp && i->to.val >= Tmp0) ? i->to.val - Tmp0 : -1;
@@ -4990,7 +5023,7 @@ emitins(Ins *i, Fn *fn)
     case Ostorew:
     case Ostoreh:
         /* Leaf opt: skip storew into param-shadow alloc slot */
-        if (leaf_opt && rtype(r1) == RTmp && r1.val >= Tmp0) {
+        if (alias_opt && rtype(r1) == RTmp && r1.val >= Tmp0) {
             int aidx = r1.val - Tmp0;
             if (aidx >= 0 && aidx < MAX_ALIAS_TEMPS && alloc_param[aidx] != 0)
                 break;  /* param already in caller frame, skip copy */
@@ -5215,7 +5248,7 @@ emitins(Ins *i, Fn *fn)
             break;
         }
         /* Leaf opt: alias param slot loads instead of copying */
-        if (leaf_opt && rtype(r0) == RSlot && rsval(r0) < 0) {
+        if (alias_opt && rtype(r0) == RSlot && rsval(r0) < 0) {
             int idx = (rtype(i->to) == RTmp && i->to.val >= Tmp0) ? i->to.val - Tmp0 : -1;
             if (idx >= 0 && idx < MAX_ALIAS_TEMPS) {
                 temp_alias[idx] = rsval(r0);
@@ -5223,7 +5256,7 @@ emitins(Ins *i, Fn *fn)
             }
         }
         /* Leaf opt: loadw from param-shadow alloc → alias to param */
-        if (leaf_opt && rtype(r0) == RTmp && r0.val >= Tmp0) {
+        if (alias_opt && rtype(r0) == RTmp && r0.val >= Tmp0) {
             int aidx = r0.val - Tmp0;
             if (aidx >= 0 && aidx < MAX_ALIAS_TEMPS && alloc_param[aidx] != 0) {
                 int didx = (rtype(i->to) == RTmp && i->to.val >= Tmp0) ? i->to.val - Tmp0 : -1;
@@ -5375,7 +5408,7 @@ emitins(Ins *i, Fn *fn)
     case Oextsh:
         /* Sign extend half (already 16-bit, no-op for Kw dest). For Kl
          * dest, propagate sign bit to high half. */
-        if (i->cls != Kl && leaf_opt && rtype(r0) == RTmp && r0.val >= Tmp0
+        if (i->cls != Kl && alias_opt && rtype(r0) == RTmp && r0.val >= Tmp0
             && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
             int si = r0.val - Tmp0;
             int di = i->to.val - Tmp0;
@@ -5406,7 +5439,7 @@ emitins(Ins *i, Fn *fn)
     case Oextuh:
         /* Zero extend half (already 16-bit, no-op for Kw dest). For Kl
          * dest, high half = 0. */
-        if (i->cls != Kl && leaf_opt && rtype(r0) == RTmp && r0.val >= Tmp0
+        if (i->cls != Kl && alias_opt && rtype(r0) == RTmp && r0.val >= Tmp0
             && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
             int si = r0.val - Tmp0;
             int di = i->to.val - Tmp0;
@@ -5427,7 +5460,7 @@ emitins(Ins *i, Fn *fn)
     case Oextsw:
         /* Sign extend word to long. For Kw dest: copy. For Kl dest:
          * propagate sign bit to high half. */
-        if (i->cls != Kl && leaf_opt && rtype(r0) == RTmp && r0.val >= Tmp0
+        if (i->cls != Kl && alias_opt && rtype(r0) == RTmp && r0.val >= Tmp0
             && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
             int si = r0.val - Tmp0;
             int di = i->to.val - Tmp0;
@@ -5458,7 +5491,7 @@ emitins(Ins *i, Fn *fn)
     case Oextuw:
         /* Zero extend word to long. For Kw dest: copy. For Kl dest:
          * high half = 0. */
-        if (i->cls != Kl && leaf_opt && rtype(r0) == RTmp && r0.val >= Tmp0
+        if (i->cls != Kl && alias_opt && rtype(r0) == RTmp && r0.val >= Tmp0
             && rtype(i->to) == RTmp && i->to.val >= Tmp0) {
             int si = r0.val - Tmp0;
             int di = i->to.val - Tmp0;
@@ -5806,7 +5839,7 @@ phi_arg_in_slot(Fn *fn, Ref arg)
     if (rtype(arg) != RTmp || arg.val < Tmp0)
         return 0;
     idx = arg.val - Tmp0;
-    if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS
+    if (alias_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS
         && temp_alias[idx] != 0 && fn->tmp[arg.val].cls != Kl)
         return 0;
     return fn->tmp[arg.val].slot >= 0;
@@ -5857,7 +5890,7 @@ emit_one_phimove(Phi *p, Ref arg, int parked, Fn *fn)
         /* The leaf-opt param alias slot is 16-bit and cannot carry a Kl
          * high half — mirror emitload_adj's `cls != Kl` guard so Kl temps
          * fall through to the two-half spilled copy. */
-        if (leaf_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS
+        if (alias_opt && idx >= 0 && idx < MAX_ALIAS_TEMPS
             && temp_alias[idx] != 0 && fn->tmp[arg.val].cls != Kl) {
             /* Aliased to param slot — load from caller frame */
             if (!acache_has(arg)) {
@@ -6329,11 +6362,41 @@ w65816_emitfn(Fn *fn, FILE *f)
     /* Reserve slots for allocs in fn->slot so assignslots starts after them */
     fn->slot = slot;
 
+    /* S5 (2026-10-08): which temps never touch their slot is decided
+     * BEFORE the slots are assigned, so that they get none: a temp that is
+     * a parameter read in place, or one whose store is skipped because
+     * its only use takes it from A. They used to be coloured like the
+     * others and the frame carried their words. None of these analyses
+     * reads a slot number or the frame size. */
+    leaf_opt = (fn->leaf || all_calls_are_tail(fn)) && !fn->dynalloc;
+    alias_opt = leaf_opt || (!fn->dynalloc && !getenv("QBE_NO_NONLEAF_ALIAS"));
+    count_temp_uses(fn);
+    mark_near_indexed(fn);      /* S4: is_far() reads it, so first */
+    build_alias_table(fn);
+    mark_dead_stores(fn);
+    memset(temp_noslot, 0, sizeof(temp_noslot));
+    if (!getenv("QBE_SLOT_FOR_ALL"))
+        for (int t = Tmp0; t < fn->ntmp && t - Tmp0 < MAX_ALIAS_TEMPS; t++)
+            if (fn->tmp[t].cls != Kl
+                && ((alias_opt && temp_alias[t - Tmp0] != 0)
+                    || temp_is_dead_store[t - Tmp0]))
+                temp_noslot[t - Tmp0] = 1;
+
     /* Assign slots to any unassigned temps (when skiprega is set) */
     fn->slot = assignslots(fn);
 
     /* Total frame size: alloc slots + temp slots + 1 for alignment */
     framesize = (fn->slot + 1) * 2;
+    /* No slot at all: no frame, and the frame size is 0, not the 2 bytes
+     * of alignment. The prologue already allocates nothing below 4 bytes
+     * (`framesize > 2`), but a parameter is read at framesize +
+     * PARAM_OFFSET + n: with 2 left here, a function that has parameters,
+     * makes calls and keeps nothing on the stack read every parameter 2
+     * bytes too high. It could not exist while each parameter was copied
+     * into a slot; textInit() became one the day they stopped being
+     * (S5, 2026-10-08: 25 examples lost their text). */
+    if (fn->slot == 0)
+        framesize = 0;
     argbytes = 0;  /* Reset argument tracking for this function */
 
     /* Leaf function optimization: enabled for true leaf functions (no calls)
@@ -6356,12 +6419,10 @@ w65816_emitfn(Fn *fn, FILE *f)
      * comment is correct for that case — we're only relaxing it for the
      * sub-case where there IS no across-call live range because the
      * function never executes past the call. */
-    leaf_opt = (fn->leaf || all_calls_are_tail(fn)) && !fn->dynalloc;
+    /* leaf_opt, alias_opt and the analyses that say which temps never
+     * touch their slot are computed above, before the slots are assigned
+     * (S5, 2026-10-08). */
     skip_dead_retstore_temp = -1;
-    count_temp_uses(fn);
-    mark_near_indexed(fn);      /* S4: is_far() reads it, so first */
-    build_alias_table(fn);
-    mark_dead_stores(fn);
     mark_high_zero(fn);
     mark_far_decomp(fn);        /* B2: before addr_only (feeds it) */
     mark_addr_only_kl(fn);
