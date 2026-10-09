@@ -1817,7 +1817,7 @@ emit_far_decomp_operand_hi(Ref a, Fn *fn, char *buf, size_t n)
  * possible, else the pointer staged in tcc__r9. Returns the decomposition
  * kind; `sfx` receives ".l" for the indexed-long form, "" otherwise. */
 static int
-emit_far_operand(Ref a, Fn *fn, char *buf, size_t n, const char **sfx)
+emit_far_operand(Ins *ins, Ref a, Fn *fn, char *buf, size_t n, const char **sfx)
 {
     int k = far_decomp_of(a);
     if (k != FAR_NONE) {
@@ -1829,6 +1829,20 @@ emit_far_operand(Ref a, Fn *fn, char *buf, size_t n, const char **sfx)
     *sfx = (k == FAR_SYM_IDX || k == FAR_NEAR_DEREF
             || (k == FAR_BASE_CON
                 && near_indexed[far_addr_idx(a)] == NEAR_PTR)) ? ".l" : "";
+    /* A plain object indexed (`sym,x`, NEAR_SYM): absolute, not long. The
+     * data bank reaches plain RAM — it is what `lda.w sym` on a scalar has
+     * always relied on — and abs,x is a byte and a cycle less than long,x
+     * (issue #166, pattern 3). A FAR or const object keeps `.l`: its bank
+     * is in the label. NEAR_PTR and NEAR_DEREF keep `.l` too: a plain
+     * pointer may hold an I/O address, which only bank $00 maps, and code
+     * may run with the data bank on $7E (the object engine's callbacks).
+     * QBE_NO_NEAR_ABS=1 turns it off for an A/B. */
+    if (k == FAR_SYM_IDX && near_indexed[far_addr_idx(a)] == NEAR_SYM
+        && (ins->volat & 6) == 0     /* the access itself is not far: the
+                                      * same `$sym + idx` also serves the
+                                      * FAR and const objects */
+        && !getenv("QBE_NO_NEAR_ABS"))
+        *sfx = ".w";
     return k;
 }
 
@@ -1856,7 +1870,7 @@ emit_far_ptr_store(Ins *i, Fn *fn)
     const char *sfx;
     int k;
 
-    k = emit_far_operand(r1, fn, opnd, sizeof opnd, &sfx);
+    k = emit_far_operand(i, r1, fn, opnd, sizeof opnd, &sfx);
     if (i->op == Ostoreb) {
         if (rtype(r0) == RCon && fn->con[r0.val].type == CBits) {
             emit_sep20();
@@ -1892,7 +1906,7 @@ emit_far_ptr_load(Ins *i, Fn *fn, int byte)
     char opnd[96];
     const char *sfx;
 
-    emit_far_operand(i->arg[0], fn, opnd, sizeof opnd, &sfx);
+    emit_far_operand(i, i->arg[0], fn, opnd, sizeof opnd, &sfx);
     if (byte)
         emit_sep20();
     fprintf(outf, "\tlda%s %s\n", sfx, opnd);
@@ -1910,7 +1924,7 @@ emit_far_ptr_load_kl(Ins *i, Fn *fn, int skip_high)
     const char *sfx;
     int k;
 
-    k = emit_far_operand(i->arg[0], fn, opnd, sizeof opnd, &sfx);
+    k = emit_far_operand(i, i->arg[0], fn, opnd, sizeof opnd, &sfx);
     fprintf(outf, "\tlda%s %s\n", sfx, opnd);
     emitstore(i->to, fn);
     if (skip_high)
