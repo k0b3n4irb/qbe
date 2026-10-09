@@ -6529,6 +6529,242 @@ lines_between(char **ln, int a, int b)
     return n;
 }
 
+/* Peephole over the emitted text (OpenSNES issue #166, patterns 1, 2, 4;
+ * 2026-10-10).
+ *
+ * The emitter stores every value it computes and loads every operand it
+ * needs, one instruction at a time; what it cannot see is the line it wrote
+ * just before. Four rules, all inside one straight line of code (no label,
+ * no branch, no call, no change of the accumulator's width in between):
+ *
+ *   reload     sta S / lda S            the load goes: A holds it
+ *   dead store sta S ... sta S          the first goes when nothing between
+ *                                       the two mentions S
+ *   dead load  lda P / lda ...          the first goes when P is a constant
+ *                                       or a frame slot (no side effect)
+ *   X reuse    lda S / tax ... lda S / tax / lda ...
+ *                                       the second pair goes while X still
+ *                                       holds S: nothing wrote X or S
+ *
+ * S is a frame slot: `tcc__lf+N` (a leaf's direct-page frame) or `N,s`.
+ * A stack slot may be an addressable local, so for `N,s` anything that
+ * reads memory through a pointer or an index counts as a mention, anything
+ * that writes through one as a write, and anything that moves the stack
+ * pointer ends the line (the same N is another slot afterwards).
+ *
+ * Everything not recognised ends the straight line. QBE_NO_PEEPHOLE=1 turns
+ * the pass off. */
+static int
+pp_is(const char *l, const char *mn)
+{
+    return l && l[0] == '\t' && strncmp(l + 1, mn, 3) == 0
+        && (l[4] == 0 || l[4] == ' ' || l[4] == '.');
+}
+
+/* The operand of an instruction line ("" when none), and whether the line
+ * is an instruction at all. */
+static const char *
+pp_operand(const char *l)
+{
+    const char *p;
+
+    if (!l || l[0] != '\t')
+        return 0;
+    p = strchr(l + 1, ' ');
+    return p ? p + 1 : "";
+}
+
+/* A frame slot operand: tcc__lf+N, or N,s. */
+static int
+pp_slot(const char *op)
+{
+    size_t n;
+
+    if (!op)
+        return 0;
+    if (strncmp(op, "tcc__lf+", 8) == 0)
+        return op[8 + strspn(op + 8, "0123456789")] == 0;
+    n = strspn(op, "0123456789");
+    return n > 0 && strcmp(op + n, ",s") == 0;
+}
+
+static int pp_stack(const char *op) { return op[0] >= '0' && op[0] <= '9'; }
+
+/* Does this line end a straight line of code? */
+static int
+pp_barrier(const char *l)
+{
+    static const char *flow[] = { "jmp", "jml", "jsl", "jsr", "rtl", "rts", "rti",
+        "brl", "bra", "bcc", "bcs", "beq", "bne", "bmi", "bpl", "bvc", "bvs",
+        "rep", "sep", "mvn", "mvp", "wai", "stp", "brk", "cop", "xce", 0 };
+    int k;
+
+    if (!l || l[0] != '\t')
+        return 1;                           /* a label, or anything at column 0 */
+    for (k = 0; flow[k]; k++)
+        if (pp_is(l, flow[k]))
+            return 1;
+    return 0;
+}
+
+static int
+pp_moves_sp(const char *l)
+{
+    static const char *sp[] = { "pha", "pla", "phx", "plx", "phy", "ply", "php",
+        "plp", "phb", "plb", "phd", "pld", "phk", "pea", "pei", "per", "tas",
+        "tcs", "txs", 0 };
+    int k;
+
+    for (k = 0; sp[k]; k++)
+        if (pp_is(l, sp[k]))
+            return 1;
+    return 0;
+}
+
+/* Through a pointer or an index: may touch any addressable local. */
+static int
+pp_indirect(const char *op)
+{
+    return strchr(op, '[') || strchr(op, '(') || strstr(op, ",x") || strstr(op, ",y");
+}
+
+static int
+pp_writes_x(const char *l)
+{
+    /* xba: with an 8-bit accumulator `tax` copies the hidden byte too */
+    static const char *wx[] = { "ldx", "tax", "tsx", "tyx", "plx", "inx", "dex", "xba", 0 };
+    int k;
+
+    for (k = 0; wx[k]; k++)
+        if (pp_is(l, wx[k]))
+            return 1;
+    return 0;
+}
+
+static int
+pp_writes_mem(const char *l)
+{
+    static const char *wm[] = { "sta", "stz", "stx", "sty", "inc", "dec", "asl",
+        "lsr", "rol", "ror", "tsb", "trb", 0 };
+    int k;
+
+    for (k = 0; wm[k]; k++)
+        if (pp_is(l, wm[k]))
+            return 1;
+    return 0;
+}
+
+/* The next line still there after i, or nl. */
+static int
+pp_next(char **ln, int nl, int i)
+{
+    for (i++; i < nl && !ln[i]; i++)
+        ;
+    return i;
+}
+
+static int
+peephole(char **ln, int nl)
+{
+    int i, j, k, removed = 0, pass;
+    const char *op, *op2;
+
+    for (pass = 0; pass < 8; pass++) {
+        int before = removed;
+        char xs[64];
+
+        xs[0] = 0;
+        for (i = 0; i < nl; i++) {
+            if (!ln[i])
+                continue;
+            if (pp_barrier(ln[i])) {
+                xs[0] = 0;
+                continue;
+            }
+            if (pp_writes_x(ln[i]) && strcmp(ln[i], "\ttax") != 0)
+                xs[0] = 0;
+            op = pp_operand(ln[i]);
+            j = pp_next(ln, nl, i);
+
+            /* what X holds: forget it when its slot is written, or when a
+             * stack slot's meaning changes */
+            if (xs[0] && (pp_writes_mem(ln[i])
+                          && (strcmp(op, xs) == 0 || (pp_stack(xs) && pp_indirect(op)))))
+                xs[0] = 0;
+            if (xs[0] && pp_stack(xs) && pp_moves_sp(ln[i]))
+                xs[0] = 0;
+
+            /* reload: sta S / lda S */
+            if (pp_is(ln[i], "sta") && pp_slot(op) && j < nl && pp_is(ln[j], "lda")
+                && strcmp(pp_operand(ln[j]), op) == 0
+                && strncmp(ln[i] + 4, ln[j] + 4, 2) == 0) {    /* the same width suffix */
+                k = pp_next(ln, nl, j);
+                /* the load also set N and Z: keep it when a branch reads them */
+                if (k < nl && ln[k][0] == '\t' && !pp_barrier(ln[k]) && !pp_is(ln[k], "php")) {
+                    ln[j] = 0;
+                    removed++;
+                    j = k;
+                }
+            }
+
+            /* X reuse: lda S / tax, with X already holding S, then a load */
+            if (pp_is(ln[i], "lda") && pp_slot(op) && j < nl && strcmp(ln[j], "\ttax") == 0) {
+                k = pp_next(ln, nl, j);
+                if (xs[0] && strcmp(xs, op) == 0 && k < nl && pp_is(ln[k], "lda")) {
+                    ln[i] = ln[j] = 0;
+                    removed += 2;
+                    continue;
+                }
+            }
+            if (strcmp(ln[i], "\ttax") == 0) {
+                /* X = A: remember the slot A was just loaded from or stored to */
+                xs[0] = 0;
+                for (k = i - 1; k >= 0 && !ln[k]; k--)
+                    ;
+                if (k >= 0 && (pp_is(ln[k], "lda") || pp_is(ln[k], "sta"))) {
+                    op2 = pp_operand(ln[k]);
+                    if (pp_slot(op2) && strlen(op2) < sizeof xs
+                        && (ln[k][4] == '.' ? ln[k][5] == 'b' : 1))
+                        strcpy(xs, op2);
+                }
+                continue;
+            }
+
+            /* dead load: lda P / lda ... */
+            if (pp_is(ln[i], "lda") && j < nl && pp_is(ln[j], "lda")
+                && (op[0] == '#' || pp_slot(op))) {
+                ln[i] = 0;
+                removed++;
+                continue;
+            }
+
+            /* dead store: sta S, and S is stored again before it is read */
+            if (pp_is(ln[i], "sta") && pp_slot(op)) {
+                for (k = pp_next(ln, nl, i); k < nl; k = pp_next(ln, nl, k)) {
+                    if (pp_barrier(ln[k]))
+                        break;
+                    if (pp_stack(op) && pp_moves_sp(ln[k]))
+                        break;
+                    op2 = pp_operand(ln[k]);
+                    if (pp_is(ln[k], "sta") && strcmp(op2, op) == 0
+                        && strncmp(ln[i] + 4, ln[k] + 4, 2) == 0) {
+                        ln[i] = 0;
+                        removed++;
+                        break;
+                    }
+                    if (strcmp(op2, op) == 0 || (pp_stack(op) && pp_indirect(op2)))
+                        break;              /* read, or may be */
+                }
+                if (!ln[i])
+                    continue;
+            }
+        }
+        if (removed == before)
+            break;
+    }
+    return removed;
+}
+
 static void
 relax_branches(FILE *in, FILE *out)
 {
@@ -6560,6 +6796,13 @@ relax_branches(FILE *in, FILE *out)
         if (!p)
             break;
         *p++ = 0;
+    }
+    if (!getenv("QBE_NO_PEEPHOLE") && peephole(ln, nl)) {
+        /* close the gaps: the branch pass below looks at adjacent lines */
+        for (i = k = 0; i < nl; i++)
+            if (ln[i])
+                ln[k++] = ln[i];
+        nl = k;
     }
     for (i = 0; i < nl; i++) {
         if (!ln[i])
@@ -6597,9 +6840,17 @@ relax_branches(FILE *in, FILE *out)
             else if (t >= 0)
                 dist = lines_between(ln, t, i) < 0 ? -1 : lines_between(ln, t, i) + 2;
             if (dist >= 0 && dist <= SHORT_REACH) {
-                fprintf(out, "\t%s %s\n", inv, target);
-                ln[i] = ln[i + 1] = ln[i + 2] = 0;  /* gone: the scans above skip them */
-                continue;
+                /* The short branch takes the triple's place IN ln[]: a later
+                 * backward bound must count its two bytes. The first version
+                 * printed it and dropped the three lines, so each branch
+                 * already shortened was missing from the count — a backward
+                 * branch judged at 123 bytes was at 129, and the assembler
+                 * refused it (difftest_stmt, seed 168847). */
+                char *shortened = emalloc(strlen(target) + 8);
+
+                sprintf(shortened, "\t%s %s", inv, target);
+                ln[i] = shortened;
+                ln[i + 1] = ln[i + 2] = 0;
             }
         }
         fprintf(out, "%s\n", ln[i]);
