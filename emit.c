@@ -51,9 +51,26 @@ static int dtype_size[] = {
 	[DL] = 4
 };
 
-/* Emit a string with proper handling of null terminators for WLA-DX.
- * WLA-DX doesn't support \000 escape sequences, so we convert them to:
- * "Hello\000World" -> "Hello", 0, "World"
+/* Is p a `\ooo` escape (three octal digits)? The front end writes every
+ * byte that is not printable, and `"` and `\` themselves, that way. */
+static int
+octal_escape(const char *p)
+{
+	return p[0] == '\\'
+		&& p[1] >= '0' && p[1] <= '3'
+		&& p[2] >= '0' && p[2] <= '7'
+		&& p[3] >= '0' && p[3] <= '7';
+}
+
+/* Emit a string for WLA-DX, whose .ASC knows no octal escape: each one is
+ * written as a number between the pieces of text,
+ * "Hello\012World\000" -> "Hello", 10, "World", 0
+ * Until 2026-10-09 only \000 was converted. Any other escape was copied
+ * into the .ASC string, where WLA-DX reads `\0` as a NUL and anything else
+ * as a backslash: "\n" came out as 0, '1', '2', "\xF0" as '\\', '3', '6',
+ * '0' — wrong bytes, and more of them than the C code counts. A newline, a
+ * tab, a quote or a backslash in a string literal, or any byte above 0x7E,
+ * was enough.
  */
 static void
 emit_wladx_string(char *str, FILE *f)
@@ -69,15 +86,15 @@ emit_wladx_string(char *str, FILE *f)
 	fputs("\t.ASC ", f);
 
 	while (*p) {
-		/* Check for \000 escape sequence (4 chars) */
-		if (p[0] == '\\' && p[1] == '0' && p[2] == '0' && p[3] == '0') {
+		/* an octal escape: a number, outside the quotes */
+		if (octal_escape(p)) {
 			if (in_string) {
 				fputc('"', f);
 				in_string = 0;
 			}
 			if (need_comma)
 				fputs(", ", f);
-			fputs("0", f);
+			fprintf(f, "%d", (p[1]-'0')*64 + (p[2]-'0')*8 + (p[3]-'0'));
 			need_comma = 1;
 			p += 4;
 			continue;
@@ -118,8 +135,8 @@ string_length(char *str)
 		p++;
 
 	while (*p) {
-		if (p[0] == '\\' && p[1] == '0' && p[2] == '0' && p[3] == '0') {
-			len++;  /* null byte */
+		if (octal_escape(p)) {
+			len++;  /* one byte */
 			p += 4;
 		} else if (*p == '"' && p[1] == '\0') {
 			break;
