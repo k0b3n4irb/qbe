@@ -6406,6 +6406,208 @@ emitjmp(Blk *b, Fn *fn)
     }
 }
 
+/* Short branches (OpenSNES issue #166, pattern 5; 2026-10-09).
+ *
+ * emitjmp() writes a conditional as
+ *
+ *         bxx +
+ *         jmp @target
+ *     +
+ *
+ * because it does not know how far @target is, and a relative branch
+ * reaches 127 bytes forward, 128 back. The function is therefore emitted
+ * into a temporary file first; this pass reads it back and turns that
+ * triple into the inverted branch `byy @target` when the target is near:
+ * two bytes instead of five, and 3 cycles saved when the branch is taken
+ * (1 when it is not).
+ *
+ * "Near" is decided on an upper bound, never on a guess: line_bytes()
+ * gives the most each instruction between the branch and the label can
+ * assemble to, and the sum must stay within SHORT_REACH. A line this pass
+ * does not understand (a directive other than .ACCU / .INDEX) stops the
+ * count. Turning a triple into a branch only shortens the code, so a
+ * bound taken on the long form holds afterwards. If the bound were ever
+ * wrong the assembler refuses the branch ("too large distance"): it cannot
+ * miscompile.
+ *
+ * The `+` of the triple must belong to it alone: an earlier `bxx +` not
+ * yet closed by a `+` line would lose its target.
+ * QBE_NO_SHORT_BRANCH=1 turns the pass off. */
+#define SHORT_REACH 124     /* bytes, forward or back: 127 / 128 less a margin */
+
+static const char *
+inverted_branch(const char *line)
+{
+    static const char *pair[][2] = {
+        {"bcc", "bcs"}, {"bcs", "bcc"}, {"beq", "bne"}, {"bne", "beq"},
+        {"bmi", "bpl"}, {"bpl", "bmi"}, {"bvc", "bvs"}, {"bvs", "bvc"},
+    };
+    size_t k;
+
+    if (line[0] != '\t' || strlen(line) != 6 || strcmp(line + 4, " +") != 0)
+        return 0;
+    for (k = 0; k < sizeof pair / sizeof pair[0]; k++)
+        if (strncmp(line + 1, pair[k][0], 3) == 0)
+            return pair[k][1];
+    return 0;
+}
+
+/* An upper bound of the bytes one instruction assembles to, from how this
+ * back end writes it: the width suffix when there is one (.b 2, .w 3, .l 4),
+ * else the operand's shape. Anything not recognised counts 4, the longest
+ * instruction there is. */
+static int
+line_bytes(const char *p)
+{
+    const char *op = p + 3;
+
+    if (strlen(p) < 3)
+        return 4;
+    if (op[0] == '.') {
+        if (op[1] == 'b') return 2;
+        if (op[1] == 'w') return 3;
+        return 4;
+    }
+    if (op[0] == 0 || strcmp(op, " a") == 0)
+        return 1;                           /* implied, accumulator */
+    if (op[0] != ' ')
+        return 4;
+    if (strncmp(p, "jsl", 3) == 0 || strncmp(p, "jml", 3) == 0)
+        return 4;
+    if (strncmp(p, "jmp", 3) == 0 || strncmp(p, "jsr", 3) == 0
+        || strncmp(p, "pea", 3) == 0 || strncmp(p, "per", 3) == 0
+        || strncmp(p, "mvn", 3) == 0 || strncmp(p, "mvp", 3) == 0)
+        return 3;
+    if (strncmp(p, "rep", 3) == 0 || strncmp(p, "sep", 3) == 0)
+        return 2;
+    if (p[0] == 'b' && strncmp(p, "bit", 3) != 0 && strncmp(p, "brk", 3) != 0
+        && strncmp(p, "brl", 3) != 0)
+        return 2;                           /* a relative branch */
+    if (op[1] == '[' || op[1] == '(')
+        return 2;                           /* through a direct-page pointer */
+    if (strlen(op) >= 2 && strcmp(op + strlen(op) - 2, ",s") == 0)
+        return 2;                           /* stack relative */
+    return 4;
+}
+
+/* An upper bound of the bytes strictly between lines a and b (a < b), or
+ * -1 when a line cannot be bounded. */
+static int
+lines_between(char **ln, int a, int b)
+{
+    int k, n = 0;
+    const char *p;
+
+    for (k = a + 1; k < b; k++) {
+        p = ln[k];
+        if (!p)
+            continue;                       /* a line an earlier triple gave up */
+        /* An anonymous label may share its line with an instruction
+         * (`+<tab>lda.w #1`): skip the label, count what follows. The first
+         * version skipped the whole line, and a branch it had judged near
+         * was 129 bytes away — refused by the assembler, as designed
+         * (difftest, seed 8). */
+        if (*p == '+' || *p == '-') {
+            while (*p == '+' || *p == '-')
+                p++;
+        } else if (*p != '\t' && *p != ' ') {
+            if (*p == 0 || *p == ';' || strchr(p, ':'))
+                continue;                   /* empty, comment, a named label alone */
+            return -1;                      /* something at column 0 we do not know */
+        }
+        while (*p == '\t' || *p == ' ')
+            p++;
+        if (*p == 0 || *p == ';')
+            continue;
+        if (*p == '.') {
+            if (strncmp(p, ".ACCU", 5) == 0 || strncmp(p, ".INDEX", 6) == 0)
+                continue;
+            return -1;
+        }
+        n += line_bytes(p);
+    }
+    return n;
+}
+
+static void
+relax_branches(FILE *in, FILE *out)
+{
+    long size;
+    char *buf, *p, **ln;
+    int nl = 0, cap = 0, i, k, t, dist, shared;
+    const char *inv, *target;
+    size_t tl;
+
+    fflush(in);
+    size = ftell(in);
+    rewind(in);
+    buf = emalloc(size + 1);
+    if (fread(buf, 1, size, in) != (size_t)size)
+        die("short branches: cannot read the function back");
+    buf[size] = 0;
+    ln = 0;
+    for (p = buf; *p; ) {
+        if (nl == cap) {
+            char **bigger = emalloc((cap ? cap * 2 : 256) * sizeof *ln);
+            if (ln)
+                memcpy(bigger, ln, nl * sizeof *ln);
+            free(ln);
+            ln = bigger;
+            cap = cap ? cap * 2 : 256;
+        }
+        ln[nl++] = p;
+        p = strchr(p, '\n');
+        if (!p)
+            break;
+        *p++ = 0;
+    }
+    for (i = 0; i < nl; i++) {
+        if (!ln[i])
+            continue;
+        inv = (i + 2 < nl && ln[i + 1] && ln[i + 2]) ? inverted_branch(ln[i]) : 0;
+        if (inv && strncmp(ln[i + 1], "\tjmp @", 6) == 0 && strcmp(ln[i + 2], "+") == 0) {
+            target = ln[i + 1] + 5;         /* "@name" */
+            tl = strlen(target);
+            /* is this `+` wanted by an earlier branch as well? */
+            shared = 0;
+            for (k = i - 1; k >= 0; k--) {
+                if (!ln[k])
+                    continue;
+                if (ln[k][0] == '+' && ln[k][1] != '+')
+                    break;                  /* a `+` is defined here: earlier
+                                             * branches to `+` stop at it */
+                if (inverted_branch(ln[k])
+                    || (ln[k][0] == '\t' && strlen(ln[k]) >= 2
+                        && strcmp(ln[k] + strlen(ln[k]) - 2, " +") == 0)) {
+                    shared = 1;
+                    break;
+                }
+            }
+            t = -1;
+            if (!shared)
+                for (k = 0; k < nl; k++)
+                    if (ln[k] && strncmp(ln[k], target, tl) == 0
+                        && strcmp(ln[k] + tl, ":") == 0) {
+                        t = k;
+                        break;
+                    }
+            dist = -1;
+            if (t > i)
+                dist = lines_between(ln, i + 2, t);
+            else if (t >= 0)
+                dist = lines_between(ln, t, i) < 0 ? -1 : lines_between(ln, t, i) + 2;
+            if (dist >= 0 && dist <= SHORT_REACH) {
+                fprintf(out, "\t%s %s\n", inv, target);
+                ln[i] = ln[i + 1] = ln[i + 2] = 0;  /* gone: the scans above skip them */
+                continue;
+            }
+        }
+        fprintf(out, "%s\n", ln[i]);
+    }
+    free(ln);
+    free(buf);
+}
+
 void
 w65816_emitfn(Fn *fn, FILE *f)
 {
@@ -6413,7 +6615,9 @@ w65816_emitfn(Fn *fn, FILE *f)
     Ins *i;
     int slot;
 
-    outf = f;
+    FILE *real = f, *staged = getenv("QBE_NO_SHORT_BRANCH") ? 0 : tmpfile();
+
+    outf = staged ? staged : f;
 
     /* 2-pass parse mode: every fn's abi0 has already run during pass 1,
      * so the w65816_alloc_size[] / w65816_alloc_slots globals hold the
@@ -6829,6 +7033,11 @@ w65816_emitfn(Fn *fn, FILE *f)
     }
 
     fprintf(outf, ".ENDS\n");
+    if (staged) {
+        relax_branches(staged, real);
+        fclose(staged);
+        outf = real;
+    }
 }
 
 void
