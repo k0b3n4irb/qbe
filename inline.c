@@ -168,7 +168,12 @@ inline_record(Fn *fn)
      * straight-line sequence (only unconditional jmp + final ret). This
      * accommodates cproc's `@start; jmp @body; @body; ...; ret` pattern
      * that survives SSA cleanup as 2 blocks for even trivial helpers. */
+    /* A function placed in a section of its own (`__ramcode`: the RAM code
+     * window, where code must run while a coprocessor owns the ROM) is
+     * never copied into a caller: its body would run from wherever the
+     * caller is. See auto_inline_ok(). */
     r->eligible = r->hint
+        && !fn->lnk.sec
         && !r->has_phis
         && !r->has_cond
         && !r->has_calls
@@ -474,6 +479,17 @@ auto_inline_ok(Fn *caller, InlRec *rec)
     if (!callee || callee == caller || !rec->is_static)
         return 0;
     if (rec->busy || addrtaken(rec->name))
+        return 0;
+    /* A function with a section of its own stays where the source put it.
+     * `RAM_CODE static void job(void)` with one call site was absorbed
+     * into its caller in ROM as soon as the leaf rule below stopped
+     * refusing it — the rule had been hiding the case since the morning —
+     * and the Super FX library test ROM, whose main CPU must wait in RAM
+     * while the GSU reads the ROM, never finished (131,000 bus violations
+     * counted by luna). A caller in such a section may still absorb an
+     * ordinary function: that body then runs from RAM too.
+     * (2026-10-10) */
+    if (callee && callee->lnk.sec)
         return 0;
     /* one call site: always. Several: only where the source says `inline`,
      * and under a size (the body is then copied at each site). */
