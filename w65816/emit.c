@@ -84,7 +84,17 @@ static int large_frame_mode;       /* 1 = use indirect via tcc__fp */
 #define DPF_WORDS 16
 #define DPF_BASE 0x4000
 static int dp_frame;
-#define SOFF(slot) (dp_frame ? DPF_BASE + (slot) * 2 : ((slot) + 1) * 2)
+/* 2026-10-10 (issue #166): in a function that CALLS, a temp that is not
+ * live across any call can live in that same direct-page block: whatever
+ * the callee does with the block, the value is dead by then. Such a temp
+ * is given a slot number at or above DPSLOT by color_slots() — DPSLOT + n
+ * is word n of tcc__lf — and the temps that do cross a call keep a stack
+ * slot. Measured on a real game before writing this: 59 % of its logic's
+ * time was in functions that call, 145 of the 250 instructions of the
+ * heaviest one stack-relative. QBE_NO_DP_TEMPS=1 turns it off. */
+#define DPSLOT 8192
+#define SOFF(slot) (dp_frame ? DPF_BASE + (slot) * 2 \
+    : (slot) >= DPSLOT ? DPF_BASE + ((slot) - DPSLOT) * 2 : ((slot) + 1) * 2)
 
 static void
 emit_stack_load(int frame_off, int sp_adjust)
@@ -585,7 +595,7 @@ check_high_read(Ref r, Fn *fn)
  * execution order). A mismatch means an operand was read after a
  * co-slotted temp overwrote it — a fold or deferral the interference graph
  * did not model. Internal compiler error; QBE_SLOT_CHECK_WARN=1 lists all. */
-#define SLOT_OWN_MAX 4096
+#define SLOT_OWN_MAX (8192 + 64)
 static int slot_owner[SLOT_OWN_MAX];
 static Fn *slot_fn;
 
@@ -2839,18 +2849,21 @@ color_slots(Fn *fn, int base)
     int nt = fn->ntmp, words = (nt + 63) / 64;
     unsigned long long *adj;
     int *order, norder = 0, *start, maxslot = base;
-    char *seen, *occ;
+    char *seen, *occ, *cross;
     BSet live[1];
     Blk *b, *pb;
     Ins *i;
     Phi *p, *q;
     int t, u, k, a, n, w, s, changed, pass;
+    int mixed, ncalls = 0;
+    char dpocc[DPF_WORDS + 2];
 
     adj = calloc((size_t)nt * words, sizeof *adj);
     seen = calloc(nt, 1);
     order = calloc(nt, sizeof *order);
     start = calloc(nt, sizeof *start);
-    if (!adj || !seen || !order || !start)
+    cross = calloc(nt, 1);
+    if (!adj || !seen || !order || !start || !cross)
         die("out of memory");
     bsinit(live, nt);
 
@@ -2879,6 +2892,14 @@ color_slots(Fn *fn, int base)
             bsset(live, b->jmp.arg.val);
         for (i = &b->ins[b->nins]; i != b->ins;) {
             i--;
+            if (i->op == Ocall) {
+                /* what is live after the call, its result apart, holds
+                 * a value across it */
+                ncalls++;
+                for (u = 0; bsiter(live, &u); u++)
+                    if (!(rtype(i->to) == RTmp && (int)i->to.val == u))
+                        cross[u] = 1;
+            }
             if (rtype(i->to) == RTmp && i->to.val >= Tmp0) {
                 t = i->to.val;
                 for (u = 0; bsiter(live, &u); u++)
@@ -2922,6 +2943,11 @@ color_slots(Fn *fn, int base)
                     if (rtype(i->arg[k]) != RTmp || i->arg[k].val < Tmp0)
                         continue;
                     u = i->arg[k].val;
+                    if (cross[t] && !cross[u]) {
+                        /* read where the add is used, maybe after a call */
+                        cross[u] = 1;
+                        changed = 1;
+                    }
                     for (n = 0; n < words; n++) {
                         unsigned long long add = adj[(size_t)t * words + n]
                                                  & ~adj[(size_t)u * words + n];
@@ -2940,6 +2966,11 @@ color_slots(Fn *fn, int base)
     occ = calloc((size_t)(base + 2 * nt + 4), 1);
     if (!occ)
         die("out of memory");
+    /* direct-page temps only for a function that calls (a leaf has the
+     * whole frame there, or none of it: emitfn decides after this), and
+     * only while a stack slot number cannot reach DPSLOT */
+    mixed = ncalls > 0 && !fn->leaf && !fn->dynalloc
+            && base + 2 * nt + 4 < DPSLOT && !getenv("QBE_NO_DP_TEMPS");
     for (n = 0; n < norder; n++) {
         t = order[n];
         if (fn->tmp[t].slot >= 0) {
@@ -2948,13 +2979,27 @@ color_slots(Fn *fn, int base)
         }
         w = SLOT_WORDS(fn, t);
         memset(occ, 0, (size_t)(base + 2 * nt + 4));
+        memset(dpocc, 0, sizeof dpocc);
         for (k = 0; k < n; k++) {
             u = order[k];
             if (adj[(size_t)t * words + u / 64] >> (u % 64) & 1) {
                 int su = fn->tmp[u].slot, wu = SLOT_WORDS(fn, u);
-                if (su >= 0)
+                if (su >= DPSLOT) {
+                    for (a = 0; a < wu && su - DPSLOT + a < DPF_WORDS; a++)
+                        dpocc[su - DPSLOT + a] = 1;
+                } else if (su >= 0)
                     for (a = 0; a < wu; a++)
                         occ[su + a] = 1;
+            }
+        }
+        if (mixed && !cross[t]) {
+            /* first fit in the direct-page block; the stack when it is full */
+            for (s = 0; s + w <= DPF_WORDS; s++)
+                if (!dpocc[s] && (w == 1 || !dpocc[s + 1]))
+                    break;
+            if (s + w <= DPF_WORDS) {
+                fn->tmp[t].slot = DPSLOT + s;
+                continue;
             }
         }
         for (s = base; occ[s] || (w == 2 && occ[s + 1]); s++)
@@ -2964,6 +3009,7 @@ color_slots(Fn *fn, int base)
             maxslot = s + w;
     }
     free(occ);
+    free(cross);
     free(adj);
     free(seen);
     free(order);
