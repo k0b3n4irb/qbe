@@ -2907,6 +2907,25 @@ color_slots(Fn *fn, int base)
     }
 #undef NOTE
 
+    /* Costliest first: QBE's use count weighted by loop depth (fillcost).
+     * First fit in definition order gave the sixteen direct-page words to
+     * whatever a function computes first — its setup — and left the
+     * temporaries of a loop further down on the stack. Stable, so that
+     * equal costs keep the definition order. QBE_SLOT_ORDER=def restores
+     * it. */
+    if (!(getenv("QBE_SLOT_ORDER") && strcmp(getenv("QBE_SLOT_ORDER"), "def") == 0)) {
+        int x, y;
+
+        for (x = 1; x < norder; x++) {
+            int v = order[x];
+            unsigned cv = fn->tmp[v].cost;
+
+            for (y = x; y > 0 && fn->tmp[order[y - 1]].cost < cv; y--)
+                order[y] = order[y - 1];
+            order[y] = v;
+        }
+    }
+
     for (b = fn->start; b; b = b->link) {
         bscopy(live, b->out);
         if (rtype(b->jmp.arg) == RTmp)
