@@ -2855,7 +2855,11 @@ color_slots(Fn *fn, int base)
     Ins *i;
     Phi *p, *q;
     int t, u, k, a, n, w, s, changed, pass;
-    int mixed, ncalls = 0;
+    int mixed, ncalls = 0, want, npa = 0, n2;
+    int phi_share = !getenv("QBE_NO_PHI_SHARE");
+    int opnd_share = phi_share && !getenv("QBE_NO_OPND_SHARE");
+    int *pref;                  /* an argument's phi result */
+    struct { int to, arg; } *pa;
     char dpocc[DPF_WORDS + 2];
 
     adj = calloc((size_t)nt * words, sizeof *adj);
@@ -2863,8 +2867,25 @@ color_slots(Fn *fn, int base)
     order = calloc(nt, sizeof *order);
     start = calloc(nt, sizeof *start);
     cross = calloc(nt, 1);
-    if (!adj || !seen || !order || !start || !cross)
+    pref = calloc(nt, sizeof *pref);
+    for (b = fn->start, n = 0; b; b = b->link)
+        for (p = b->phi; p; p = p->link)
+            n += p->narg;
+    pa = calloc(n + 1, sizeof *pa);
+    if (!adj || !seen || !order || !start || !cross || !pref || !pa)
         die("out of memory");
+    for (b = fn->start; b; b = b->link)
+        for (p = b->phi; p; p = p->link) {
+            if (rtype(p->to) != RTmp || p->to.val < Tmp0)
+                continue;
+            for (n = 0; n < (int)p->narg; n++)
+                if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
+                    pa[npa].to = p->to.val;
+                    pa[npa++].arg = p->arg[n].val;
+                    if (!pref[p->arg[n].val])
+                        pref[p->arg[n].val] = p->to.val;
+                }
+        }
     bsinit(live, nt);
 
 #define NOTE(r) do { if (rtype(r) == RTmp && (r).val >= Tmp0 && !seen[(r).val] \
@@ -2905,7 +2926,11 @@ color_slots(Fn *fn, int base)
                 for (u = 0; bsiter(live, &u); u++)
                     slot_edge(adj, words, t, u);
                 for (k = 0; k < 2; k++)
-                    if (rtype(i->arg[k]) == RTmp)
+                    if (rtype(i->arg[k]) == RTmp
+                        && !(opnd_share && i->cls == Kw
+                             && fn->tmp[i->arg[k].val].cls == Kw
+                             && (i->op == Oadd || i->op == Osub || i->op == Oand
+                                 || i->op == Oor || i->op == Oxor || i->op == Ocopy)))
                         slot_edge(adj, words, t, i->arg[k].val);
                 bsclr(live, t);
             }
@@ -2924,8 +2949,15 @@ color_slots(Fn *fn, int base)
                 slot_edge(adj, words, p->to.val, u);
             for (a = 0; a < (int)p->narg; a++) {
                 pb = p->blk[a];
-                for (u = 0; bsiter(pb->out, &u); u++)
+                for (u = 0; bsiter(pb->out, &u); u++) {
+                    /* its own argument on this edge may share its slot:
+                     * the move is then nothing. Any other reason for the
+                     * two to interfere still adds the edge. */
+                    if (phi_share && rtype(p->arg[a]) == RTmp
+                        && (int)p->arg[a].val == u)
+                        continue;
                     slot_edge(adj, words, p->to.val, u);
+                }
             }
         }
     }
@@ -2978,6 +3010,7 @@ color_slots(Fn *fn, int base)
             continue;
         }
         w = SLOT_WORDS(fn, t);
+        want = phi_share ? pref[t] : 0;
         memset(occ, 0, (size_t)(base + 2 * nt + 4));
         memset(dpocc, 0, sizeof dpocc);
         for (k = 0; k < n; k++) {
@@ -2991,6 +3024,89 @@ color_slots(Fn *fn, int base)
                     for (a = 0; a < wu; a++)
                         occ[su + a] = 1;
             }
+        }
+        /* the slot of the phi it feeds, or of an argument already placed */
+        for (k = 0; want && k < 2; k++) {
+            int su;
+            u = k == 0 ? want : 0;
+            if (k == 0 && want && fn->tmp[want].slot < 0) {
+                /* the phi is not placed yet: another of its arguments */
+                for (a = 0; a < npa; a++)
+                    if (pa[a].to == want && pa[a].arg != t
+                        && fn->tmp[pa[a].arg].slot >= 0) {
+                        u = pa[a].arg;
+                        break;
+                    }
+            }
+            if (k == 1) {
+                /* a phi result: any coloured argument */
+                for (a = 0; a < npa; a++)
+                    if (pa[a].to == t && fn->tmp[pa[a].arg].slot >= 0) {
+                        u = pa[a].arg;
+                        break;
+                    }
+            }
+            if (!u || u == t || fn->tmp[u].slot < 0 || SLOT_WORDS(fn, u) != w)
+                continue;
+            if (adj[(size_t)t * words + u / 64] >> (u % 64) & 1)
+                continue;
+            su = fn->tmp[u].slot;
+            if (su >= DPSLOT) {
+                if (!mixed || cross[t] || su - DPSLOT + w > DPF_WORDS)
+                    continue;
+                for (a = 0; a < w && !dpocc[su - DPSLOT + a]; a++)
+                    ;
+            } else {
+                if (su < base)
+                    continue;
+                for (a = 0; a < w && !occ[su + a]; a++)
+                    ;
+            }
+            /* and no other partner of t half over it */
+            for (n2 = 0; a == w && n2 < npa; n2++) {
+                int v, sv;
+                if (pa[n2].to == t)
+                    v = pa[n2].arg;
+                else if (pa[n2].arg == t)
+                    v = pa[n2].to;
+                else
+                    continue;
+                sv = fn->tmp[v].slot;
+                if (v == t || sv < 0 || (sv == su && SLOT_WORDS(fn, v) == w))
+                    continue;
+                if (sv < su + w && su < sv + SLOT_WORDS(fn, v))
+                    a = -1;
+            }
+            if (a == w) {
+                fn->tmp[t].slot = su;
+                if (su < DPSLOT && su + w > maxslot)
+                    maxslot = su + w;
+                break;
+            }
+        }
+        if (fn->tmp[t].slot >= 0)
+            continue;
+        /* Not the same slot, then not half of it either: a phi and its
+         * argument have no edge between them, and first fit would let two
+         * 32-bit ones overlap by one word. */
+        for (a = 0; a < npa; a++) {
+            int su, wu;
+            if (pa[a].to == t)
+                u = pa[a].arg;
+            else if (pa[a].arg == t)
+                u = pa[a].to;
+            else
+                continue;
+            su = fn->tmp[u].slot;
+            wu = SLOT_WORDS(fn, u);
+            if (u == t || su < 0 || (w == 1 && wu == 1))
+                continue;           /* two single words: the same or apart */
+            if (su >= DPSLOT) {
+                for (k = 0; k < wu && su - DPSLOT + k < DPF_WORDS; k++)
+                    dpocc[su - DPSLOT + k] = 1;
+            } else
+                for (k = 0; k < wu; k++)
+                    occ[su + k] = 1;
         }
         if (mixed && !cross[t]) {
             /* first fit in the direct-page block; the stack when it is full */
@@ -3009,6 +3125,8 @@ color_slots(Fn *fn, int base)
             maxslot = s + w;
     }
     free(occ);
+    free(pref);
+    free(pa);
     free(cross);
     free(adj);
     free(seen);
