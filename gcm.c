@@ -405,16 +405,23 @@ sinkref(Fn *fn, Blk *b, Ref *pr)
 	i.to = r;
 	fn->tmp[r.val].gcmbid = b->id;
 	emiti(i);
-	/* Sink the operands of the copy that was EMITTED (curi points at it;
-	 * insb is filled backwards, so what is emitted next comes before it).
-	 * Upstream recurses on the local `i`: the emitted copy then keeps the
-	 * original operands, and the sunk operands are referenced by nothing.
-	 * Harmless where a register allocator drops dead definitions; this
-	 * target has none (T.skiprega) and emitted them all. (OpenSNES,
-	 * 2026-10-08) */
-	e = curi;
-	sinkref(fn, b, &e->arg[0]);
-	sinkref(fn, b, &e->arg[1]);
+	/* The operands are NOT sunk with it, unless QBE_SINK_DEEP is set.
+	 * Upstream recurses on the local `i`, so its emitted copy keeps the
+	 * original operands anyway and the sunk operands are referenced by
+	 * nothing. On 2026-10-08 this fork made the recursion real (on the
+	 * emitted copy, curi): the dead copies went, but every load and store
+	 * of `a[i]` then carried its own `mul i, 2`, which this target emits
+	 * as `lda i / asl a / tax` in front of each access — a dozen times
+	 * per iteration in a loop over parallel arrays. Sinking the address
+	 * alone keeps it next to its access (where the emitter folds it into
+	 * the addressing mode) and leaves the index computed once. Measured
+	 * on a game's match logic: 75.1 M master cycles to 68.3 M over the
+	 * same 340 ticks. (OpenSNES, 2026-10-10) */
+	if (getenv("QBE_SINK_DEEP")) {
+		e = curi;
+		sinkref(fn, b, &e->arg[0]);
+		sinkref(fn, b, &e->arg[1]);
+	}
 }
 
 /* Remove what sink() left without a use: the original of an instruction
