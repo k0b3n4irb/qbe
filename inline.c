@@ -435,7 +435,7 @@ inline_leaf_max(void)
 {
     char *e = getenv("CC_INLINE_LEAF_MAX");
 
-    return e ? atoi(e) : 16;
+    return e ? atoi(e) : -1;        /* -1: no limit (the default since 2026-10-10) */
 }
 
 static int
@@ -511,13 +511,24 @@ auto_inline_ok(Fn *caller, InlRec *rec)
      * made mode7/extbg boot four frames later. So a leaf goes into such a
      * caller only when it is tiny (the call then costs more than the
      * body); into a caller whose every call can be absorbed, always — that
-     * caller ends up a leaf itself. CC_INLINE_LEAF_MAX=N moves the size. */
+     * caller ends up a leaf itself. CC_INLINE_LEAF_MAX=N moves the size.
+     *
+     * That was the morning of 2026-10-10. The same evening the rule is OFF
+     * unless CC_INLINE_LEAF_MAX is set: since then a function that calls
+     * keeps in the direct page what no call crosses, an index is computed
+     * once and a loop variable is updated in place, so being poured into
+     * such a caller costs a leaf little — and the rule had a failure of its
+     * own, found by the same game: a static called from a loop sixteen
+     * times a tick stopped being absorbed the day its caller gained one
+     * cold call elsewhere (+11,000 master cycles a tick). Measured again
+     * with the rule off: that game's logic 0.7 % faster, the `depot`
+     * workload 5.7 %, nothing slower. */
     ccalls = 0;
     for (b = callee->start; b; b = b->link)
         for (i = b->ins; i < &b->ins[b->nins]; i++)
             if (i->op == Ocall)
                 ccalls++;
-    if (!ccalls && rec->ins_count > inline_leaf_max()) {
+    if (!ccalls && inline_leaf_max() >= 0 && rec->ins_count > inline_leaf_max()) {
         /* does the caller keep a call once everything that can be
          * absorbed into it has been? (a guess: a candidate counted here
          * may still be declined; then a leaf was absorbed for little) */
