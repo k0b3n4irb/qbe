@@ -151,9 +151,19 @@ defwidthle(Fn *fn, Ref r, int w)
 			if (req(p->to, r))
 				break;
 		assert(p);
+		/* A phi met again while it is being proven "no wider than
+		 * w0" may be taken as such — for a question at w0 or wider
+		 * only. Upstream answers yes whatever the width asked: with
+		 * `v = sar (extsb v), n` in a loop, "v fits 8 bits" asked
+		 * "v fits 7 bits" of the same phi through the extsb (a sign
+		 * extension keeps the width only below the sign bit), got
+		 * yes, and the `extub` of `(u8)v` after the loop was dropped:
+		 * the high byte of a negative v reached a 16-bit xor.
+		 * (OpenSNES difftest_stmt, seed 241214: one program in
+		 * 40,000; 2026-10-10) */
 		if (p->visit)
-			return 1;
-		p->visit = 1;
+			return w+1 >= (int)p->visit;
+		p->visit = w+1;
 		for (n=0; n<p->narg; n++)
 			if (!defwidthle(fn, p->arg[n], w)) {
 				p->visit = 0;

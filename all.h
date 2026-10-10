@@ -259,7 +259,7 @@ struct Phi {
 	Blk **blk;
 	uint narg;
 	short cls;
-	uint visit:1;
+	uint visit:8;  /* copy.c: a mark, or the width being proven plus one */
 	Phi *link;
 };
 
