@@ -6663,6 +6663,105 @@ pp_next(char **ln, int nl, int i)
     return i;
 }
 
+/* Did this instruction leave N and Z describing the accumulator? */
+static int
+pp_sets_nz_of_a(const char *l)
+{
+    static const char *nz[] = { "lda", "ora", "and", "eor", "adc", "sbc", "pla",
+        "txa", "tya", 0 };
+    int k;
+
+    for (k = 0; nz[k]; k++)
+        if (pp_is(l, nz[k]))
+            return 1;
+    return strcmp(l, "\tasl a") == 0 || strcmp(l, "\tlsr a") == 0
+        || strcmp(l, "\tinc a") == 0 || strcmp(l, "\tdec a") == 0
+        || strcmp(l, "\trol a") == 0 || strcmp(l, "\tror a") == 0;
+}
+
+/* Two rules that look further than a straight line (2026-10-10, from the
+ * output of a real game's functions, OpenSNES issue #166):
+ *
+ *   cmp.w #0 / beq|bne   after an instruction that set N and Z from A, with
+ *                        only stores in between (a store changes no flag):
+ *                        the compare goes. Only before beq / bne: the
+ *                        compare also sets the carry, which those two do not
+ *                        read.
+ *   sta tcc__lf+N        when nothing in the WHOLE function mentions that
+ *                        slot except stores: all of them go. A leaf's
+ *                        direct-page slot is private to the function and
+ *                        cannot be reached through a pointer, which is not
+ *                        true of a stack slot — so not for `N,s`. This is
+ *                        the high half of a widened index, written and never
+ *                        read. */
+static int
+peephole_wide(char **ln, int nl)
+{
+    int i, j, k, removed = 0;
+    const char *op, *op2;
+
+    for (i = 0; i < nl; i++) {
+        if (!ln[i] || strcmp(ln[i], "\tcmp.w #0") != 0)
+            continue;
+        j = pp_next(ln, nl, i);
+        if (j >= nl || !(pp_is(ln[j], "beq") || pp_is(ln[j], "bne")))
+            continue;
+        /* The compare also sets the carry, and a 32-bit unsigned compare
+         * reads it two lines further (`cmp.w #0 / beq + / bcc ++`): the
+         * first version of this rule looked at the next line only, and the
+         * differential tests returned wrong checksums. Keep the compare
+         * whenever a carry reader follows before the next block. */
+        {
+            int n, reads_carry = 0;
+
+            for (n = 0, k = pp_next(ln, nl, j); k < nl && n < 16; k = pp_next(ln, nl, k), n++) {
+                if (ln[k][0] == '@')
+                    break;                  /* the next block: flags are not carried into it */
+                if (pp_is(ln[k], "bcc") || pp_is(ln[k], "bcs") || pp_is(ln[k], "adc")
+                    || pp_is(ln[k], "sbc") || pp_is(ln[k], "rol") || pp_is(ln[k], "ror")
+                    || pp_is(ln[k], "php")) {
+                    reads_carry = 1;
+                    break;
+                }
+                if (pp_is(ln[k], "clc") || pp_is(ln[k], "sec") || pp_is(ln[k], "cmp"))
+                    break;                  /* the carry is set again first */
+            }
+            if (reads_carry || (k < nl && n >= 16))
+                continue;
+        }
+        for (k = i - 1; k >= 0 && (!ln[k] || pp_is(ln[k], "sta")); k--)
+            ;
+        if (k >= 0 && ln[k][0] == '\t' && pp_sets_nz_of_a(ln[k])) {
+            ln[i] = 0;
+            removed++;
+        }
+    }
+    for (i = 0; i < nl; i++) {
+        if (!ln[i] || !pp_is(ln[i], "sta"))
+            continue;
+        op = pp_operand(ln[i]);
+        if (strncmp(op, "tcc__lf+", 8) != 0 || !pp_slot(op))
+            continue;
+        for (k = 0; k < nl; k++) {
+            if (!ln[k])
+                continue;
+            op2 = pp_operand(ln[k]);
+            if (op2 && strcmp(op2, op) == 0 && !pp_is(ln[k], "sta"))
+                break;                      /* read, or changed in place */
+            if (op2 && strstr(op2, "tcc__lf") && !pp_slot(op2))
+                break;                      /* tcc__lf in a shape we do not know */
+        }
+        if (k < nl)
+            continue;
+        for (k = 0; k < nl; k++)
+            if (ln[k] && pp_is(ln[k], "sta") && strcmp(pp_operand(ln[k]), op) == 0) {
+                ln[k] = 0;
+                removed++;
+            }
+    }
+    return removed;
+}
+
 static int
 peephole(char **ln, int nl)
 {
@@ -6672,6 +6771,9 @@ peephole(char **ln, int nl)
     for (pass = 0; pass < 8; pass++) {
         int before = removed;
         char xs[64];
+
+        if (!getenv("QBE_NO_PEEP_WIDE"))
+            removed += peephole_wide(ln, nl);
 
         xs[0] = 0;
         for (i = 0; i < nl; i++) {
@@ -6698,12 +6800,20 @@ peephole(char **ln, int nl)
             if (pp_is(ln[i], "sta") && pp_slot(op) && j < nl && pp_is(ln[j], "lda")
                 && strcmp(pp_operand(ln[j]), op) == 0
                 && strncmp(ln[i] + 4, ln[j] + 4, 2) == 0) {    /* the same width suffix */
-                k = pp_next(ln, nl, j);
-                /* the load also set N and Z: keep it when a branch reads them */
+                /* The load also set N and Z. Keep it when something reads them
+                 * before they are set again — and a store sets nothing, so look
+                 * past the stores: `sta S / lda S / sta T / bne` branches on the
+                 * load. The first version looked at the next line only; once
+                 * the rule above had dropped a `cmp.w #0` that stood before the
+                 * branch, the load it had relied on went too, and the branch
+                 * read the flags of a loop counter (OpenSNES difftest_stmt,
+                 * seed 179180: one program in 100,000). */
+                for (k = pp_next(ln, nl, j); k < nl && pp_is(ln[k], "sta"); k = pp_next(ln, nl, k))
+                    ;
                 if (k < nl && ln[k][0] == '\t' && !pp_barrier(ln[k]) && !pp_is(ln[k], "php")) {
                     ln[j] = 0;
                     removed++;
-                    j = k;
+                    j = pp_next(ln, nl, i);
                 }
             }
 
