@@ -39,7 +39,6 @@ isimm(Ref r, Fn *fn, int64_t *val)
 static void
 sel(Ins *i, Fn *fn)
 {
-    (void)fn;
     (void)isimm;
 
     /* For now, just pass through all instructions.
@@ -47,6 +46,18 @@ sel(Ins *i, Fn *fn)
      * More sophisticated instruction selection can be added later
      * (e.g., combining operations, strength reduction).
      */
+    /* A shift count is a word (QBE: the second argument of a shift is a
+     * `w`), and a word is 16 bits here. The front end hands the count over
+     * without narrowing it — `x >> (s16)(3 + 0x20000000UL)` arrives as
+     * `shr x, 536870915` once folded — and the emitter read the whole
+     * constant: "16 or more", result 0, where the count is 3. A count in
+     * a temp was already read as its low word. (OpenSNES difftest, seeds
+     * 102026, 102200, 103718: three expressions in 144,000; 2026-10-10) */
+    if ((i->op == Oshl || i->op == Oshr || i->op == Osar)
+        && rtype(i->arg[1]) == RCon && fn->con[i->arg[1].val].type == CBits
+        && (fn->con[i->arg[1].val].bits.i & ~0xFFFFLL) != 0)
+        i->arg[1] = getcon(fn->con[i->arg[1].val].bits.i & 0xFFFF, fn);
+
     switch (i->op) {
     case Oadd:
     case Osub:
