@@ -594,6 +594,8 @@ void inline_record(Fn *);
 void inline_check(Fn *);
 void inline_record_dat_ref(const char *name);
 int  inline_fully_consumed(const char *name);
+void inline_count_sites(Fn *);
+int  inline_absorbed(const char *name);
 
 /* alias.c */
 void fillalias(Fn *);

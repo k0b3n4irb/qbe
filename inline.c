@@ -76,6 +76,14 @@ struct InlRec {
     int  n_declined;      /* of which were declined (couldn't inline) */
     int  n_indirect;      /* indirect references (function-ptr use) */
     InlBody *body;        /* deep-clone of body, or NULL if not eligible */
+    /* Whole-function inlining of a static function with one call site
+     * (2026-10-10, OpenSNES issue #166, pattern 9): */
+    Fn  *fn;              /* the function itself; alive until the module is emitted */
+    char is_static;       /* not exported */
+    char checked;         /* inline_check has run on it: its body is final */
+    char busy;            /* inline_check is running on it (a cycle: decline) */
+    char absorbed;        /* its one call site took its body: do not emit it */
+    int  sites;           /* direct calls to it in the module */
     InlRec *next;
 };
 
@@ -129,6 +137,12 @@ inline_record(Fn *fn)
     r->n_inlined = 0;
     r->n_declined = 0;
     r->n_indirect = 0;
+    r->fn = fn;
+    r->is_static = !fn->lnk.export;
+    r->checked = 0;
+    r->busy = 0;
+    r->absorbed = 0;
+    r->sites = 0;
 
     for (b = fn->start; b; b = b->link) {
         r->blk_count++;
@@ -375,6 +389,359 @@ splice_at(Fn *caller, Blk *blk, int call_idx, InlBody *body)
     return 1;
 }
 
+/* ---------------------------------------------------------------------------
+ * Whole-function inlining (2026-10-10; OpenSNES issue #166, pattern 9).
+ *
+ * A game's per-entity tick is a handful of small `static` functions called
+ * once each from one loop. Each call pushes its arguments, enters, rebuilds
+ * the index it was given and returns; and a function that calls another is
+ * not a leaf, so it loses the direct-page frame. Measured on a real game:
+ * the functions whose body is calls gained 4 to 8 % from everything done
+ * inside a block, against 16 to 28 % for those whose body is array accesses.
+ *
+ * A function that is not exported, whose address is not taken and that has
+ * exactly ONE call site in the module is that call site's code: its body
+ * replaces the call and the function is not emitted. No size limit is
+ * needed — the code exists once either way.
+ *
+ * A function called from several places is copied only where the source
+ * asks for it: `static inline`, up to INLINE_MAX_BIG instructions of IR.
+ * The first inliner above still takes the tiny single-block ones; this one
+ * takes those it declined (control flow, calls inside). The standalone
+ * function disappears when every call was inlined, as before.
+ *
+ * Unlike the first inliner above, which pastes a few instructions into a
+ * block, this one handles control flow. The caller's block is cut at the
+ * call; the callee's blocks are cloned between the two halves with fresh
+ * temporaries; each parameter is the argument, extended as the parameter's
+ * type says; each `ret` jumps to the second half, where a phi (or a copy,
+ * for a single `ret`) receives the value. The clone is made from the
+ * callee's IR as it stands, after its own calls were inlined: the module is
+ * walked bottom-up, and a cycle is declined.
+ *
+ * Declined: a leaf of some size when its caller still calls something else
+ * (see auto_inline_ok), a callee that still holds an alloc (a local whose address
+ * escapes), a struct or variadic parameter, a caller that would pass the
+ * back end's limit on temporaries. QBE_NO_AUTO_INLINE=1 turns it off.
+ * ------------------------------------------------------------------------- */
+#define AUTO_INLINE_TMP_ROOM 1800       /* under the back end's 2048 */
+
+#define INLINE_MAX_BIG 160      /* IR instructions; CC_INLINE_MAX_BIG=N overrides */
+
+static int inl_seq;
+
+static int
+inline_leaf_max(void)
+{
+    char *e = getenv("CC_INLINE_LEAF_MAX");
+
+    return e ? atoi(e) : 16;
+}
+
+static int
+inline_max_big(void)
+{
+    char *e = getenv("CC_INLINE_MAX_BIG");
+
+    return e && atoi(e) > 0 ? atoi(e) : INLINE_MAX_BIG;
+}
+
+static Ref
+clone_ref(Ref r, Fn *caller, Fn *callee, Ref *tmap)
+{
+    if (req(r, R))
+        return R;
+    switch (rtype(r)) {
+    case RTmp:
+        return r.val < Tmp0 ? r : tmap[r.val];
+    case RCon:
+        return newcon(&callee->con[r.val], caller);
+    default:
+        return r;
+    }
+}
+
+static int
+auto_inline_ok(Fn *caller, InlRec *rec)
+{
+    Fn *callee = rec->fn;
+    Blk *b;
+    Ins *i;
+    int ccalls, calls;
+
+    if (getenv("QBE_NO_AUTO_INLINE"))
+        return 0;
+    if (!callee || callee == caller || !rec->is_static)
+        return 0;
+    if (rec->busy || addrtaken(rec->name))
+        return 0;
+    /* one call site: always. Several: only where the source says `inline`,
+     * and under a size (the body is then copied at each site). */
+    if (rec->sites != 1
+        && !(rec->hint && rec->ins_count <= inline_max_big()))
+        return 0;
+    if (callee->vararg || callee->dynalloc)
+        return 0;
+    if (caller->ntmp + callee->ntmp >= AUTO_INLINE_TMP_ROOM)
+        return 0;
+    for (b = callee->start; b; b = b->link) {
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (isalloc(i->op))
+                return 0;
+            if (i->op == Oparc || i->op == Opare || i->op == Oargc
+                || i->op == Oarge || i->op == Oargv || i->op == Ovastart
+                || i->op == Ovaarg)
+                return 0;
+            if (ispar(i->op) && b != callee->start)
+                return 0;
+        }
+        if (b->jmp.type != Jjmp && b->jmp.type != Jjnz && b->jmp.type != Jhlt
+            && !isret(b->jmp.type))
+            return 0;
+        if (b->jmp.type == Jretc || b->jmp.type == Jrets || b->jmp.type == Jretd)
+            return 0;                   /* a struct or a float returned */
+    }
+    /* A leaf keeps its temporaries in the direct page; a function that
+     * calls keeps them on the stack, a cycle dearer at each access and out
+     * of reach of the peephole's rules on direct-page slots. Pouring a leaf
+     * into a caller that still calls something else trades one call for
+     * that, at every access: measured on a real game (2026-10-10), its
+     * logic ran 2 % SLOWER with every leaf absorbed and 0.4 % faster with
+     * the leaves left alone; in the corpus a 16 KB fill inlined into main
+     * made mode7/extbg boot four frames later. So a leaf goes into such a
+     * caller only when it is tiny (the call then costs more than the
+     * body); into a caller whose every call can be absorbed, always — that
+     * caller ends up a leaf itself. CC_INLINE_LEAF_MAX=N moves the size. */
+    ccalls = 0;
+    for (b = callee->start; b; b = b->link)
+        for (i = b->ins; i < &b->ins[b->nins]; i++)
+            if (i->op == Ocall)
+                ccalls++;
+    if (!ccalls && rec->ins_count > inline_leaf_max()) {
+        /* does the caller keep a call once everything that can be
+         * absorbed into it has been? (a guess: a candidate counted here
+         * may still be declined; then a leaf was absorbed for little) */
+        calls = 0;
+        for (b = caller->start; b; b = b->link)
+            for (i = b->ins; i < &b->ins[b->nins]; i++) {
+                InlRec *o;
+                Con *c;
+
+                if (i->op != Ocall)
+                    continue;
+                o = 0;
+                if (rtype(i->arg[0]) == RCon) {
+                    c = &caller->con[i->arg[0].val];
+                    if (c->type == CAddr)
+                        o = inline_lookup(str(c->sym.id));
+                }
+                if (o && o->eligible)
+                    continue;           /* the small inliner takes it */
+                if (o && o->fn && o->fn != caller && o->is_static && !o->busy
+                    && !addrtaken(o->name)
+                    && (o->sites == 1
+                        || (o->hint && o->ins_count <= inline_max_big())))
+                    continue;
+                calls++;
+            }
+        if (calls)
+            return 0;
+    }
+    return 1;
+}
+
+/* Replace the call at blk->ins[call_idx] by the body of `callee`. Returns
+ * the block that holds what followed the call (0: declined, nothing done). */
+static Blk *
+splice_fn(Fn *caller, Blk *blk, int call_idx, Fn *callee)
+{
+    Ins call_ins, *i, *ni, *head, *tail, *iarg;
+    Blk *b, *c, *cont, *succ, **bmap, *last, *firstc;
+    Phi *p, *np, *retphi;
+    Ref *tmap, *retval;
+    Blk **retblk;
+    int npar, nargs, arg_start, nb, k, n, nret, nhead, ntail, seq;
+    uint t, a;
+
+    npar = 0;
+    for (i = callee->start->ins; i < &callee->start->ins[callee->start->nins]; i++)
+        if (ispar(i->op))
+            npar++;
+    nargs = 0;
+    for (k = call_idx - 1; k >= 0 && isarg(blk->ins[k].op); k--)
+        nargs++;
+    if (nargs != npar)
+        return 0;
+    arg_start = call_idx - npar;
+    iarg = &blk->ins[arg_start];
+    call_ins = blk->ins[call_idx];
+    seq = ++inl_seq;
+
+    /* fresh temporaries, one per callee temporary, of the same class */
+    tmap = emalloc(callee->ntmp * sizeof tmap[0]);
+    for (t = Tmp0; t < (uint)callee->ntmp; t++)
+        tmap[t] = newtmp("inl", callee->tmp[t].cls, caller);
+
+    /* the callee's blocks, cloned */
+    nb = 0;
+    for (b = callee->start; b; b = b->link)
+        b->visit = nb++;
+    bmap = emalloc(nb * sizeof bmap[0]);
+    for (b = callee->start; b; b = b->link) {
+        c = newblk();
+        snprintf(c->name, NString, "inl%d.%.40s", seq, b->name);
+        bmap[b->visit] = c;
+    }
+    cont = newblk();
+    snprintf(cont->name, NString, "inl%d.ret", seq);
+
+    retval = emalloc(nb * sizeof retval[0]);
+    retblk = emalloc(nb * sizeof retblk[0]);
+    nret = 0;
+    for (b = callee->start; b; b = b->link) {
+        c = bmap[b->visit];
+        /* phis */
+        for (p = b->phi; p; p = p->link) {
+            np = alloc(sizeof *np);
+            np->to = clone_ref(p->to, caller, callee, tmap);
+            np->cls = p->cls;
+            np->narg = p->narg;
+            np->arg = vnew(p->narg, sizeof np->arg[0], PFn);
+            np->blk = vnew(p->narg, sizeof np->blk[0], PFn);
+            for (a = 0; a < p->narg; a++) {
+                np->arg[a] = clone_ref(p->arg[a], caller, callee, tmap);
+                np->blk[a] = bmap[p->blk[a]->visit];
+            }
+            np->link = c->phi;
+            c->phi = np;
+        }
+        /* instructions; a parameter becomes its argument, extended as the
+         * parameter's type says (the caller's value is the full word) */
+        c->ins = vnew(b->nins + 1, sizeof(Ins), PFn);
+        n = 0;
+        k = 0;
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            ni = &c->ins[n++];
+            if (ispar(i->op)) {
+                *ni = (Ins){ .cls = i->cls, .to = tmap[i->to.val],
+                             .arg = { iarg[k].arg[0], R } };
+                switch (i->op) {
+                case Oparsb: ni->op = Oextsb; break;
+                case Oparub: ni->op = Oextub; break;
+                case Oparsh: ni->op = Oextsh; break;
+                case Oparuh: ni->op = Oextuh; break;
+                default:     ni->op = Ocopy;  break;
+                }
+                k++;
+                continue;
+            }
+            *ni = *i;
+            ni->to = clone_ref(i->to, caller, callee, tmap);
+            ni->arg[0] = clone_ref(i->arg[0], caller, callee, tmap);
+            ni->arg[1] = clone_ref(i->arg[1], caller, callee, tmap);
+        }
+        c->nins = n;
+        /* the way out */
+        if (isret(b->jmp.type)) {
+            if (b->jmp.type != Jret0) {
+                retval[nret] = clone_ref(b->jmp.arg, caller, callee, tmap);
+                if (isretbh(b->jmp.type)) {
+                    /* a byte or half returned: what the caller reads is the
+                     * value extended as the return type says */
+                    Ref ext = newtmp("inl", Kw, caller);
+
+                    ni = &c->ins[c->nins++];
+                    *ni = (Ins){ .cls = Kw, .to = ext, .arg = { retval[nret], R } };
+                    ni->op = b->jmp.type == Jretsb ? Oextsb
+                           : b->jmp.type == Jretub ? Oextub
+                           : b->jmp.type == Jretsh ? Oextsh : Oextuh;
+                    retval[nret] = ext;
+                }
+                retblk[nret] = c;
+                nret++;
+            }
+            c->jmp.type = Jjmp;
+            c->jmp.arg = R;
+            c->s1 = cont;
+            c->s2 = 0;
+        } else {
+            c->jmp.type = b->jmp.type;
+            c->jmp.arg = clone_ref(b->jmp.arg, caller, callee, tmap);
+            c->s1 = b->s1 ? bmap[b->s1->visit] : 0;
+            c->s2 = b->s2 ? bmap[b->s2->visit] : 0;
+        }
+    }
+
+    /* the second half of the caller's block */
+    ntail = (int)blk->nins - call_idx - 1;
+    tail = vnew(ntail + 1, sizeof(Ins), PFn);
+    n = 0;
+    retphi = 0;
+    if (!req(call_ins.to, R) && nret == 1) {
+        tail[n++] = (Ins){ .op = Ocopy, .cls = call_ins.cls, .to = call_ins.to,
+                           .arg = { retval[0], R } };
+    } else if (!req(call_ins.to, R) && nret > 1) {
+        retphi = alloc(sizeof *retphi);
+        retphi->to = call_ins.to;
+        retphi->cls = call_ins.cls;
+        retphi->narg = nret;
+        retphi->arg = vnew(nret, sizeof retphi->arg[0], PFn);
+        retphi->blk = vnew(nret, sizeof retphi->blk[0], PFn);
+        for (k = 0; k < nret; k++) {
+            retphi->arg[k] = retval[k];
+            retphi->blk[k] = retblk[k];
+        }
+        retphi->link = 0;
+    }
+    for (k = call_idx + 1; k < (int)blk->nins; k++)
+        tail[n++] = blk->ins[k];
+    cont->ins = tail;
+    cont->nins = n;
+    cont->phi = retphi;
+    cont->jmp = blk->jmp;
+    cont->s1 = blk->s1;
+    cont->s2 = blk->s2;
+    /* whoever the block jumped to now hears from its second half */
+    for (k = 0; k < 2; k++) {
+        succ = k ? cont->s2 : cont->s1;
+        if (!succ || (k && succ == cont->s1))
+            continue;
+        for (p = succ->phi; p; p = p->link)
+            for (a = 0; a < p->narg; a++)
+                if (p->blk[a] == blk)
+                    p->blk[a] = cont;
+    }
+
+    /* the first half: what came before the arguments, then into the clone */
+    nhead = arg_start;
+    head = vnew(nhead ? nhead : 1, sizeof(Ins), PFn);
+    for (k = 0; k < nhead; k++)
+        head[k] = blk->ins[k];
+    blk->ins = head;
+    blk->nins = nhead;
+    firstc = bmap[callee->start->visit];
+    blk->jmp.type = Jjmp;
+    blk->jmp.arg = R;
+    blk->s1 = firstc;
+    blk->s2 = 0;
+
+    /* layout: first half, the clone in the callee's order, second half */
+    last = blk;
+    cont->link = blk->link;
+    for (b = callee->start; b; b = b->link) {
+        last->link = bmap[b->visit];
+        last = bmap[b->visit];
+    }
+    last->link = cont;
+    caller->nblk += nb + 1;
+
+    free(tmap);
+    free(bmap);
+    free(retval);
+    free(retblk);
+    return cont;
+}
+
 /* Count indirect (RTmp arg) references to inline-marked functions in
  * the caller's IR. A function-pointer-store of $foo also counts: the
  * symbol's address is being taken, so the standalone is needed. */
@@ -415,7 +782,16 @@ inline_check(Fn *fn)
     char *trace;
     int idx, ok;
 
+    InlRec *self;
+    Blk *cont;
+
     trace = getenv("CC_TRACE_INLINE");
+    self = inline_lookup(fn->name);
+    if (self) {
+        if (self->checked || self->busy)
+            return;
+        self->busy = 1;
+    }
 
     /* Walk blocks. We restart per-block after each splice because
      * blk->ins is rewritten. */
@@ -428,6 +804,25 @@ restart:
             if (c->type != CAddr) continue;
             target = str(c->sym.id);
             rec = inline_lookup(target);
+            if (rec && !rec->eligible && auto_inline_ok(fn, rec)) {
+                /* its own calls first: the body cloned is the final one */
+                inline_check(rec->fn);
+                if (auto_inline_ok(fn, rec)
+                    && (cont = splice_fn(fn, b, idx, rec->fn)) != 0) {
+                    if (rec->hint) {
+                        /* inline_fully_consumed() decides on these */
+                        rec->n_direct++;
+                        rec->n_inlined++;
+                    } else
+                        rec->absorbed = 1;
+                    if (trace)
+                        fprintf(stderr, "[inline] %s absorbed %s (%s)\n",
+                                fn->name, rec->name,
+                                rec->sites == 1 ? "one call site" : "static inline");
+                    b = cont;
+                    goto restart;
+                }
+            }
             if (!rec || !rec->eligible || !rec->body) {
                 if (rec && rec->hint) {
                     /* Inline-marked but not eligible (or body missing
@@ -471,6 +866,58 @@ restart:
      * to an inline-marked fn that's NOT an Ocall target means the
      * symbol's address was taken; standalone must be emitted). */
     count_indirect_refs(fn);
+
+    /* a function left without a call is a leaf (parse.c decided on the
+     * calls it read) */
+    {
+        int calls = 0;
+
+        for (b = fn->start; b; b = b->link)
+            for (i = b->ins; i < &b->ins[b->nins]; i++)
+                if (i->op == Ocall)
+                    calls = 1;
+        if (!calls)
+            fn->leaf = 1;
+    }
+    if (self) {
+        self->busy = 0;
+        self->checked = 1;
+    }
+}
+
+/* Before any inlining: how many direct calls each function has in the
+ * module. */
+void
+inline_count_sites(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    Con *c;
+    InlRec *rec;
+
+    for (b = fn->start; b; b = b->link)
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (i->op != Ocall || rtype(i->arg[0]) != RCon)
+                continue;
+            c = &fn->con[i->arg[0].val];
+            if (c->type != CAddr)
+                continue;
+            rec = inline_lookup(str(c->sym.id));
+            if (rec)
+                rec->sites++;
+        }
+}
+
+/* Its one call site took its body: there is nothing left to emit. */
+int
+inline_absorbed(const char *name)
+{
+    InlRec *r;
+
+    for (r = inl_head; r; r = r->next)
+        if (strcmp(r->name, name) == 0)
+            return r->absorbed;
+    return 0;
 }
 
 /* Record an indirect (data-section) reference to a symbol. Called from

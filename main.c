@@ -373,6 +373,14 @@ emit_collected(FILE *out)
 {
 	CollectedFn *c;
 
+	/* what whole-function inlining asks first: how many direct calls
+	 * each function has, and whose address is taken (the scan below is
+	 * run again after inlining; a clone takes no new address) */
+	for (c = collected_head; c; c = c->next) {
+		inline_count_sites(c->fn);
+		addrtaken_scan(c->fn);
+	}
+
 	/* Pass 1.b: module-wide inline_check phase */
 	for (c = collected_head; c; c = c->next)
 		inline_check(c->fn);
@@ -386,6 +394,8 @@ emit_collected(FILE *out)
 	for (c = collected_head; c; c = c->next) {
 		Fn *fn = c->fn;
 		if (fn->lnk.inline_hint && inline_fully_consumed(fn->name))
+			continue;
+		if (inline_absorbed(fn->name))
 			continue;
 		finalize_and_emit(fn, out);
 	}
