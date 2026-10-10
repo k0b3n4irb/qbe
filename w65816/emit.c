@@ -7039,6 +7039,143 @@ peephole(char **ln, int nl)
     return removed;
 }
 
+/* Is the accumulator dead after line i? Yes when the next instruction
+ * loads it: directly, past labels, or at the target of a `jmp @name`. */
+static int
+pp_a_dead_after(char **ln, int nl, int i)
+{
+    int k, t;
+    size_t tl;
+
+    for (k = pp_next(ln, nl, i); k < nl && ln[k][0] == '@'; k = pp_next(ln, nl, k))
+        ;
+    if (k >= nl)
+        return 0;
+    if (pp_is(ln[k], "lda"))
+        return 1;
+    if (strncmp(ln[k], "\tjmp @", 6) != 0)
+        return 0;
+    tl = strlen(ln[k] + 5);
+    for (t = 0; t < nl; t++)
+        if (ln[t] && strncmp(ln[t], ln[k] + 5, tl) == 0 && strcmp(ln[t] + tl, ":") == 0)
+            break;
+    if (t == nl)
+        return 0;
+    for (k = pp_next(ln, nl, t); k < nl && ln[k][0] == '@'; k = pp_next(ln, nl, k))
+        ;
+    return k < nl && pp_is(ln[k], "lda");
+}
+
+/* Can `stz` write this operand? Direct page or absolute, plain or ,x. */
+static int
+pp_stz_operand(const char *l)
+{
+    const char *op = pp_operand(l);
+
+    if (strncmp(l, "\tsta.b ", 7) != 0 && strncmp(l, "\tsta.w ", 7) != 0)
+        return 0;
+    return !strchr(op, '[') && !strchr(op, '(') && !strstr(op, ",s") && !strstr(op, ",y");
+}
+
+static char *
+pp_copy(const char *l)
+{
+    char *nw = emalloc(strlen(l) + 1);
+
+    strcpy(nw, l);
+    return nw;
+}
+
+/* Four rewrites into forms the emitter does not write for a frame slot
+ * (ldx from memory, stz, inc and dec of memory). They run ONCE, after peephole() has
+ * settled: its rules look for `lda` / `sta` / `tax` and would take these
+ * forms for something unknown — the first version ran them inside the
+ * loop, and a `stz` on a slot that was written and never read hid it from
+ * the dead-store rules (a real game's logic went 2 % slower with fewer
+ * instructions). 2026-10-10, issue #166.
+ *
+ *   lda.w #K / sta ... / lda.w #K     the second load goes
+ *   lda.w #0 / sta M ... / (A dead)   stz M ...
+ *   lda.b S / inc a / sta.b S / (A dead)   inc.b S      (dec likewise)
+ *   lda.b S / tax / lda ...           ldx.b S / lda ...
+ *
+ * S is a direct-page slot (ldx, inc have no stack-relative form). All four
+ * need a 16-bit accumulator: the emitter opens an 8-bit section with
+ * `sep #$20` and closes it with `rep #$20` within one straight line of
+ * code, never across a label or a branch, so the width is known line by
+ * line. X is always 16 bits wide in compiled code. QBE_NO_PEEP_LATE=1
+ * turns the pass off. */
+static int
+peephole_late(char **ln, int nl)
+{
+    int i, j, k, last, removed = 0, a8 = 0;
+    const char *op;
+
+    for (i = 0; i < nl; i++) {
+        if (!ln[i])
+            continue;
+        if (strncmp(ln[i], "\tsep #$20", 9) == 0 || strncmp(ln[i], "\tsep #$30", 9) == 0)
+            a8 = 1;
+        else if (strncmp(ln[i], "\trep #$20", 9) == 0 || strncmp(ln[i], "\trep #$30", 9) == 0)
+            a8 = 0;
+        if (a8 || !pp_is(ln[i], "lda"))
+            continue;
+        op = pp_operand(ln[i]);
+        j = pp_next(ln, nl, i);
+        if (j >= nl)
+            break;
+
+        if (strncmp(ln[i], "\tlda.w #", 8) == 0) {
+            for (k = j; k < nl && pp_is(ln[k], "sta"); k = pp_next(ln, nl, k))
+                ;
+            if (k < nl && k != j && strcmp(ln[k], ln[i]) == 0) {
+                ln[k] = 0;
+                removed++;
+            }
+        }
+        if (strcmp(ln[i], "\tlda.w #0") == 0 && pp_stz_operand(ln[j])) {
+            last = j;
+            for (k = j; k < nl && pp_stz_operand(ln[k]); k = pp_next(ln, nl, k))
+                last = k;
+            if ((k >= nl || !pp_is(ln[k], "sta")) && pp_a_dead_after(ln, nl, last)) {
+                for (k = j; k <= last; k++)
+                    if (ln[k]) {
+                        ln[k] = pp_copy(ln[k]);
+                        ln[k][3] = 'z';
+                    }
+                ln[i] = 0;
+                removed++;
+            }
+            continue;
+        }
+        if (strncmp(ln[i], "\tlda.b tcc__lf+", 15) != 0 || !pp_slot(op))
+            continue;
+        if (strcmp(ln[j], "\tinc a") == 0 || strcmp(ln[j], "\tdec a") == 0) {
+            k = pp_next(ln, nl, j);
+            if (k < nl && strncmp(ln[k], "\tsta.b ", 7) == 0
+                && strcmp(pp_operand(ln[k]), op) == 0 && pp_a_dead_after(ln, nl, k)) {
+                char *nw = pp_copy(ln[i]);
+                memcpy(nw + 1, ln[j] + 1, 3);
+                ln[i] = nw;
+                ln[j] = ln[k] = 0;
+                removed += 2;
+            }
+            continue;
+        }
+        if (strcmp(ln[j], "\ttax") == 0) {
+            k = pp_next(ln, nl, j);
+            if (k < nl && pp_is(ln[k], "lda")) {
+                char *nw = pp_copy(ln[i]);
+                memcpy(nw + 1, "ldx", 3);
+                ln[i] = nw;
+                ln[j] = 0;
+                removed++;
+            }
+        }
+    }
+    return removed;
+}
+
 static void
 relax_branches(FILE *in, FILE *out)
 {
@@ -7071,7 +7208,8 @@ relax_branches(FILE *in, FILE *out)
             break;
         *p++ = 0;
     }
-    if (!getenv("QBE_NO_PEEPHOLE") && peephole(ln, nl)) {
+    if (!getenv("QBE_NO_PEEPHOLE")
+        && (peephole(ln, nl) + (getenv("QBE_NO_PEEP_LATE") ? 0 : peephole_late(ln, nl)))) {
         /* close the gaps: the branch pass below looks at adjacent lines */
         for (i = k = 0; i < nl; i++)
             if (ln[i])
