@@ -6945,6 +6945,156 @@ peephole_wide(char **ln, int nl)
     return removed;
 }
 
+/* Dead stores to direct-page slots, across branches (2026-10-10).
+ *
+ * The rules above see a straight line of code, or a slot that nothing in
+ * the whole function reads. Neither removes `sta.b tcc__lf+N` when the slot
+ * is read somewhere else in the function but not after THIS store — and in
+ * a large function every slot is shared by several temporaries, so that is
+ * the common case: 172 of the 902 slot stores of a real game's logic, and
+ * one per iteration of a 16,384-turn loop that an example's boot ran 5 %
+ * slower for once it was inlined into main.
+ *
+ * Liveness of the sixteen words of tcc__lf over the function's text, one
+ * bit a word: a line's successors are the next line, and the target of its
+ * branch (`@name`, or the next line that starts with the same run of `+`).
+ * Nothing is live at a return: the block is scratch, by the ABI. A call
+ * neither reads nor keeps it for us (a value that must survive a call is on
+ * the stack), and is taken as doing nothing — the careful side. A store
+ * with an 8-bit accumulator writes half a word: neither a read nor a kill.
+ *
+ * Anything this does not recognise leaves the function alone: a slot in a
+ * shape other than `tcc__lf+N` alone (indexed, indirect), an odd N, a jump
+ * that is not to a local label, a `-` label. Returns the number of lines
+ * removed. QBE_NO_PEEP_FLOW=1 turns it off. */
+static int
+pp_lf_bit(const char *op, int *plain)
+{
+    const char *p = strstr(op, "tcc__lf");
+    char *end;
+    long n;
+
+    *plain = 0;
+    if (!p)
+        return 0;
+    if (p[7] != '+')
+        return -1;
+    n = strtol(p + 8, &end, 10);
+    if (n < 0 || n >= 2 * DPF_WORDS || (n & 1))
+        return -1;
+    *plain = p == op && *end == 0;
+    return 1 << (n / 2);
+}
+
+static int
+peephole_flow(char **ln, int nl)
+{
+    static const char *cond[] = { "bcc", "bcs", "beq", "bne", "bmi", "bpl", "bvc", "bvs", 0 };
+    int *tgt, *use, *def, *out, *fall, i, k, m, a8, plain, changed, removed = 0;
+    const char *l, *op;
+    size_t plus;
+
+    if (getenv("QBE_NO_PEEP_FLOW") || nl == 0)
+        return 0;
+    tgt = emalloc(5 * nl * sizeof *tgt);
+    use = tgt + nl;
+    def = use + nl;
+    out = def + nl;
+    fall = out + nl;
+    a8 = 0;
+    for (i = 0; i < nl; i++) {
+        tgt[i] = -1;
+        use[i] = def[i] = out[i] = 0;
+        fall[i] = 1;
+        if (!ln[i])
+            continue;
+        l = ln[i];
+        if (l[0] == '-')
+            goto leave;
+        /* a `+` label may carry an instruction on its line */
+        plus = strspn(l, "+");
+        if (plus) {
+            if (l[plus] == 0)
+                continue;
+            if (l[plus] != '\t')
+                goto leave;
+            l += plus;
+        }
+        if (l[0] != '\t')
+            continue;                   /* a label */
+        if (strncmp(l, "\tsep #$20", 9) == 0 || strncmp(l, "\tsep #$30", 9) == 0)
+            a8 = 1;
+        else if (strncmp(l, "\trep #$20", 9) == 0 || strncmp(l, "\trep #$30", 9) == 0)
+            a8 = 0;
+        op = pp_operand(l);
+        if (pp_is(l, "rtl") || pp_is(l, "rts") || pp_is(l, "rti")) {
+            fall[i] = 0;
+            continue;
+        }
+        m = 0;
+        for (k = 0; cond[k]; k++)
+            if (pp_is(l, cond[k]))
+                m = 1;
+        if (pp_is(l, "jmp") || pp_is(l, "bra") || pp_is(l, "brl")) {
+            m = 1;
+            fall[i] = 0;
+        } else if (pp_is(l, "jml"))
+            goto leave;
+        if (m) {
+            if (op[0] == '@') {
+                size_t tl = strlen(op);
+                for (k = 0; k < nl; k++)
+                    if (ln[k] && strncmp(ln[k], op, tl) == 0 && strcmp(ln[k] + tl, ":") == 0)
+                        break;
+            } else if (op[0] == '+' && strspn(op, "+") == strlen(op)) {
+                size_t tl = strlen(op);
+                for (k = i + 1; k < nl; k++)
+                    if (ln[k] && strspn(ln[k], "+") == tl)
+                        break;
+            } else
+                goto leave;
+            if (k >= nl)
+                goto leave;
+            tgt[i] = k;
+            continue;
+        }
+        m = pp_lf_bit(op, &plain);
+        if (m < 0)
+            goto leave;
+        if (!m)
+            continue;
+        if (!plain)
+            goto leave;
+        if ((pp_is(l, "sta") || pp_is(l, "stz")) && l[4] == '.' && l[5] == 'b') {
+            if (!a8)
+                def[i] = m;
+        } else
+            use[i] = m;
+    }
+    do {
+        changed = 0;
+        for (i = nl - 1; i >= 0; i--) {
+            m = 0;
+            if (fall[i] && i + 1 < nl)
+                m |= (out[i + 1] & ~def[i + 1]) | use[i + 1];
+            if (tgt[i] >= 0)
+                m |= (out[tgt[i]] & ~def[tgt[i]]) | use[tgt[i]];
+            if (m != out[i]) {
+                out[i] = m;
+                changed = 1;
+            }
+        }
+    } while (changed);
+    for (i = 0; i < nl; i++)
+        if (ln[i] && def[i] && !(def[i] & out[i]) && ln[i][0] == '\t') {
+            ln[i] = 0;
+            removed++;
+        }
+leave:
+    free(tgt);
+    return removed;
+}
+
 static int
 peephole(char **ln, int nl)
 {
@@ -6957,6 +7107,7 @@ peephole(char **ln, int nl)
 
         if (!getenv("QBE_NO_PEEP_WIDE"))
             removed += peephole_wide(ln, nl);
+        removed += peephole_flow(ln, nl);
 
         xs[0] = 0;
         for (i = 0; i < nl; i++) {
