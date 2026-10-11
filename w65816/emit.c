@@ -6392,12 +6392,45 @@ static Ref fork_ref;
 static void branch_fork(void) { fork_valid = acache_valid; fork_ref = acache_ref; }
 static void branch_join(void) { acache_valid = fork_valid; acache_ref = fork_ref; }
 
+/* Loop rotation (2026-10-11). A block that ends in `jmp @T`, where T is
+ * nothing but a compare and the branch on it (the condition of a `for` or a
+ * `while`), emits T's compare and branch itself instead of jumping to them:
+ * one `jmp` less every turn of the loop, for a copy of the test. T's phi
+ * moves belong to its edges and are emitted from the copy as from T.
+ * rot_next is the block laid out after the one that carries the copy: the
+ * branch falls through to THAT block, not to T's own neighbour.
+ * QBE_NO_ROTATE=1 turns it off. */
+static Blk *rot_next;
+static int rot_on;
+
+static int
+rotatable(Blk *t)
+{
+    Ins *i;
+    int cidx;
+
+    if (t->jmp.type != Jjnz || t->nins != 1)
+        return 0;
+    i = t->ins;
+    if (!is_cmp_op(i->op)
+        || (is_kl_cmp(i->op) && i->op != Oceql && i->op != Ocnel)
+        || rtype(i->to) != RTmp || i->to.val < Tmp0
+        || !req(i->to, t->jmp.arg))
+        return 0;
+    cidx = i->to.val - Tmp0;
+    if (cidx < 0 || cidx >= MAX_ALIAS_TEMPS || temp_use_count[cidx] != 0)
+        return 0;
+    return !getenv("QBE_NO_ROTATE");
+}
+
 /*
  * Emit jump/return
  */
 static void
 emitjmp(Blk *b, Fn *fn)
 {
+    Blk *next = rot_on ? rot_next : b->link;
+
     switch (b->jmp.type) {
     case Jret0:
     case Jretw:
@@ -6431,8 +6464,25 @@ emitjmp(Blk *b, Fn *fn)
         break;
     case Jjmp:
         emitphimoves(b, b->s1, fn);
-        if (b->s1 != b->link)
-            fprintf(outf, "\tjmp @%s\n", b->s1->name);
+        if (b->s1 != b->link) {
+            Blk *t = b->s1;
+            if (!rot_on && rotatable(t)) {
+                emit_rep20();
+                /* the copy is read as at T's entry: the phi moves just
+                 * emitted are T's inputs, and one that found its value
+                 * already in place wrote nothing the ownership check saw */
+                slot_owner_reset();
+                fused_cmp = 1;
+                fused_cmp_op = t->ins->op;
+                fused_cmp_r0 = t->ins->arg[0];
+                fused_cmp_r1 = t->ins->arg[1];
+                rot_next = b->link;
+                rot_on = 1;
+                emitjmp(t, fn);
+                rot_on = 0;
+            } else
+                fprintf(outf, "\tjmp @%s\n", t->name);
+        }
         break;
     case Jjnz:
         if (fused_cmp) {
@@ -6470,7 +6520,7 @@ emitjmp(Blk *b, Fn *fn)
                 emitop2("cmp", fused_cmp_r1, fn);
             }
             acache_invalidate();
-            if (b->s1 == b->link) {
+            if (b->s1 == next) {
                 /* True falls through: skip false path on TRUE */
                 branch_fork();
                 fprintf(outf, "\t%s +\n", bt);
@@ -6479,7 +6529,7 @@ emitjmp(Blk *b, Fn *fn)
                 fprintf(outf, "+\n");
                 branch_join();
                 emitphimoves(b, b->s1, fn);
-            } else if (b->s2 == b->link) {
+            } else if (b->s2 == next) {
                 /* False falls through: skip true path on FALSE */
                 branch_fork();
                 fprintf(outf, "\t%s +\n", bf);
@@ -7346,6 +7396,158 @@ peephole_late(char **ln, int nl)
     return removed;
 }
 
+/* A load at a block's entry that every way in makes redundant (2026-10-11).
+ *
+ *   @for_body:                 A block label followed by `lda S`, S a frame
+ *       lda.b tcc__lf+0        slot, when every way into the block — falling
+ *                              in from above, and each `jmp @for_body` —
+ * comes straight from a `lda S` or a `sta S` with nothing in between but
+ * compares and conditional branches, which leave A and S alone: the body of
+ * a loop whose condition has just compared its index, the commonest block of
+ * all. The emitter's A-cache cannot know: it is dropped at every label.
+ *
+ * It runs LAST and once, on purpose: it removes an instruction another rule
+ * may have counted on for N and Z (peephole_wide drops `cmp.w #0` after a
+ * load), so the load stays unless the next thing that looks at the flags
+ * comes after an instruction that sets them. Walking back from an entry, a
+ * `+` is entered from the one branch that names it; two branches to the same
+ * `+`, any other label, any other instruction, and the load stays.
+ * QBE_NO_PEEP_ENTRY=1 turns it off. */
+static int
+pp_cond_branch(const char *l)
+{
+    static const char *br[] = { "bcc", "bcs", "beq", "bne", "bmi", "bpl", "bvc", "bvs", 0 };
+    int k;
+
+    for (k = 0; br[k]; k++)
+        if (pp_is(l, br[k]))
+            return 1;
+    return 0;
+}
+
+/* Walking up from line i (not included): is A equal to slot `op` there? */
+static int
+pp_a_is_slot_before(char **ln, int i, const char *op)
+{
+    int k, n;
+    size_t len;
+    const char *o;
+
+    for (i--; i >= 0; i--) {
+        if (!ln[i])
+            continue;
+        if (strcmp(ln[i], "+") == 0) {
+            /* entered from the branch(es) to this `+` only: the line above
+             * it must not fall in, and exactly one branch may name it */
+            for (k = i - 1; k >= 0 && !ln[k]; k--)
+                ;
+            if (k < 0 || !pp_is(ln[k], "jmp"))
+                return 0;
+            n = 0;
+            for (k = i - 1; k >= 0; k--) {
+                if (!ln[k])
+                    continue;
+                if (ln[k][0] != '\t')
+                    break;                      /* any label ends the search */
+                len = strlen(ln[k]);
+                if (len >= 2 && strcmp(ln[k] + len - 2, " +") == 0) {
+                    if (!pp_cond_branch(ln[k]) || n++)
+                        return 0;
+                    i = k;                      /* go on from that branch */
+                }
+            }
+            if (n != 1)
+                return 0;
+            continue;                           /* i is the branch: i-- next */
+        }
+        if (pp_is(ln[i], "cmp") || pp_cond_branch(ln[i]))
+            continue;
+        o = pp_operand(ln[i]);
+        return (pp_is(ln[i], "lda") || pp_is(ln[i], "sta")) && o && strcmp(o, op) == 0;
+    }
+    return 0;
+}
+
+static int
+peephole_entry(char **ln, int nl)
+{
+    static const char *through[] = { "sta", "stz", "stx", "sty", "clc", "sec",
+        "pha", "phx", "phy", "pea", 0 };
+    static const char *setsnz[] = { "lda", "ldx", "ldy", "and", "ora", "eor",
+        "adc", "sbc", "cmp", "cpx", "cpy", "asl", "lsr", "rol", "ror", "inc",
+        "dec", "inx", "iny", "dex", "dey", "tax", "tay", "txa", "tya", "pla",
+        "plx", "ply", "bit", 0 };
+    int i, j, k, m, removed = 0, ok, ways;
+    const char *op, *q;
+    size_t tl;
+
+    if (getenv("QBE_NO_PEEP_ENTRY"))
+        return 0;
+    for (i = 0; i + 1 < nl; i++) {
+        if (!ln[i] || ln[i][0] != '@')
+            continue;
+        tl = strlen(ln[i]);
+        if (tl < 2 || ln[i][tl - 1] != ':')
+            continue;
+        tl--;                                   /* "@name" */
+        j = pp_next(ln, nl, i);
+        if (j >= nl || !pp_is(ln[j], "lda"))
+            continue;
+        op = pp_operand(ln[j]);
+        if (!pp_slot(op))
+            continue;
+        /* the flags of the load: nobody may read them */
+        ok = 0;
+        for (k = pp_next(ln, nl, j); k < nl; k = pp_next(ln, nl, k)) {
+            for (m = 0; through[m]; m++)
+                if (pp_is(ln[k], through[m]))
+                    break;
+            if (through[m])
+                continue;
+            for (m = 0; setsnz[m]; m++)
+                if (pp_is(ln[k], setsnz[m]))
+                    ok = 1;
+            break;
+        }
+        if (!ok)
+            continue;
+        /* every way in */
+        ways = 0;
+        for (k = i - 1; k >= 0 && !ln[k]; k--)
+            ;
+        if (k < 0)
+            continue;
+        if (!(pp_is(ln[k], "jmp") || pp_is(ln[k], "rtl") || pp_is(ln[k], "rts")
+              || pp_is(ln[k], "rti") || pp_is(ln[k], "jml") || pp_is(ln[k], "bra")
+              || pp_is(ln[k], "brl"))) {
+            if (!pp_a_is_slot_before(ln, i, op))
+                continue;
+            ways++;
+        }
+        for (k = 0; k < nl && ok; k++) {
+            if (!ln[k] || k == i)
+                continue;
+            for (q = strstr(ln[k], "@"); q; q = strstr(q + 1, "@")) {
+                if (strncmp(q, ln[i], tl) != 0)
+                    continue;
+                if (q[tl] && q[tl] != ' ' && q[tl] != ',' && q[tl] != ':')
+                    continue;                   /* a longer name */
+                if (!pp_is(ln[k], "jmp") || q != ln[k] + 5 || q[tl] != 0
+                    || !pp_a_is_slot_before(ln, k, op))
+                    ok = 0;
+                else
+                    ways++;
+                break;
+            }
+        }
+        if (!ok || !ways)
+            continue;
+        ln[j] = 0;
+        removed++;
+    }
+    return removed;
+}
+
 static void
 relax_branches(FILE *in, FILE *out)
 {
@@ -7381,6 +7583,12 @@ relax_branches(FILE *in, FILE *out)
     if (!getenv("QBE_NO_PEEPHOLE")
         && (peephole(ln, nl) + (getenv("QBE_NO_PEEP_LATE") ? 0 : peephole_late(ln, nl)))) {
         /* close the gaps: the branch pass below looks at adjacent lines */
+        for (i = k = 0; i < nl; i++)
+            if (ln[i])
+                ln[k++] = ln[i];
+        nl = k;
+    }
+    if (!getenv("QBE_NO_PEEPHOLE") && peephole_entry(ln, nl)) {
         for (i = k = 0; i < nl; i++)
             if (ln[i])
                 ln[k++] = ln[i];
