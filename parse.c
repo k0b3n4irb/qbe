@@ -183,13 +183,23 @@ static int nblk;
 static int rcls;
 static uint ntyp;
 
+/* The driver (cc65816) runs qbe on a temporary IR file and names the C
+ * source in QBE_SOURCE_NAME: a message then says "qbe:main.c (IR line
+ * 5803): ..." instead of "qbe:/tmp/cc65816_ir.WTG3I6:5803: ...", which
+ * nobody can open (the IR line stays: CC65816_KEEP_IR saves the file it
+ * counts in). (2026-10-12) */
 void
 err(char *s, ...)
 {
 	va_list ap;
+	char *src;
 
 	va_start(ap, s);
-	fprintf(stderr, "qbe:%s:%d: ", inpath, lnum);
+	src = getenv("QBE_SOURCE_NAME");
+	if (src && *src)
+		fprintf(stderr, "qbe:%s (IR line %d): ", src, lnum);
+	else
+		fprintf(stderr, "qbe:%s:%d: ", inpath, lnum);
 	vfprintf(stderr, s, ap);
 	fprintf(stderr, "\n");
 	va_end(ap);
@@ -330,8 +340,11 @@ Alpha:
 		err("invalid character %c (%d)", c, c);
 	i = 0;
 	do {
-		if (i >= NString-1)
-			err("identifier too long");
+		if (i >= NString-1) {
+			tok[i] = 0;
+			err("identifier too long: %d characters at most, "
+			    "starting %s", NString-1, tok);
+		}
 		tok[i++] = c;
 		c = fgetc(inf);
 	} while (isalpha(c) || c == '$' || c == '.' || c == '_' || isdigit(c));
