@@ -2123,6 +2123,12 @@ consumes_r0_via_emitload(Ins *i, Fn *fn)
             return is_inline_mul_const(c->bits.i);
         }
         return 0;
+    /* A 32-bit divide or remainder pushes r1 first, then reads r0 from its
+     * slot. With a Kw temp as r0 — the condition gvn puts in place of
+     * `c ? 1L : 0L` — the store was skipped and the read stopped the build
+     * (`(!g ? 1L : 0L) % d`; difftest_stmt seed 364296, 2026-10-11). */
+    case Odiv: case Oudiv: case Orem: case Ourem:
+        return i->cls != Kl;
     default:
         return 1;
     }
