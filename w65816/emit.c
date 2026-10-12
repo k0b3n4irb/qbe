@@ -7474,6 +7474,577 @@ pp_a_is_slot_before(char **ln, int i, const char *op)
     return 0;
 }
 
+/* The counter of a rotated loop kept in X (stage 2, T3, 2026-10-12). A text
+ * rule of the peephole stage, run once after peephole_late.
+ *
+ * The shape the emitter writes for `for (j = c0; j < N; j += c)` whose body
+ * indexes with j — after ivar, j is the byte offset:
+ *
+ *     lda.b S          \
+ *     cmp.w #N          | the header test on the way in
+ *     bcs @join        /
+ * @body:
+ *     ldx.b S          (or `lda.b S / tax`)   X := j
+ *     ... body: sym,x accesses, nothing that writes X or S ...
+ * [@cont:]
+ *     lda.b S          \
+ *     clc               |
+ *     adc.w #c          | the step (or `inc a` for c = 1)
+ *     sta.b S           |
+ *     cmp.w #N          | the test at the bottom
+ *     bcc @body        /
+ *
+ * becomes
+ *
+ *     ldx.b S
+ *     cpx.w #N
+ *     bcs @join
+ * @body:
+ *     ... body, a `lda.b S` read as `txa` ...
+ * [@cont:]
+ *     inx (c times, c <= 2; else txa / clc / adc.w #c / tax)
+ *     cpx.w #N
+ *     bcc @body
+ *
+ * when, in the region from @body to the bcc: no line writes X (pp_writes_x)
+ * but the top `ldx`/`tax`; no line writes S or its high byte; every read of
+ * S is a `lda.b S`; no call (jsl/jsr), no mvn/mvp; every label of the
+ * region is branched to from the region only; S is a direct-page slot
+ * (tcc__lf+N) mentioned nowhere else in the function but the stores that
+ * precede the header test (the counter dies with the loop, which is what
+ * ivar leaves); and the body's first touch of A, before any branch, is a
+ * write (lda, txa, tya, pla): A is not j at @body any more.
+ *
+ * A second rule hoists the one `lda.w #imm` of a body that writes A nowhere
+ * else, into the slot the deleted `ldx.b S` leaves (the label moves down
+ * one line): `lda.w #0` before @body, `sta.l far,x / inx / inx / cpx / bcc`
+ * inside — the hand-written form, 15 CPU cycles a word for farClear (31
+ * before T2, 18 after this rule alone).
+ *
+ * QBE_NO_PEEP_LOOPX=1 turns it off. */
+
+static int
+pp_reads_a(const char *l)
+{
+    static const char *ra[] = { "sta", "adc", "sbc", "and", "ora", "eor", "cmp",
+        "bit", "tax", "tay", "pha", "xba", "tcd", "tcs", "tsb", "trb", 0 };
+    int k;
+
+    for (k = 0; ra[k]; k++)
+        if (pp_is(l, ra[k]))
+            return 1;
+    return strcmp(l, "\tasl a") == 0 || strcmp(l, "\tlsr a") == 0
+        || strcmp(l, "\tinc a") == 0 || strcmp(l, "\tdec a") == 0
+        || strcmp(l, "\trol a") == 0 || strcmp(l, "\tror a") == 0;
+}
+
+static int
+pp_writes_a(const char *l)
+{
+    static const char *wa[] = { "lda", "txa", "tya", "pla", "adc", "sbc", "and",
+        "ora", "eor", "xba", "tdc", "tsc", 0 };
+    int k;
+
+    for (k = 0; wa[k]; k++)
+        if (pp_is(l, wa[k]))
+            return 1;
+    return strcmp(l, "\tasl a") == 0 || strcmp(l, "\tlsr a") == 0
+        || strcmp(l, "\tinc a") == 0 || strcmp(l, "\tdec a") == 0
+        || strcmp(l, "\trol a") == 0 || strcmp(l, "\tror a") == 0;
+}
+
+/* Does the operand mention the slot S (tcc__lf+N) or its high byte? */
+static int
+pp_mentions_slot(const char *op, const char *s, const char *s1)
+{
+    return op && (strcmp(op, s) == 0 || strcmp(op, s1) == 0);
+}
+
+/* Is the direct-page slot S (or its high byte S1) live on entry to line
+ * `at`? Backward liveness of that one slot over the function's text, with
+ * the same reading of labels and branches as peephole_flow: a 16-bit store
+ * to S defines it, any other mention of S or S1 uses it. -1 when the text
+ * has a form the reading does not cover (then the caller gives up). */
+static int
+pp_slot_live_at(char **ln, int nl, const char *s, const char *s1, int at)
+{
+    static const char *cond[] = { "bcc", "bcs", "beq", "bne", "bmi", "bpl", "bvc", "bvs", 0 };
+    int *tgt, *fall, *use, *def, *in, i, k, m, a8, changed, res;
+    const char *l, *op;
+    size_t plus;
+
+    tgt = emalloc(5 * nl * sizeof *tgt);
+    fall = tgt + nl;
+    use = fall + nl;
+    def = use + nl;
+    in = def + nl;
+    a8 = 0;
+    res = -1;
+    for (i = 0; i < nl; i++) {
+        tgt[i] = -1;
+        use[i] = def[i] = in[i] = 0;
+        fall[i] = 1;
+        if (!ln[i])
+            continue;
+        l = ln[i];
+        if (l[0] == '-')
+            goto leave;
+        plus = strspn(l, "+");
+        if (plus) {
+            if (l[plus] == 0)
+                continue;
+            if (l[plus] != '\t')
+                goto leave;
+            l += plus;
+        }
+        if (l[0] != '\t')
+            continue;
+        if (strncmp(l, "\tsep #$20", 9) == 0 || strncmp(l, "\tsep #$30", 9) == 0)
+            a8 = 1;
+        else if (strncmp(l, "\trep #$20", 9) == 0 || strncmp(l, "\trep #$30", 9) == 0)
+            a8 = 0;
+        op = pp_operand(l);
+        if (pp_is(l, "rtl") || pp_is(l, "rts") || pp_is(l, "rti")) {
+            fall[i] = 0;
+            continue;
+        }
+        m = 0;
+        for (k = 0; cond[k]; k++)
+            if (pp_is(l, cond[k]))
+                m = 1;
+        if (pp_is(l, "jmp") || pp_is(l, "bra") || pp_is(l, "brl")) {
+            m = 1;
+            fall[i] = 0;
+        } else if (pp_is(l, "jml"))
+            goto leave;
+        else if (pp_is(l, "jsl") || pp_is(l, "jsr")) {
+            /* A runtime helper (__mul16, tcc_mul32, the divisions...) is
+             * not a call to the slot allocation and keeps the direct page:
+             * the slot lives across it (difftest_stmt seed 380493: a
+             * counter read back after twelve tcc_mul32). Any other call:
+             * a direct-page temp never crosses one (color_slots,
+             * 2026-10-10), so it kills the slot. */
+            if (strncmp(op, "__", 2) == 0 || strncmp(op, "tcc_", 4) == 0)
+                continue;
+            def[i] = 3;
+            continue;
+        }
+        if (m) {
+            if (op[0] == '@') {
+                size_t tl = strlen(op);
+                for (k = 0; k < nl; k++)
+                    if (ln[k] && strncmp(ln[k], op, tl) == 0 && strcmp(ln[k] + tl, ":") == 0)
+                        break;
+            } else if (op[0] == '+' && strspn(op, "+") == strlen(op)) {
+                size_t tl = strlen(op);
+                for (k = i + 1; k < nl; k++)
+                    if (ln[k] && strspn(ln[k], "+") == tl)
+                        break;
+            } else
+                goto leave;
+            if (k >= nl)
+                goto leave;
+            tgt[i] = k;
+            continue;
+        }
+        if (!op)
+            continue;
+        /* two bits: 1 the low byte, 2 the high byte of the slot. A store
+         * defines what it writes, a read uses what it reads; `.b` is the
+         * addressing mode, the width is the accumulator's. A leaf's page
+         * is private: nothing reaches it through a pointer. */
+        if (strcmp(op, s) == 0) {
+            if (pp_is(l, "sta") || pp_is(l, "stz"))
+                def[i] = a8 ? 1 : 3;
+            else
+                use[i] = a8 ? 1 : 3;
+        } else if (strcmp(op, s1) == 0) {
+            if (pp_is(l, "sta") || pp_is(l, "stz"))
+                def[i] = a8 ? 2 : 2;    /* a 16-bit store at S+1 writes the high byte too */
+            else
+                use[i] = 2;
+        }
+    }
+    do {
+        changed = 0;
+        for (i = nl - 1; i >= 0; i--) {
+            int out = 0;
+            if (fall[i] && i + 1 < nl)
+                out |= in[i + 1];
+            if (tgt[i] >= 0)
+                out |= in[tgt[i]];
+            m = use[i] | (out & ~def[i]);
+            if (m != in[i]) {
+                in[i] = m;
+                changed = 1;
+            }
+        }
+    } while (changed);
+    res = at < nl ? in[at] : 0;
+leave:
+    free(tgt);
+    return res;
+}
+
+static int
+peephole_loop_x(char **ln, int nl)
+{
+    int i, j, k, e, b, t, c, found = 0, bodytop, reads, stepend, cmpline, ldaline;
+    int conv_b[64], conv_e[64], nconv;
+    const char *why;
+#define WHY(r) do { if (why) fprintf(stderr, "loopx: %s: %s\n", s, r); } while (0)
+    const char *op, *s, *lbl;
+    char s1[64], bound[48], step[48];
+    size_t tl;
+
+    if (getenv("QBE_NO_PEEP_LOOPX"))
+        return 0;
+    why = getenv("QBE_PEEP_LOOPX_WHY");
+    if (getenv("QBE_PEEP_LOOPX_TRACE"))
+        for (i = 0; i < nl; i++)
+            if (ln[i])
+                fprintf(stderr, "%4d|%s\n", i, ln[i]);
+    nconv = 0;
+    /* from the end: an inner loop's header comes after its outer's, so the
+     * inner is read first and the outer then sees its inx / cpx */
+    for (i = nl - 4; i >= 0; i--) {
+        /* the header test: lda.b S / cmp.w #N / (bcs @join | bcc + / jmp @join / +) / @body: */
+        if (!ln[i] || !pp_is(ln[i], "lda") || ln[i][4] != '.' || ln[i][5] != 'b')
+            continue;
+        s = pp_operand(ln[i]);
+        if (strncmp(s, "tcc__lf+", 8) != 0 || !pp_slot(s) || strlen(s) > 40)
+            continue;
+        j = pp_next(ln, nl, i);
+        if (j >= nl || strncmp(ln[j], "\tcmp.w #", 8) != 0)
+            continue;
+        strcpy(bound, pp_operand(ln[j]));
+        if (why) fprintf(stderr, "loopx: %s: candidate (bound %s)\n", s, bound);
+        k = pp_next(ln, nl, j);
+        if (k >= nl)
+            continue;
+        if (pp_is(ln[k], "bcs") && pp_operand(ln[k])[0] == '@')
+            b = pp_next(ln, nl, k);
+        else if (strcmp(ln[k], "\tbcc +") == 0) {
+            int k2 = pp_next(ln, nl, k), k3;
+            if (k2 >= nl || !pp_is(ln[k2], "jmp") || pp_operand(ln[k2])[0] != '@') {
+                WHY("entry triple without jmp");
+                continue;
+            }
+            k3 = pp_next(ln, nl, k2);
+            if (k3 >= nl || strcmp(ln[k3], "+") != 0) {
+                WHY("entry triple without +");
+                continue;
+            }
+            b = pp_next(ln, nl, k3);
+        } else {
+            if (why) fprintf(stderr, "loopx: %s: entry branch is not bcs: %s\n", s, ln[k]);
+            continue;
+        }
+        if (b >= nl || ln[b][0] != '@') {
+            WHY("no body label after the test");
+            continue;
+        }
+        lbl = ln[b];
+        tl = strlen(lbl);
+        if (tl < 2 || lbl[tl - 1] != ':' || tl > 60)
+            continue;
+        snprintf(s1, sizeof s1, "tcc__lf+%d", atoi(s + 8) + 1);
+
+        /* the backward branch: bcc @body, or bcs + / jmp @body / + */
+        e = -1;
+        for (t = b + 1; t < nl; t++) {
+            if (!ln[t] || !(pp_is(ln[t], "bcc") || pp_is(ln[t], "jmp")))
+                continue;
+            op = pp_operand(ln[t]);
+            if (strlen(op) == tl - 1 && strncmp(op, lbl, tl - 1) == 0) {
+                e = t;
+                break;
+            }
+        }
+        if (e < 0) {
+            WHY("no backward branch");
+            continue;
+        }
+        {
+            int p1 = e;
+            if (pp_is(ln[e], "jmp")) {
+                int e2 = pp_next(ln, nl, e);
+                for (p1 = e - 1; p1 > b && !ln[p1]; p1--) ;
+                if (p1 <= b || strcmp(ln[p1], "\tbcs +") != 0
+                    || e2 >= nl || strcmp(ln[e2], "+") != 0)
+                    continue;
+                e = e2;
+            }
+            /* the test at the bottom: [lda.b S] / cmp.w #N */
+            for (cmpline = p1 - 1; cmpline > b && !ln[cmpline]; cmpline--) ;
+            if (cmpline <= b || strncmp(ln[cmpline], "\tcmp.w #", 8) != 0
+                || strcmp(pp_operand(ln[cmpline]), bound) != 0)
+                continue;
+            for (ldaline = cmpline - 1; ldaline > b && !ln[ldaline]; ldaline--) ;
+            if (ldaline <= b)
+                continue;
+        }
+        bodytop = pp_next(ln, nl, b);
+        /* the step: lda.b S / clc / adc.w #c / sta.b S, or lda.b S / inc a /
+         * sta.b S — right before the compare (the reload folded) or anywhere
+         * in the region once, the compare then reloading S */
+        reads = stepend = -1;
+        c = 0;
+        {
+            int q, last = ldaline;
+            if (pp_is(ln[ldaline], "lda") && strncmp(ln[ldaline], "\tlda.b ", 7) == 0
+                && strcmp(pp_operand(ln[ldaline]), s) == 0) {
+                for (last = ldaline - 1; last > b && !ln[last]; last--) ;
+            } else
+                ldaline = -1;           /* merged: the sta feeds the cmp */
+            /* find the step ending at or before `last` */
+            for (q = last; q > b && reads < 0; q--) {
+                int p4, p5, p6;
+                if (!ln[q] || !(strncmp(ln[q], "\tsta.b ", 7) == 0
+                                && strcmp(pp_operand(ln[q]), s) == 0))
+                    continue;
+                for (p4 = q - 1; p4 > b && !ln[p4]; p4--) ;
+                if (p4 <= b)
+                    break;
+                if (strcmp(ln[p4], "\tinc a") == 0) {
+                    for (p5 = p4 - 1; p5 > b && !ln[p5]; p5--) ;
+                    if (p5 > b && strncmp(ln[p5], "\tlda.b ", 7) == 0
+                        && strcmp(pp_operand(ln[p5]), s) == 0) {
+                        c = 1;
+                        reads = p5;
+                        stepend = q;
+                    }
+                } else if (strncmp(ln[p4], "\tadc.w #", 8) == 0) {
+                    for (p5 = p4 - 1; p5 > b && !ln[p5]; p5--) ;
+                    for (p6 = p5 - 1; p6 > b && !ln[p6]; p6--) ;
+                    if (p5 > b && strcmp(ln[p5], "\tclc") == 0 && p6 > b
+                        && strncmp(ln[p6], "\tlda.b ", 7) == 0
+                        && strcmp(pp_operand(ln[p6]), s) == 0) {
+                        c = atoi(ln[p4] + 8);
+                        reads = p6;
+                        stepend = q;
+                    }
+                }
+                break;                  /* the last store to S decides */
+            }
+            if (reads < 0 || c <= 0 || c > 0x7FFF) {
+                WHY("no step");
+                continue;
+            }
+            if (ldaline < 0 && stepend != last) {
+                WHY("merged form, step elsewhere");
+                continue;
+            }
+        }
+        if (bodytop > reads) {
+            WHY("empty region");
+            continue;
+        }
+
+        /* another converted loop inside or around this one: X is taken */
+        {
+            int bad = 0;
+            for (t = 0; t < nconv; t++)
+                if (!(e < conv_b[t] || conv_e[t] < b))
+                    bad = 1;
+            if (bad || nconv >= 64) {
+                WHY("overlaps a converted loop");
+                continue;
+            }
+        }
+
+        /* the counter dies with the loop: S is not live at any exit — the
+         * fall-through after the bottom branch, and every branch or jump
+         * from the region to a line outside it */
+        {
+            int bad = 0, live;
+            live = pp_slot_live_at(ln, nl, s, s1, pp_next(ln, nl, e));
+            if (live != 0)
+                bad = 1;
+            for (t = bodytop; t < e && !bad; t = pp_next(ln, nl, t)) {
+                const char *l = ln[t];
+                size_t ol;
+                if (l[0] != '\t' || !(pp_barrier(l)))
+                    continue;
+                op = pp_operand(l);
+                if (!op || op[0] != '@')
+                    continue;
+                ol = strlen(op);
+                for (k = 0; k < nl; k++)
+                    if (ln[k] && strncmp(ln[k], op, ol) == 0 && strcmp(ln[k] + ol, ":") == 0)
+                        break;
+                if (k >= nl || (k >= b && k <= e))
+                    continue;
+                if (pp_slot_live_at(ln, nl, s, s1, k) != 0)
+                    bad = 1;
+            }
+            if (bad) {
+                WHY("counter live at an exit");
+                continue;
+            }
+        }
+
+        /* the region's lines: X, S, calls, labels, the first touch of A */
+        {
+            int bad = 0, top_ldx = 0, top_lda_tax = 0, a_seen = 0, nsta = 0;
+            t = bodytop;
+            if (strncmp(ln[t], "\tldx.b ", 7) == 0 && strcmp(pp_operand(ln[t]), s) == 0)
+                top_ldx = 1;
+            else if (strncmp(ln[t], "\tlda.b ", 7) == 0 && strcmp(pp_operand(ln[t]), s) == 0) {
+                int t2 = pp_next(ln, nl, t);
+                if (t2 < reads && strcmp(ln[t2], "\ttax") == 0)
+                    top_lda_tax = 1;
+            }
+            for (t = bodytop; t < cmpline && !bad; t = pp_next(ln, nl, t)) {
+                const char *l = ln[t];
+                if (t == ldaline)
+                    continue;           /* the reload the compare reads */
+                if (l[0] == '@') {
+                    size_t ll = strlen(l) - 1;
+                    int r;
+                    for (r = 0; r < nl && !bad; r++) {
+                        if (!ln[r] || r == t || ln[r][0] != '\t')
+                            continue;
+                        op = pp_operand(ln[r]);
+                        if (op && strlen(op) == ll && strncmp(op, l, ll) == 0
+                            && (r < b || r > e)) {
+                            if (why) fprintf(stderr, "loopx: %s: label %s entered from outside: %s\n", s, l, ln[r]);
+                            bad = 1;
+                        }
+                    }
+                    continue;
+                }
+                if (l[0] == '+' && l[1] == 0)
+                    continue;
+                if (l[0] != '\t') {
+                    if (why) fprintf(stderr, "loopx: %s: odd line: %s\n", s, l);
+                    bad = 1;
+                    continue;
+                }
+                if (top_ldx && t == bodytop)
+                    continue;
+                if (top_lda_tax && (t == bodytop || t == pp_next(ln, nl, bodytop)))
+                    continue;
+                if (t >= reads && t <= stepend) {
+                    /* the step itself: lda S / [clc / adc #c | inc a] / sta S */
+                    if (strncmp(l, "\tsta.b ", 7) == 0)
+                        nsta++;
+                    if (!a_seen) {
+                        if (t == reads)
+                            a_seen = 1; /* lda S writes A */
+                    }
+                    continue;
+                }
+                if (pp_writes_x(l) || pp_is(l, "jsl") || pp_is(l, "jsr")
+                    || pp_is(l, "mvn") || pp_is(l, "mvp") || pp_is(l, "jml")
+                    || pp_is(l, "rtl") || pp_is(l, "rts") || pp_is(l, "phx")) {
+                    if (why) fprintf(stderr, "loopx: %s: region writes X or calls: %s\n", s, l);
+                    bad = 1;
+                    continue;
+                }
+                op = pp_operand(l);
+                if (pp_mentions_slot(op, s, s1)) {
+                    if (!(strncmp(l, "\tlda.b ", 7) == 0 && strcmp(op, s) == 0)) {
+                        if (why) fprintf(stderr, "loopx: %s: S touched: %s\n", s, l);
+                        bad = 1;
+                    } else if (!a_seen)
+                        a_seen = 1;     /* becomes txa: writes A */
+                    continue;
+                }
+                if (!a_seen) {
+                    if (pp_barrier(l)) {
+                        if (!pp_is(l, "rep") && !pp_is(l, "sep")) {
+                            if (why) fprintf(stderr, "loopx: %s: branch before A written: %s\n", s, l);
+                            bad = 1;    /* a branch before A is written */
+                        }
+                    } else if (pp_writes_a(l) && !pp_reads_a(l))
+                        a_seen = 1;
+                    else if (pp_reads_a(l)) {
+                        if (why) fprintf(stderr, "loopx: %s: A read as the counter: %s\n", s, l);
+                        bad = 1;        /* A read as the counter: no longer true */
+                    }
+                }
+            }
+            if (bad || nsta != 1) {
+                WHY(bad ? "region" : "stores to S");
+                continue;
+            }
+
+            /* the rewrite */
+            ln[i] = emalloc(strlen(s) + 8);
+            sprintf((char *)ln[i], "\tldx.b %s", s);
+            ln[j] = emalloc(strlen(bound) + 8);
+            sprintf((char *)ln[j], "\tcpx.w %s", bound);
+            if (top_ldx)
+                ln[bodytop] = 0;
+            if (top_lda_tax) {
+                ln[pp_next(ln, nl, bodytop)] = 0;
+                ln[bodytop] = 0;
+            }
+            for (t = pp_next(ln, nl, b); t < cmpline; t = pp_next(ln, nl, t))
+                if (ln[t] && t != ldaline && !(t >= reads && t <= stepend)
+                    && strncmp(ln[t], "\tlda.b ", 7) == 0 && strcmp(pp_operand(ln[t]), s) == 0)
+                    ln[t] = "\ttxa";
+            {
+                int slots[8], ns = 0;
+                for (t = reads; t <= stepend; t++)
+                    if (ln[t])
+                        slots[ns++] = t;
+                for (t = 0; t < ns; t++)
+                    ln[slots[t]] = 0;
+                k = 0;
+                if (c <= 2) {
+                    for (t = 0; t < c; t++)
+                        ln[slots[k++]] = "\tinx";
+                } else {
+                    ln[slots[k++]] = "\ttxa";
+                    ln[slots[k++]] = "\tclc";
+                    snprintf(step, sizeof step, "\tadc.w #%d", c);
+                    ln[slots[k]] = emalloc(strlen(step) + 1);
+                    strcpy((char *)ln[slots[k]], step);
+                    k++;
+                    ln[slots[k++]] = "\ttax";   /* the adc form has four lines */
+                }
+            }
+            if (ldaline >= 0)
+                ln[ldaline] = 0;
+            ln[cmpline] = emalloc(strlen(bound) + 8);
+            sprintf((char *)ln[cmpline], "\tcpx.w %s", bound);
+            conv_b[nconv] = i;          /* from the entry test to the bottom branch */
+            conv_e[nconv] = e;
+            nconv++;
+            found++;
+
+            /* The body's one `lda #imm`, when it is the body's first line
+             * and nothing else in the region writes A or changes its width,
+             * is loop-invariant: it moves before the body label, into the
+             * line the top `ldx S` left (the label moves down). farClear:
+             * lda #0 out of the loop, 18 CPU cycles a word to 15. */
+            if (top_ldx) {
+                int first = pp_next(ln, nl, b), nwa = 0, ok = 1, t2;
+                if (first < cmpline && pp_is(ln[first], "lda")
+                    && pp_operand(ln[first])[0] == '#') {
+                    for (t2 = first; t2 < cmpline; t2 = pp_next(ln, nl, t2)) {
+                        if (ln[t2][0] != '\t')
+                            continue;
+                        if (pp_is(ln[t2], "rep") || pp_is(ln[t2], "sep"))
+                            ok = 0;
+                        if (pp_writes_a(ln[t2]))
+                            nwa++;
+                    }
+                    if (ok && nwa == 1) {
+                        /* bodytop is the freed line, b the label */
+                        ln[bodytop] = ln[b];
+                        ln[b] = ln[first];
+                        ln[first] = 0;
+                    }
+                }
+            }
+        }
+    }
+    return found;
+}
+
 static int
 peephole_entry(char **ln, int nl)
 {
@@ -7589,6 +8160,12 @@ relax_branches(FILE *in, FILE *out)
     if (!getenv("QBE_NO_PEEPHOLE")
         && (peephole(ln, nl) + (getenv("QBE_NO_PEEP_LATE") ? 0 : peephole_late(ln, nl)))) {
         /* close the gaps: the branch pass below looks at adjacent lines */
+        for (i = k = 0; i < nl; i++)
+            if (ln[i])
+                ln[k++] = ln[i];
+        nl = k;
+    }
+    if (!getenv("QBE_NO_PEEPHOLE") && peephole_loop_x(ln, nl)) {
         for (i = k = 0; i < nl; i++)
             if (ln[i])
                 ln[k++] = ln[i];
