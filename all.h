@@ -631,6 +631,7 @@ void gvn(Fn *);
 /* gcm.c */
 int pinned(Ins *);
 void gcm(Fn *);
+void ivar(Fn *);
 
 /* simpl.c */
 void simpl(Fn *);

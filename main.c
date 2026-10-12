@@ -94,6 +94,7 @@ char debug['Z'+1] = {
 	['L'] = 0, /* liveness */
 	['S'] = 0, /* spilling */
 	['R'] = 0, /* reg. allocation */
+	['V'] = 0, /* induction variables (OpenSNES) */
 };
 
 extern Target T_amd64_sysv;
@@ -240,6 +241,7 @@ finalize_and_emit(Fn *fn, FILE *out)
 	filluse(fn);
 	simpljnz(fn);
 	filluse(fn);
+	ivar(fn);
 	filldom(fn);
 	gcm(fn);
 	filluse(fn);
@@ -327,6 +329,7 @@ func(Fn *fn)
 		filldom(fn);
 		gvn(fn);
 		fillcfg(fn); filluse(fn); simpljnz(fn); filluse(fn);
+		ivar(fn);
 		filldom(fn); gcm(fn);
 		filluse(fn); ssacheck(fn);
 		T.abi1(fn); simpl(fn);
