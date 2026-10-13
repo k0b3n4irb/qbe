@@ -8045,6 +8045,371 @@ peephole_loop_x(char **ln, int nl)
     return found;
 }
 
+/* What X is known to hold, across the blocks of a function (2026-10-13).
+ *
+ * The emitter's X cache and the rules above know X inside a straight line of
+ * code; at a label they forget. A function that indexes parallel arrays by
+ * one value — a channel, a player — then reloads it at the top of every
+ * block: `lda 2,s / tax`, seven cycles, where X has held that slot since the
+ * function's first lines (a sequencer's step did it in nearly every block).
+ *
+ * A forward analysis over the function's text. The state at a line is two
+ * slots, or none: the frame slot A equals and the frame slot X equals (a
+ * slot is `N,s` or `tcc__lf+N`, 16 bits). At a label the state is what
+ * every way in agrees on. Then:
+ *
+ *   tax      with X already equal to the slot A was loaded from: goes; and
+ *            the `lda S` before it too when the next line loads A again
+ *   ldx S    with X already equal to S: goes (unless a branch reads its flags)
+ *
+ * What changes X is a closed set of the instruction set (ldx, tax, tsx, tyx,
+ * plx, inx, dex, mvn, mvp, a call, plp, rep / sep of the index width); what
+ * changes A is everything outside a list of instructions known not to. A
+ * slot's value changes when it or a byte of it is written, when the stack
+ * pointer moves (a stack slot's name then means another byte), when a call
+ * is made, and — for a stack slot — when something is written through a
+ * pointer (`[..]`, `(..)`, `$0000,x`): a local whose address was taken lives
+ * on the stack. A store indexed from a named symbol (`sym,x`) writes a
+ * global and leaves the frame alone.
+ *
+ * QBE_NO_PEEP_XFLOW=1 turns it off. */
+
+#define XF_TOP  (-2)
+#define XF_NONE (-1)
+
+/* The slot an operand names: kind 's' (stack) or 'd' (direct page) and its
+ * offset; 0 when the operand is not a frame slot. */
+static int
+xf_slot(const char *op, int *off)
+{
+    if (!op || !pp_slot(op))
+        return 0;
+    if (strncmp(op, "tcc__lf+", 8) == 0) {
+        *off = atoi(op + 8);
+        return 'd';
+    }
+    *off = atoi(op);
+    return 's';
+}
+
+static int
+xf_meet(int a, int b)
+{
+    if (a == XF_TOP)
+        return b;
+    if (b == XF_TOP)
+        return a;
+    return a == b ? a : XF_NONE;
+}
+
+static int
+peephole_xflow(char **ln, int nl)
+{
+    static const char *keeps_a[] = { "sta", "stz", "stx", "sty", "cmp", "cpx", "cpy",
+        "bit", "bcc", "bcs", "beq", "bne", "bmi", "bpl", "bvc", "bvs", "bra", "brl",
+        "jmp", "tax", "tay", "pha", "php", "phx", "phy", "phb", "phd", "phk", "plx",
+        "ply", "plb", "pld", "pea", "pei", "per", "clc", "sec", "cld", "sed", "cli",
+        "sei", "clv", "nop", "inx", "iny", "dex", "dey", "ldx", "ldy", "tas", "tcs",
+        "txs", "txy", "tyx", "tsb", "trb", "wai", 0 };
+    static const char *writes_x[] = { "ldx", "tax", "tsx", "tyx", "plx", "inx", "dex",
+        "mvn", "mvp", "jsl", "jsr", "plp", "rti", "brk", "cop", 0 };
+    static const char *cond[] = { "bcc", "bcs", "beq", "bne", "bmi", "bpl", "bvc", "bvs", 0 };
+    int *tgt, *fall, *ina, *inx, *a8v, *kind, *offv;
+    int i, k, changed, removed = 0, a8, nslot = 0, cap = 0;
+    const char *l, *op;
+    size_t plus;
+
+    if (getenv("QBE_NO_PEEP_XFLOW") || nl == 0)
+        return 0;
+    tgt = emalloc(5 * nl * sizeof *tgt);
+    fall = tgt + nl;
+    ina = fall + nl;
+    inx = ina + nl;
+    a8v = inx + nl;
+    kind = 0;
+    offv = 0;
+
+    /* successors and the accumulator's width, as peephole_flow reads them */
+    a8 = 0;
+    for (i = 0; i < nl; i++) {
+        tgt[i] = -1;
+        fall[i] = 1;
+        ina[i] = inx[i] = XF_TOP;
+        a8v[i] = a8;
+        if (!ln[i])
+            continue;
+        l = ln[i];
+        if (l[0] == '-')
+            goto leave;
+        plus = strspn(l, "+");
+        if (plus) {
+            if (l[plus] == 0)
+                continue;
+            goto leave;                 /* an instruction on a `+` line: not read here */
+        }
+        if (l[0] != '\t')
+            continue;
+        if (strncmp(l, "\tsep #$20", 9) == 0 || strncmp(l, "\tsep #$30", 9) == 0)
+            a8 = 1;
+        else if (strncmp(l, "\trep #$20", 9) == 0 || strncmp(l, "\trep #$30", 9) == 0)
+            a8 = 0;
+        op = pp_operand(l);
+        if (pp_is(l, "rtl") || pp_is(l, "rts") || pp_is(l, "rti")) {
+            fall[i] = 0;
+            continue;
+        }
+        k = 0;
+        for (changed = 0; cond[changed]; changed++)
+            if (pp_is(l, cond[changed]))
+                k = 1;
+        if (pp_is(l, "jmp") || pp_is(l, "bra") || pp_is(l, "brl")) {
+            k = 1;
+            fall[i] = 0;
+        } else if (pp_is(l, "jml"))
+            goto leave;
+        if (k) {
+            if (op[0] == '@') {
+                size_t tl = strlen(op);
+                for (k = 0; k < nl; k++)
+                    if (ln[k] && strncmp(ln[k], op, tl) == 0 && strcmp(ln[k] + tl, ":") == 0)
+                        break;
+            } else if (op[0] == '+' && strspn(op, "+") == strlen(op)) {
+                size_t tl = strlen(op);
+                for (k = i + 1; k < nl; k++)
+                    if (ln[k] && strspn(ln[k], "+") == tl && ln[k][tl] == 0)
+                        break;
+            } else
+                goto leave;
+            if (k >= nl)
+                goto leave;
+            tgt[i] = k;
+        }
+    }
+
+    /* the slots, numbered: kind[] and offv[] by id */
+    cap = 16;
+    kind = emalloc(cap * sizeof *kind);
+    offv = emalloc(cap * sizeof *offv);
+
+    ina[0] = inx[0] = XF_NONE;          /* nothing is known at the entry */
+    do {
+        changed = 0;
+        for (i = 0; i < nl; i++) {
+            int a = ina[i], x = inx[i], sk, so, id, w;
+
+            if (a == XF_TOP && x == XF_TOP)
+                continue;               /* not reached yet */
+            l = ln[i];
+            if (l && l[0] == '\t') {
+                op = pp_operand(l);
+                sk = xf_slot(op, &so);
+                id = XF_NONE;
+                if (sk) {
+                    for (id = 0; id < nslot; id++)
+                        if (kind[id] == sk && offv[id] == so)
+                            break;
+                    if (id == nslot) {
+                        if (nslot == cap) {
+                            int *nk = emalloc(2 * cap * sizeof *nk), *no = emalloc(2 * cap * sizeof *no);
+                            memcpy(nk, kind, cap * sizeof *nk);
+                            memcpy(no, offv, cap * sizeof *no);
+                            free(kind);
+                            free(offv);
+                            kind = nk;
+                            offv = no;
+                            cap *= 2;
+                        }
+                        kind[nslot] = sk;
+                        offv[nslot] = so;
+                        nslot++;
+                    }
+                }
+
+                /* 1. what the line does to the slots' values */
+                if (pp_is(l, "jsl") || pp_is(l, "jsr")) {
+                    a = x = XF_NONE;
+                } else {
+                    w = pp_writes_mem(l) || pp_is(l, "stx") || pp_is(l, "sty");
+                    if (w && strcmp(op, "a") == 0)
+                        w = 0;          /* asl a, inc a...: the accumulator */
+                    if (w && sk) {
+                        /* a byte of a slot written: that slot and its neighbours */
+                        if (a >= 0 && kind[a] == sk && abs(offv[a] - so) <= 1)
+                            a = XF_NONE;
+                        if (x >= 0 && kind[x] == sk && abs(offv[x] - so) <= 1)
+                            x = XF_NONE;
+                    } else if (w && (strchr(op, '[') || strchr(op, '(') || op[0] == '$')) {
+                        /* through a pointer: any stack slot may be the target */
+                        if (a >= 0 && kind[a] == 's')
+                            a = XF_NONE;
+                        if (x >= 0 && kind[x] == 's')
+                            x = XF_NONE;
+                    }
+                    if (pp_moves_sp(l) || pp_is(l, "tas") || pp_is(l, "tcs") || pp_is(l, "txs")) {
+                        if (a >= 0 && kind[a] == 's')
+                            a = XF_NONE;
+                        if (x >= 0 && kind[x] == 's')
+                            x = XF_NONE;
+                    }
+                }
+
+                /* 2. what it does to X */
+                if (strcmp(l, "\ttax") == 0)
+                    x = a;
+                else if (pp_is(l, "ldx") && sk)
+                    x = id;
+                else if (pp_is(l, "rep") || pp_is(l, "sep")) {
+                    if (strstr(op, "$10") || strstr(op, "$30"))
+                        x = XF_NONE;
+                } else
+                    for (k = 0; writes_x[k]; k++)
+                        if (pp_is(l, writes_x[k]))
+                            x = XF_NONE;
+
+                /* 3. what it does to A */
+                if (pp_is(l, "rep") || pp_is(l, "sep"))
+                    a = XF_NONE;
+                else if (pp_is(l, "lda"))
+                    a = (sk && !a8v[i]) ? id : XF_NONE;
+                else if (pp_is(l, "sta") && sk && !a8v[i])
+                    a = id;             /* A was just stored there */
+                else if (strcmp(op, "a") == 0)
+                    a = XF_NONE;
+                else {
+                    for (k = 0; keeps_a[k]; k++)
+                        if (pp_is(l, keeps_a[k]))
+                            break;
+                    if (!keeps_a[k] && !(pp_is(l, "inc") || pp_is(l, "dec") || pp_is(l, "asl")
+                                         || pp_is(l, "lsr") || pp_is(l, "rol") || pp_is(l, "ror")))
+                        a = XF_NONE;
+                }
+            }
+            /* the ways out */
+            if (fall[i] && i + 1 < nl) {
+                int na = xf_meet(ina[i + 1], a), nx = xf_meet(inx[i + 1], x);
+                if (na != ina[i + 1] || nx != inx[i + 1]) {
+                    ina[i + 1] = na;
+                    inx[i + 1] = nx;
+                    changed = 1;
+                }
+            }
+            if (tgt[i] >= 0) {
+                int na = xf_meet(ina[tgt[i]], a), nx = xf_meet(inx[tgt[i]], x);
+                if (na != ina[tgt[i]] || nx != inx[tgt[i]]) {
+                    ina[tgt[i]] = na;
+                    inx[tgt[i]] = nx;
+                    changed = 1;
+                }
+            }
+        }
+    } while (changed);
+
+    /* the redundant loads */
+    for (i = 0; i < nl; i++) {
+        int j, p, sk, so;
+
+        if (!ln[i] || ln[i][0] != '\t' || inx[i] < 0)
+            continue;
+        if (strcmp(ln[i], "\ttax") == 0 && ina[i] == inx[i]) {
+            ln[i] = 0;
+            removed++;
+            /* the load that fed it, when the next line loads A again */
+            for (p = i - 1; p >= 0 && !ln[p]; p--)
+                ;
+            j = pp_next(ln, nl, i);
+            if (p >= 0 && pp_is(ln[p], "lda") && xf_slot(pp_operand(ln[p]), &so)
+                && j < nl && pp_is(ln[j], "lda")) {
+                ln[p] = 0;
+                removed++;
+            }
+            continue;
+        }
+        if (pp_is(ln[i], "ldx") && (sk = xf_slot(pp_operand(ln[i]), &so)) != 0
+            && kind[inx[i]] == sk && offv[inx[i]] == so) {
+            j = pp_next(ln, nl, i);
+            if (j < nl && ln[j][0] == '\t' && !pp_barrier(ln[j]) && !pp_is(ln[j], "php")) {
+                ln[i] = 0;
+                removed++;
+            }
+        }
+    }
+leave:
+    free(tgt);
+    free(kind);
+    free(offv);
+    return removed;
+}
+
+/* An indexed load that only feeds the next operation becomes its operand
+ * (2026-10-13):
+ *
+ *     lda.w SYM,x          \           lda Y
+ *     sta.b T               |    ->    [clc | sec]
+ *     lda Y                 |          op.w SYM,x
+ *     [clc | sec]           |
+ *     op.b T               /
+ *
+ * for cmp, adc, sbc, and, ora, eor — the operand's place is the same, so
+ * the order of a compare or of a subtraction is kept. T is a direct-page
+ * slot dead after the operation (pp_slot_live_at), `lda Y` does not write X
+ * (no lda does) and reads neither T nor through X's array being changed in
+ * between (nothing is written between). 17 cycles to 9. */
+static int
+peephole_fuse_indexed(char **ln, int nl)
+{
+    static const char *ops[] = { "cmp", "adc", "sbc", "and", "ora", "eor", 0 };
+    int i, j, k, m, n, o, removed = 0;
+    const char *op1, *t, *y;
+    char t1[64], *nl2;
+
+    if (getenv("QBE_NO_PEEP_FUSE"))
+        return 0;
+    for (i = 0; i < nl; i++) {
+        if (!ln[i] || !pp_is(ln[i], "lda") || ln[i][4] != '.')
+            continue;
+        op1 = pp_operand(ln[i]);
+        k = (int)strlen(op1);
+        if (k < 3 || strcmp(op1 + k - 2, ",x") != 0 || strchr(op1, '[') || strchr(op1, '(')
+            || op1[0] == '$' || (ln[i][5] != 'w' && ln[i][5] != 'l'))
+            continue;                   /* a named symbol, indexed by X */
+        j = pp_next(ln, nl, i);
+        if (j >= nl || strncmp(ln[j], "\tsta.b tcc__lf+", 15) != 0)
+            continue;
+        t = pp_operand(ln[j]);
+        if (!pp_slot(t) || strlen(t) > 40)
+            continue;
+        m = pp_next(ln, nl, j);
+        if (m >= nl || !pp_is(ln[m], "lda"))
+            continue;
+        y = pp_operand(ln[m]);
+        if (strncmp(y, "tcc__lf+", 8) == 0 && abs(atoi(y + 8) - atoi(t + 8)) <= 1)
+            continue;                   /* Y is T or shares a byte with it */
+        n = pp_next(ln, nl, m);
+        if (n < nl && (strcmp(ln[n], "\tclc") == 0 || strcmp(ln[n], "\tsec") == 0))
+            o = pp_next(ln, nl, n);
+        else
+            o = n;
+        if (o >= nl || ln[o][0] != '\t' || ln[o][4] != '.' || ln[o][5] != 'b'
+            || strcmp(pp_operand(ln[o]), t) != 0)
+            continue;
+        for (k = 0; ops[k]; k++)
+            if (pp_is(ln[o], ops[k]))
+                break;
+        if (!ops[k])
+            continue;
+        snprintf(t1, sizeof t1, "tcc__lf+%d", atoi(t + 8) + 1);
+        if (pp_slot_live_at(ln, nl, t, t1, pp_next(ln, nl, o)) != 0)
+            continue;
+        nl2 = emalloc(strlen(op1) + 8);
+        sprintf(nl2, "\t%s.%c %s", ops[k], ln[i][5], op1);
+        ln[o] = nl2;
+        ln[i] = 0;
+        ln[j] = 0;
+        removed += 2;
+    }
+    return removed;
+}
+
 static int
 peephole_entry(char **ln, int nl)
 {
@@ -8170,6 +8535,20 @@ relax_branches(FILE *in, FILE *out)
             if (ln[i])
                 ln[k++] = ln[i];
         nl = k;
+    }
+    if (!getenv("QBE_NO_PEEPHOLE") && (peephole_fuse_indexed(ln, nl) + peephole_xflow(ln, nl))) {
+        for (i = k = 0; i < nl; i++)
+            if (ln[i])
+                ln[k++] = ln[i];
+        nl = k;
+        /* what the two rules left behind is the first pass's to take: a
+         * store read back at once, a load nobody reads */
+        if (peephole(ln, nl)) {
+            for (i = k = 0; i < nl; i++)
+                if (ln[i])
+                    ln[k++] = ln[i];
+            nl = k;
+        }
     }
     if (!getenv("QBE_NO_PEEPHOLE") && peephole_entry(ln, nl)) {
         for (i = k = 0; i < nl; i++)
