@@ -23,9 +23,12 @@ static int datasec_counter = 0;
  * We buffer data items and emit both sections at DEnd when we know the size.
  */
 
-/* Buffer for accumulating initialized data */
-#define MAX_INIT_ITEMS 16384
-static struct {
+/* Buffer for accumulating initialized data. It grows with the object: a
+ * fixed 16384 items (2026-10-14) refused a const table of 16385 elements,
+ * 16 KB of u8, with "too many data items" and no name. What bounds an
+ * object now is the cartridge — a section cannot span a ROM bank — and the
+ * linker says so, naming it. */
+typedef struct {
 	int type;       /* DB, DH, DW, DL, or -1 for string, -2 for ref, -3 for zero-fill */
 	int64_t num;    /* numeric value or size for zero-fill */
 	char *str;      /* string value (if type == -1) */
@@ -34,9 +37,22 @@ static struct {
 		int64_t off;
 	} ref;
 	int reftype;    /* original type for references (DB, DH, etc.) */
-} init_items[MAX_INIT_ITEMS];
-static int init_count;
+} InitItem;
+static InitItem *init_items;
+static int init_count, init_cap;
 static int64_t init_total_size;
+
+/* room for one more item */
+static void
+init_grow(void)
+{
+	if (init_count < init_cap)
+		return;
+	init_cap = init_cap ? 2 * init_cap : 1024;
+	init_items = realloc(init_items, (size_t)init_cap * sizeof *init_items);
+	if (!init_items)
+		die("out of memory for an initialized object");
+}
 
 /* Current data definition info */
 static char *cur_data_name;
@@ -537,8 +553,7 @@ wla_emitdat(Dat *d, FILE *f)
 		 * values moved to the front, and for a RAM object the init record
 		 * announced more bytes than it carried, shifting every record
 		 * after it. (difftest_stmt, seed 62) */
-		if (init_count >= MAX_INIT_ITEMS)
-			die("too many data items");
+		init_grow();
 		init_items[init_count].type = -3;
 		init_items[init_count].num = d->u.num;
 		init_count++;
@@ -549,8 +564,7 @@ wla_emitdat(Dat *d, FILE *f)
 		/* DB, DH, DW, DL - actual data */
 		has_nonzero_data = 1;
 
-		if (init_count >= MAX_INIT_ITEMS)
-			die("too many data items");
+		init_grow();
 
 		if (d->isstr) {
 			if (d->type != DB)
