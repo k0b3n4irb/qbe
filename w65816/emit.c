@@ -3588,6 +3588,14 @@ emitins(Ins *i, Fn *fn)
     case Oloadsw: case Oloaduw: case Oload:
     case Ostoreb: case Ostoreh: case Ostorew: case Ostorel:
         break;
+    case Oand: case Oor: case Oxor:
+        /* 16 bits: emitload / emitop2 / emitstore, none of which touches
+         * tcc__r9, and the result is not the staged pointer (a Kl temp).
+         * `d[k] |= p[k]` through one pointer staged it again for every
+         * word (a game's tile compositor, 2026-10-15). */
+        if (i->cls == Kl || (r9_valid && req(i->to, r9_ref)))
+            r9_invalidate();
+        break;
     default:
         r9_invalidate();
         break;
@@ -8340,6 +8348,99 @@ leave:
     return removed;
 }
 
+/* Helpers of peephole_fuse_indexed when the index registers are loaded
+ * between the indexed load and the operation (2026-10-15). */
+
+static const char *fx_writes_x[] = { "ldx", "tax", "tsx", "tyx", "plx", "inx", "dex",
+    "mvn", "mvp", "jsl", "jsr", "jml", "jmp", "plp", "rti", "brk", "cop", "rep", "sep", 0 };
+
+static int
+fx_in(const char *l, const char **set)
+{
+    int k;
+
+    for (k = 0; set[k]; k++)
+        if (pp_is(l, set[k]))
+            return 1;
+    return 0;
+}
+
+/* The line of the ldx that gave X its value at line i — from an immediate
+ * or a frame slot, in the same straight line of code — or -1. */
+static int
+fuse_x_source(char **ln, int i)
+{
+    const char *s;
+    int k, seen = 0;
+
+    for (k = i - 1; k >= 0 && seen < 64; k--) {
+        if (!ln[k])
+            continue;
+        seen++;
+        if (ln[k][0] != '\t')
+            return -1;                  /* a label: another way in */
+        if (pp_is(ln[k], "ldx")) {
+            s = pp_operand(ln[k]);
+            return (s[0] == '#' || (strncmp(s, "tcc__lf+", 8) == 0 && pp_slot(s))) ? k : -1;
+        }
+        if (fx_in(ln[k], fx_writes_x) || ln[k][1] == 'b')
+            return -1;                  /* X moved, or a branch */
+    }
+    return -1;
+}
+
+/* Nothing between that ldx (line x) and line o writes its slot. */
+static int
+fuse_x_unwritten(char **ln, int x, int o)
+{
+    static const char *writes[] = { "sta", "stz", "stx", "sty", "inc", "dec",
+        "tsb", "trb", "asl", "lsr", "rol", "ror", 0 };
+    const char *q, *s = pp_operand(ln[x]);
+    int k, d;
+
+    if (s[0] == '#')
+        return 1;
+    for (k = x + 1; k < o; k++) {
+        if (!ln[k] || !fx_in(ln[k], writes))
+            continue;
+        q = pp_operand(ln[k]);
+        if (!q || strncmp(q, "tcc__lf+", 8) != 0)
+            continue;
+        d = atoi(q + 8) - atoi(s + 8);
+        if (d >= -1 && d <= 1)
+            return 0;
+    }
+    return 1;
+}
+
+/* After line o, X is written before anything reads it, in the same
+ * straight line of code. */
+static int
+fuse_x_dead_after(char **ln, int nl, int o)
+{
+    static const char *reads_x[] = { "txa", "txy", "txs", "stx", "cpx", "phx",
+        "inx", "dex", 0 };
+    const char *q;
+    int k, seen = 0;
+
+    for (k = o + 1; k < nl && seen < 64; k++) {
+        if (!ln[k])
+            continue;
+        seen++;
+        if (ln[k][0] != '\t')
+            return 0;
+        q = pp_operand(ln[k]);
+        if (fx_in(ln[k], reads_x) || (q && strstr(q, ",x")))
+            return 0;
+        if (pp_is(ln[k], "ldx") || pp_is(ln[k], "tax") || pp_is(ln[k], "plx"))
+            return 1;
+        if (fx_in(ln[k], fx_writes_x) || ln[k][1] == 'b' || pp_is(ln[k], "rtl")
+            || pp_is(ln[k], "rts"))
+            return 0;
+    }
+    return 0;
+}
+
 /* An indexed load that only feeds the next operation becomes its operand
  * (2026-10-13):
  *
@@ -8358,7 +8459,7 @@ static int
 peephole_fuse_indexed(char **ln, int nl)
 {
     static const char *ops[] = { "cmp", "adc", "sbc", "and", "ora", "eor", 0 };
-    int i, j, k, m, n, o, removed = 0;
+    int i, j, k, m, n, o, xs, removed = 0;
     const char *op1, *t, *y;
     char t1[64], *nl2;
 
@@ -8378,7 +8479,17 @@ peephole_fuse_indexed(char **ln, int nl)
         t = pp_operand(ln[j]);
         if (!pp_slot(t) || strlen(t) > 40)
             continue;
-        m = pp_next(ln, nl, j);
+        /* the index registers may be loaded between (2026-10-15): an ldy
+         * keeps X, an ldx moves it and is undone before the operation */
+        xs = 0;
+        for (m = pp_next(ln, nl, j); m < nl; m = pp_next(ln, nl, m)) {
+            if (!(pp_is(ln[m], "ldy") || pp_is(ln[m], "ldx")))
+                break;
+            if (pp_operand(ln[m])[0] != '#' && !pp_slot(pp_operand(ln[m])))
+                break;
+            if (pp_is(ln[m], "ldx"))
+                xs = 1;
+        }
         if (m >= nl || !pp_is(ln[m], "lda"))
             continue;
         y = pp_operand(ln[m]);
@@ -8402,10 +8513,44 @@ peephole_fuse_indexed(char **ln, int nl)
             continue;
         nl2 = emalloc(strlen(op1) + 8);
         sprintf(nl2, "\t%s.%c %s", ops[k], ln[i][5], op1);
+        if (xs) {
+            /* X held S at the load; it must again at the operation, and
+             * what the moved ldx left in X must be dead after it */
+            int x = fuse_x_source(ln, i), w;
+            char *ldx;
+
+            if (x < 0 || !fuse_x_unwritten(ln, x, o) || !fuse_x_dead_after(ln, nl, o)) {
+                free(nl2);
+                continue;
+            }
+            ldx = emalloc(strlen(ln[x]) + 1);
+            strcpy(ldx, ln[x]);
+            /* i .. o hold no label (only loads and clc / sec): rewrite
+             * them in place, the two freed lines making room for the ldx */
+            for (w = i, k = pp_next(ln, nl, j); k < o; k = pp_next(ln, nl, k))
+                ln[w++] = ln[k];
+            ln[w++] = ldx;
+            ln[w++] = nl2;
+            while (w <= o)
+                ln[w++] = 0;
+            removed += 1;
+            continue;
+        }
         ln[o] = nl2;
         ln[i] = 0;
         ln[j] = 0;
         removed += 2;
+    }
+    /* an ldx the next line overwrites: the fusion above leaves one where
+     * the index of the first load was set up for it */
+    for (i = 0; i < nl; i++) {
+        if (!ln[i] || !pp_is(ln[i], "ldx"))
+            continue;
+        j = pp_next(ln, nl, i);
+        if (j < nl && pp_is(ln[j], "ldx")) {
+            ln[i] = 0;
+            removed++;
+        }
     }
     return removed;
 }
