@@ -7073,8 +7073,16 @@ peephole_flow(char **ln, int nl)
         if (!ln[i])
             continue;
         l = ln[i];
-        if (l[0] == '-')
-            goto leave;
+        /* a `-` label, like a `+` one, may carry an instruction on its
+         * line: the variable shift loop is `-\tasl a / dex / bne -` */
+        if (l[0] == '-') {
+            size_t minus = strspn(l, "-");
+            if (l[minus] == 0)
+                continue;
+            if (l[minus] != '\t')
+                goto leave;
+            l += minus;
+        }
         /* a `+` label may carry an instruction on its line */
         plus = strspn(l, "+");
         if (plus) {
@@ -7115,6 +7123,13 @@ peephole_flow(char **ln, int nl)
                 for (k = i + 1; k < nl; k++)
                     if (ln[k] && strspn(ln[k], "+") == tl)
                         break;
+            } else if (op[0] == '-' && strspn(op, "-") == strlen(op)) {
+                size_t tl = strlen(op);
+                for (k = i - 1; k >= 0; k--)
+                    if (ln[k] && strspn(ln[k], "-") == tl)
+                        break;
+                if (k < 0)
+                    goto leave;
             } else
                 goto leave;
             if (k >= nl)
@@ -7595,8 +7610,16 @@ pp_slot_live_at(char **ln, int nl, const char *s, const char *s1, int at)
         if (!ln[i])
             continue;
         l = ln[i];
-        if (l[0] == '-')
-            goto leave;
+        /* a `-` label, like a `+` one, may carry an instruction on its
+         * line: the variable shift loop is `-\tasl a / dex / bne -` */
+        if (l[0] == '-') {
+            size_t minus = strspn(l, "-");
+            if (l[minus] == 0)
+                continue;
+            if (l[minus] != '\t')
+                goto leave;
+            l += minus;
+        }
         plus = strspn(l, "+");
         if (plus) {
             if (l[plus] == 0)
@@ -7648,6 +7671,13 @@ pp_slot_live_at(char **ln, int nl, const char *s, const char *s1, int at)
                 for (k = i + 1; k < nl; k++)
                     if (ln[k] && strspn(ln[k], "+") == tl)
                         break;
+            } else if (op[0] == '-' && strspn(op, "-") == strlen(op)) {
+                size_t tl = strlen(op);
+                for (k = i - 1; k >= 0; k--)
+                    if (ln[k] && strspn(ln[k], "-") == tl)
+                        break;
+                if (k < 0)
+                    goto leave;
             } else
                 goto leave;
             if (k >= nl)
@@ -7894,7 +7924,7 @@ peephole_loop_x(char **ln, int nl)
 
         /* the region's lines: X, S, calls, labels, the first touch of A */
         {
-            int bad = 0, top_ldx = 0, top_lda_tax = 0, a_seen = 0, nsta = 0;
+            int bad = 0, top_ldx = 0, top_lda_tax = 0, a_seen = 0, nsta = 0, after_step = 0;
             t = bodytop;
             if (strncmp(ln[t], "\tldx.b ", 7) == 0 && strcmp(pp_operand(ln[t]), s) == 0)
                 top_ldx = 1;
@@ -7937,6 +7967,8 @@ peephole_loop_x(char **ln, int nl)
                     /* the step itself: lda S / [clc / adc #c | inc a] / sta S */
                     if (strncmp(l, "\tsta.b ", 7) == 0)
                         nsta++;
+                    if (t == stepend)
+                        after_step = 1; /* A is the new counter from here */
                     if (!a_seen) {
                         if (t == reads)
                             a_seen = 1; /* lda S writes A */
@@ -7949,6 +7981,20 @@ peephole_loop_x(char **ln, int nl)
                     if (why) fprintf(stderr, "loopx: %s: region writes X or calls: %s\n", s, l);
                     bad = 1;
                     continue;
+                }
+                /* After the step A holds the new counter, which `inx` does not
+                 * give it: a line reading A before A is written again read
+                 * the counter — `sta 2,s`, the stack home of a counter whose
+                 * address is taken, stored A's old value (difftest_stmt seed
+                 * 105, 2026-10-15). */
+                if (after_step) {
+                    if (pp_reads_a(l) || pp_barrier(l)) {
+                        if (why) fprintf(stderr, "loopx: %s: A read as the new counter: %s\n", s, l);
+                        bad = 1;
+                        continue;
+                    }
+                    if (pp_writes_a(l))
+                        after_step = 0;
                 }
                 op = pp_operand(l);
                 if (pp_mentions_slot(op, s, s1)) {
