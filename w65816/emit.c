@@ -707,9 +707,10 @@ static Ref far_decomp_idx[MAX_ALIAS_TEMPS];    /* index temp or CBits con */
 static int far_decomp_all[MAX_ALIAS_TEMPS];    /* every use is a far access */
 
 /* tcc__r9 cache: which Kl ref is currently staged in tcc__r9 (24-bit).
- * Valid only within a block and only across loads/stores — every other
- * op may use tcc__r9 as scratch (Kl add/sub, mul bodies, indirect
- * calls), so emitins() drops the cache before emitting any of them. */
+ * Valid only within a block. The ops that write tcc__r9 — multiply bodies,
+ * the runtime helpers of mul/div/rem, calls (an indirect call stages its
+ * target there) — and an op defining the staged temp drop it in emitins();
+ * every other op (arithmetic, logic, shifts, copies, compares) keeps it. */
 static Ref r9_ref;
 static int r9_valid;
 
@@ -3588,16 +3589,33 @@ emitins(Ins *i, Fn *fn)
     case Oloadsw: case Oloaduw: case Oload:
     case Ostoreb: case Ostoreh: case Ostorew: case Ostorel:
         break;
-    case Oand: case Oor: case Oxor:
-        /* 16 bits: emitload / emitop2 / emitstore, none of which touches
-         * tcc__r9, and the result is not the staged pointer (a Kl temp).
-         * `d[k] |= p[k]` through one pointer staged it again for every
-         * word (a game's tile compositor, 2026-10-15). */
-        if (i->cls == Kl || (r9_valid && req(i->to, r9_ref)))
-            r9_invalidate();
+    case Omul:
+        /* by 0, 1 or a power of two: shifts, both classes (the index of
+         * an array access, `i * 2`) */
+        if (rtype(r1) == RCon && fn->con[r1.val].type == CBits) {
+            int64_t v = fn->con[r1.val].bits.i;
+            if (v >= 0 && v < (1LL << 31) && (v & (v - 1)) == 0) {
+                if (r9_valid && req(i->to, r9_ref))
+                    r9_invalidate();
+                break;
+            }
+        }
+        /* fall through: a multiply body uses tcc__r9 as scratch */
+    case Odiv: case Oudiv: case Orem: case Ourem:
+        /* a runtime helper (__mul16, __div16, tcc_mul32...) may */
+    case Ocall:
+    case Oalloc4: case Oalloc8: case Oalloc16:
+        r9_invalidate();
         break;
     default:
-        r9_invalidate();
+        /* Arithmetic, logic, shifts, copies, comparisons and extensions
+         * load and store A and X, never tcc__r9: the staged pointer
+         * survives them, unless the instruction defines that very temp.
+         * A loop reading q[0], q[1], q[2] staged q again before each read,
+         * across the `asl a / tax` of an index (a game's text-on-texture
+         * column, 2026-10-16). */
+        if (r9_valid && req(i->to, r9_ref))
+            r9_invalidate();
         break;
     }
 
@@ -8587,6 +8605,60 @@ peephole_fuse_indexed(char **ln, int nl)
         ln[j] = 0;
         removed += 2;
     }
+    /* A value stored only to be the operand of a commutative operation
+     * after the next load (2026-10-16):
+     *
+     *     sta.b T          \
+     *     [ldy ...]         |    ->    [ldy ...]
+     *     lda Y             |          op Y
+     *     op.b T           /
+     *
+     * for ora, and, eor: A at the operation is the stored value either
+     * way, and `op` is commutative. An ldy between leaves A and X alone.
+     * T is a direct-page slot dead after the operation; Y does not read T.
+     * `d = (d & m) | q[1]` kept d in a slot to reload q[1] (a game's
+     * text-on-texture column). */
+    for (i = 0; i < nl; i++) {
+        static const char *cops[] = { "ora", "and", "eor", 0 };
+        const char *ty;
+        char *nl3;
+        int c;
+
+        if (!ln[i] || strncmp(ln[i], "\tsta.b tcc__lf+", 15) != 0)
+            continue;
+        t = pp_operand(ln[i]);
+        if (!pp_slot(t))
+            continue;
+        for (m = pp_next(ln, nl, i); m < nl && pp_is(ln[m], "ldy"); m = pp_next(ln, nl, m))
+            if (pp_operand(ln[m])[0] != '#' && !pp_slot(pp_operand(ln[m])))
+                break;
+        if (m >= nl || !pp_is(ln[m], "lda"))
+            continue;
+        ty = pp_operand(ln[m]);
+        if (!ty || (strstr(ty, "tcc__lf+") && (strcmp(ty, t) == 0
+                                             || abs(atoi(strstr(ty, "tcc__lf+") + 8) - atoi(t + 8)) <= 1)))
+            continue;                   /* Y is T or shares a byte with it */
+        o = pp_next(ln, nl, m);
+        if (o >= nl || ln[o][0] != '\t' || ln[o][4] != '.' || ln[o][5] != 'b'
+            || strcmp(pp_operand(ln[o]), t) != 0)
+            continue;
+        for (c = 0; cops[c]; c++)
+            if (pp_is(ln[o], cops[c]))
+                break;
+        if (!cops[c])
+            continue;
+        snprintf(t1, sizeof t1, "tcc__lf+%d", atoi(t + 8) + 1);
+        if (pp_slot_live_at(ln, nl, t, t1, pp_next(ln, nl, o)) != 0)
+            continue;
+        nl3 = emalloc(strlen(ln[m]) + 1);
+        strcpy(nl3, ln[m]);
+        memcpy(nl3 + 1, cops[c], 3);    /* "\tlda..." -> "\tora..." */
+        ln[o] = nl3;
+        ln[i] = 0;
+        ln[m] = 0;
+        removed += 2;
+    }
+
     /* an ldx the next line overwrites: the fusion above leaves one where
      * the index of the first load was set up for it */
     for (i = 0; i < nl; i++) {
