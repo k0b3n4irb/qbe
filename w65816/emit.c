@@ -7241,6 +7241,18 @@ peephole(char **ln, int nl)
                  * seed 179180: one program in 100,000). */
                 for (k = pp_next(ln, nl, j); k < nl && pp_is(ln[k], "sta"); k = pp_next(ln, nl, k))
                     ;
+                /* a label in the way (the end of a loop body before its
+                 * step): fine when the line after it sets N and Z itself
+                 * (2026-10-16) */
+                if (k < nl && ln[k][0] == '@') {
+                    int k2 = k;
+                    while (k2 < nl && ln[k2][0] == '@')
+                        k2 = pp_next(ln, nl, k2);
+                    if (k2 < nl && (pp_sets_nz_of_a(ln[k2]) || pp_is(ln[k2], "dec")
+                                    || pp_is(ln[k2], "inc") || pp_is(ln[k2], "ldx")
+                                    || pp_is(ln[k2], "ldy")))
+                        k = k2;
+                }
                 if (k < nl && ln[k][0] == '\t' && !pp_barrier(ln[k]) && !pp_is(ln[k], "php")) {
                     ln[j] = 0;
                     removed++;
@@ -8505,6 +8517,237 @@ fuse_x_dead_after(char **ln, int nl, int o)
     return 0;
 }
 
+/* Does the instruction at line n neither read A nor the flags before
+ * writing both? Follows one `jmp @label` to the label's first line. */
+static int
+pp_a_and_flags_dead_at(char **ln, int nl, int n)
+{
+    const char *op;
+    size_t tl;
+    int k;
+
+    if (n >= nl)
+        return 0;
+    if (pp_is(ln[n], "jmp")) {
+        op = pp_operand(ln[n]);
+        if (!op || op[0] != '@')
+            return 0;
+        tl = strlen(op);
+        for (k = 0; k < nl; k++)
+            if (ln[k] && strncmp(ln[k], op, tl) == 0 && strcmp(ln[k] + tl, ":") == 0)
+                break;
+        if (k >= nl)
+            return 0;
+        for (n = pp_next(ln, nl, k); n < nl && ln[n][0] == '@'; n = pp_next(ln, nl, n))
+            ;
+        if (n >= nl)
+            return 0;
+    }
+    return ln[n][0] == '\t' && pp_writes_a(ln[n]) && !pp_reads_a(ln[n])
+        && pp_sets_nz_of_a(ln[n]);
+}
+
+/* A value stored to a slot T only to be copied to the slot S further down
+ * is stored to S at once (2026-10-16):
+ *
+ *     sta T            \           sta S
+ *     ...               |    ->    ...
+ *     lda T             |
+ *     sta S            /
+ *
+ * when the lines between are a straight line that mentions neither T nor
+ * S (nor moves the stack pointer, nor writes through a pointer, for a
+ * stack S), T is dead after the copy, and the line after the copy writes
+ * A and the flags before reading them. A loop's `q += stride` computed
+ * into two temporaries then copied into q (a game's text-on-texture
+ * column): eleven lines to seven. QBE_NO_PEEP_FWDSTORE=1 turns it off. */
+static int
+pp_near_slot(const char *op, const char *t)
+{
+    if (!op || !t)
+        return 0;
+    if (strncmp(op, "tcc__lf+", 8) == 0 && strncmp(t, "tcc__lf+", 8) == 0)
+        return abs(atoi(op + 8) - atoi(t + 8)) <= 1;
+    if (pp_stack(op) && pp_stack(t) && strstr(op, ",s") && strstr(t, ",s"))
+        return abs(atoi(op) - atoi(t)) <= 1;
+    return 0;
+}
+
+static int
+peephole_forward_store(char **ln, int nl)
+{
+    int i, j, k, k1, removed = 0;
+    const char *t, *sop, *op;
+    char t1[64], *nl2;
+
+    if (getenv("QBE_NO_PEEP_FWDSTORE"))
+        return 0;
+    for (i = 0; i < nl; i++) {
+        if (!ln[i] || strncmp(ln[i], "\tsta.b tcc__lf+", 15) != 0)
+            continue;
+        t = pp_operand(ln[i]);
+        if (!pp_slot(t))
+            continue;
+        k = -1;
+        for (j = pp_next(ln, nl, i); j < nl; j = pp_next(ln, nl, j)) {
+            if (pp_barrier(ln[j]))
+                break;
+            op = pp_operand(ln[j]);
+            if (pp_near_slot(op, t)) {
+                if (strcmp(op, t) == 0 && strncmp(ln[j], "\tlda.b ", 7) == 0)
+                    k = j;
+                break;
+            }
+        }
+        if (k < 0)
+            continue;
+        k1 = pp_next(ln, nl, k);
+        if (k1 >= nl || !pp_is(ln[k1], "sta") || strncmp(ln[k1] + 4, ln[i] + 4, 2) != 0)
+            continue;                   /* the same width suffix as the first store */
+        sop = pp_operand(ln[k1]);
+        if (!pp_slot(sop) || pp_near_slot(sop, t))
+            continue;
+        /* nothing between the two stores mentions S, moves the stack (for a
+         * stack S), or writes through a pointer (for a stack S) */
+        for (j = pp_next(ln, nl, i); j < k; j = pp_next(ln, nl, j)) {
+            op = pp_operand(ln[j]);
+            if (pp_near_slot(op, sop))
+                break;
+            if (pp_stack(sop) && (pp_moves_sp(ln[j])
+                                  || (op && pp_indirect(op) && pp_writes_mem(ln[j]))))
+                break;
+        }
+        if (j < k)
+            continue;
+        snprintf(t1, sizeof t1, "tcc__lf+%d", atoi(t + 8) + 1);
+        if (pp_slot_live_at(ln, nl, t, t1, pp_next(ln, nl, k1)) != 0)
+            continue;
+        if (!pp_a_and_flags_dead_at(ln, nl, pp_next(ln, nl, k1)))
+            continue;
+        nl2 = emalloc(strlen(ln[k1]) + 1);
+        strcpy(nl2, ln[k1]);
+        ln[i] = nl2;
+        ln[k] = 0;
+        ln[k1] = 0;
+        removed += 2;
+    }
+    return removed;
+}
+
+/* A counted loop whose test is at its top (2026-10-16):
+ *
+ *     @C:  lda.b S / beq @J            @C:  lda.b S / beq @J
+ *     @B:  ...body...                  @B:  ...body...
+ *          dec.b S          ->              ...the rest of the step...
+ *          ...the rest of the step...       dec.b S
+ *          jmp @C                           bne @B
+ *     @J:                              @J:
+ *
+ * The decrement moves to the end of the step, where its Z flag is the
+ * test `lda S / beq` would make, and the jump back to the test becomes
+ * the branch back to the body: two instructions a turn. When nothing
+ * between the decrement and the jump mentions S or ends the straight line,
+ * the jump is followed by @J, and both @B and @J begin with a line that
+ * writes A and the flags without reading them (A held S there).
+ * QBE_NO_PEEP_DECLOOP=1 turns it off. */
+static int
+peephole_dec_loop(char **ln, int nl)
+{
+    int i, c, b, jl, d, k, w, found = 0;
+    const char *op, *s;
+    size_t tl;
+    char *dec, *bne, t1[64];
+
+    if (getenv("QBE_NO_PEEP_DECLOOP"))
+        return 0;
+    for (i = 0; i < nl; i++) {
+        if (!ln[i] || !pp_is(ln[i], "jmp"))
+            continue;
+        op = pp_operand(ln[i]);
+        if (!op || op[0] != '@')
+            continue;
+        tl = strlen(op);
+        for (c = 0; c < nl; c++)
+            if (ln[c] && strncmp(ln[c], op, tl) == 0 && strcmp(ln[c] + tl, ":") == 0)
+                break;
+        if (c >= nl || c > i)
+            continue;                   /* a backward jump to a label */
+        k = pp_next(ln, nl, c);
+        if (k >= nl || strncmp(ln[k], "\tlda.b ", 7) != 0)
+            continue;
+        s = pp_operand(ln[k]);
+        if (!pp_slot(s) || strncmp(s, "tcc__lf+", 8) != 0)
+            continue;
+        /* the exit: `beq @J`, or before branch relaxation `bne + / jmp @J
+         * / +`; @B is the label right after it */
+        b = pp_next(ln, nl, k);
+        if (b >= nl)
+            continue;
+        if (pp_is(ln[b], "beq")) {
+            op = pp_operand(ln[b]);
+            k = pp_next(ln, nl, b);
+        } else if (strcmp(ln[b], "\tbne +") == 0) {
+            int jj = pp_next(ln, nl, b), pl;
+            if (jj >= nl || !pp_is(ln[jj], "jmp"))
+                continue;
+            pl = pp_next(ln, nl, jj);
+            if (pl >= nl || strcmp(ln[pl], "+") != 0)
+                continue;
+            op = pp_operand(ln[jj]);
+            k = pp_next(ln, nl, pl);
+        } else
+            continue;
+        jl = pp_next(ln, nl, i);        /* @J: right after the jmp */
+        if (jl >= nl || !op || op[0] != '@' || strncmp(ln[jl], op, strlen(op)) != 0
+            || strcmp(ln[jl] + strlen(op), ":") != 0)
+            continue;
+        if (k >= nl || ln[k][0] != '@')
+            continue;                   /* @B */
+        /* the decrement, in the straight line that ends at the jmp */
+        for (d = i - 1; d > b; d--) {
+            if (!ln[d])
+                continue;
+            if (ln[d][0] != '\t' || pp_barrier(ln[d]))
+                break;
+            op = pp_operand(ln[d]);
+            if (op && pp_near_slot(op, s)) {
+                if (!(strncmp(ln[d], "\tdec.b ", 7) == 0 && strcmp(op, s) == 0))
+                    d = 0;
+                break;
+            }
+        }
+        if (d <= b || !ln[d] || strncmp(ln[d], "\tdec.b ", 7) != 0)
+            continue;
+        /* A and the flags at @B and @J: written first */
+        {
+            int nb = k, nj = jl;
+            while (nb < nl && ln[nb][0] == '@')
+                nb = pp_next(ln, nl, nb);
+            while (nj < nl && ln[nj][0] == '@')
+                nj = pp_next(ln, nl, nj);
+            if (nb >= nl || nj >= nl
+                || !(pp_writes_a(ln[nb]) && !pp_reads_a(ln[nb]) && pp_sets_nz_of_a(ln[nb]))
+                || !(pp_writes_a(ln[nj]) && !pp_reads_a(ln[nj]) && pp_sets_nz_of_a(ln[nj])))
+                continue;
+        }
+        (void)t1;
+        dec = ln[d];
+        /* the long form, which the branch pass below shortens to `bne @B`
+         * when @B is in reach: three lines in one, split by the caller */
+        bne = emalloc(strlen(ln[k]) + 24);
+        snprintf(bne, strlen(ln[k]) + 24, "\tbeq +\n\tjmp %.*s\n+", (int)(strlen(ln[k]) - 1), ln[k]);
+        /* move the lines between the decrement and the jmp up by one */
+        for (w = d, k = pp_next(ln, nl, d); k < i; k = pp_next(ln, nl, k))
+            ln[w++] = ln[k];
+        while (w < i - 1)
+            ln[w++] = 0;
+        ln[i - 1] = dec;
+        ln[i] = bne;
+        found++;
+    }
+    return found;
+}
+
 /* An indexed load that only feeds the next operation becomes its operand
  * (2026-10-13):
  *
@@ -8799,7 +9042,8 @@ relax_branches(FILE *in, FILE *out)
                 ln[k++] = ln[i];
         nl = k;
     }
-    if (!getenv("QBE_NO_PEEPHOLE") && (peephole_fuse_indexed(ln, nl) + peephole_xflow(ln, nl))) {
+    if (!getenv("QBE_NO_PEEPHOLE") && (peephole_fuse_indexed(ln, nl) + peephole_forward_store(ln, nl)
+                                       + peephole_xflow(ln, nl))) {
         for (i = k = 0; i < nl; i++)
             if (ln[i])
                 ln[k++] = ln[i];
@@ -8812,6 +9056,32 @@ relax_branches(FILE *in, FILE *out)
                     ln[k++] = ln[i];
             nl = k;
         }
+    }
+    if (!getenv("QBE_NO_PEEPHOLE") && peephole_dec_loop(ln, nl)) {
+        /* the rule writes `beq + / jmp @B / +` as one line: split it */
+        int extra = 0;
+        char **wide;
+        for (i = 0; i < nl; i++)
+            if (ln[i])
+                for (p = ln[i]; (p = strchr(p, '\n')); p++)
+                    extra++;
+        wide = emalloc((nl + extra + 1) * sizeof *wide);
+        for (i = k = 0; i < nl; i++) {
+            if (!ln[i])
+                continue;
+            for (p = ln[i]; ; ) {
+                char *e = strchr(p, '\n');
+                wide[k++] = p;
+                if (!e)
+                    break;
+                *e = 0;
+                p = e + 1;
+            }
+        }
+        free(ln);
+        ln = wide;
+        nl = k;
+        cap = nl + extra + 1;
     }
     if (!getenv("QBE_NO_PEEPHOLE") && peephole_entry(ln, nl)) {
         for (i = k = 0; i < nl; i++)
