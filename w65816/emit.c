@@ -8916,6 +8916,340 @@ peephole_fuse_indexed(char **ln, int nl)
     return removed;
 }
 
+/* A far pointer kept in tcc__r9 for a whole loop (2026-10-16, the first
+ * game's text walk):
+ *
+ *     @H:  ...                          lda.b Q / sta.b tcc__r9
+ *          lda.b Q / sta.b tcc__r9      lda.b Q+2 / sta.b tcc__r9+2
+ *          lda.b Q+2 / sta.b tcc__r9+2  @H:  ...
+ *          lda [tcc__r9],y           ->      lda [tcc__r9],y
+ *          ...                               ...
+ *          adc.w #6 / sta.b Q                adc.w #6 / sta.b tcc__r9
+ *          jmp @H                            jmp @H
+ *
+ * The pointer each turn stages into tcc__r9 lives there for the whole loop,
+ * from its header H to the last line naming H: four instructions a turn
+ * fewer, its step written to tcc__r9 directly. Exact when, in the region:
+ * every write of tcc__r9 is a staging of that same Q, every other mention
+ * of tcc__r9 is a `[tcc__r9]` / `[tcc__r9],y` access, and Q is not written
+ * between a staging and a read through tcc__r9 that follows it in its block
+ * (then tcc__r9 == Q at every such read, before and after); Q's bytes are
+ * named only as Q and Q+2; no call, no `jml`, no direct-page change; every
+ * label of the region is entered from the region only (H also by falling
+ * in), and Q is dead wherever the region is left. The staging moved before
+ * H clobbers A and N/Z, so H's first instruction writes A without reading
+ * it; so does the one after each staging taken out. When Q is read after
+ * the loop, at the line after its end, tcc__r9 is copied back to Q there —
+ * only where the loop alone leads (after that line's label when every way
+ * in is the loop's, before it when the loop falls in and others branch
+ * there); another exit with Q live, and the rule refuses. The codegen invalidates
+ * its tcc__r9 cache at every block (B2), so a read through tcc__r9 is always
+ * preceded by a staging in its own block: a label resets the reading.
+ * QBE_NO_PEEP_R9LOOP=1 turns it off. */
+static int
+pp_dp_mention(const char *op, const char *slot)
+{
+    /* the operand names `slot` (tcc__lf+N), not tcc__lf+N0... */
+    size_t sl = strlen(slot);
+    const char *q;
+
+    for (q = strstr(op, slot); q; q = strstr(q + 1, slot))
+        if (!(q[sl] >= '0' && q[sl] <= '9'))
+            return 1;
+    return 0;
+}
+
+static int
+pp_label_line(const char *l)
+{
+    size_t n;
+
+    if (!l)
+        return 0;
+    if (l[0] == '@')
+        return 1;
+    n = strspn(l, "+");
+    if (n && l[n] == 0)
+        return 1;
+    n = strspn(l, "-");
+    return n && l[n] == 0;
+}
+
+static int
+pp_writes_a_only(const char *l)
+{
+    return l && (pp_is(l, "lda") || pp_is(l, "txa") || pp_is(l, "tya") || pp_is(l, "pla"));
+}
+
+/* the line a branch at i goes to, -1 if not a branch, -2 if unknown */
+static int
+pp_branch_target(char **ln, int nl, int i)
+{
+    static const char *br[] = { "bcc", "bcs", "beq", "bne", "bmi", "bpl", "bvc", "bvs",
+        "bra", "brl", "jmp", 0 };
+    const char *op;
+    size_t tl;
+    int k, m = 0;
+
+    for (k = 0; br[k]; k++)
+        if (pp_is(ln[i], br[k]))
+            m = 1;
+    if (!m)
+        return -1;
+    op = pp_operand(ln[i]);
+    tl = strlen(op);
+    if (op[0] == '@') {
+        for (k = 0; k < nl; k++)
+            if (strncmp(ln[k], op, tl) == 0 && strcmp(ln[k] + tl, ":") == 0)
+                return k;
+        return -2;
+    }
+    if (tl && strspn(op, "+") == tl) {
+        for (k = i + 1; k < nl; k++)
+            if (strspn(ln[k], "+") == tl && ln[k][tl] == 0)
+                return k;
+        return -2;
+    }
+    if (tl && strspn(op, "-") == tl) {
+        for (k = i - 1; k >= 0; k--)
+            if (strspn(ln[k], "-") == tl && ln[k][tl] == 0)
+                return k;
+        return -2;
+    }
+    return -2;
+}
+
+static int
+pp_is_staging(char **ln, int nl, int i, const char *q, const char *q2)
+{
+    return i + 3 < nl && strncmp(ln[i], "\tlda.b ", 7) == 0 && strcmp(ln[i] + 7, q) == 0
+        && strcmp(ln[i + 1], "\tsta.b tcc__r9") == 0
+        && strncmp(ln[i + 2], "\tlda.b ", 7) == 0 && strcmp(ln[i + 2] + 7, q2) == 0
+        && strcmp(ln[i + 3], "\tsta.b tcc__r9+2") == 0;
+}
+
+/* one loop at most; returns 1 when rewritten (the caller calls again) */
+static int
+peephole_r9_loop_one(char ***lnp, int *nlp, int *capp, int from)
+{
+    char **ln = *lnp, **out, q[32], q2[32], qm[32], q1[32], q3[32];
+    int nl = *nlp, s, h, e, i, k, t, n, dirty, ok, lv, tox, copyat;
+    const char *op;
+
+    for (s = from; s + 3 < nl; s++) {
+        if (strncmp(ln[s], "\tlda.b tcc__lf+", 15) != 0 || strcmp(ln[s + 1], "\tsta.b tcc__r9") != 0)
+            continue;
+        n = atoi(ln[s] + 15);
+        snprintf(q, sizeof q, "tcc__lf+%d", n);
+        snprintf(q2, sizeof q2, "tcc__lf+%d", n + 2);
+        if (!pp_is_staging(ln, nl, s, q, q2))
+            continue;
+        snprintf(qm, sizeof qm, "tcc__lf+%d", n - 1);
+        snprintf(q1, sizeof q1, "tcc__lf+%d", n + 1);
+        snprintf(q3, sizeof q3, "tcc__lf+%d", n + 3);
+        /* the innermost loop around s: the nearest `@H:` before s named by a
+         * branch after s; the region ends at the last line naming H */
+        for (h = s - 1; h >= 0; h--) {
+            size_t hl;
+            if (ln[h][0] != '@')
+                continue;
+            hl = strlen(ln[h]) - 1;
+            e = -1;
+            for (k = s + 4; k < nl; k++) {
+                op = pp_operand(ln[k]);
+                if (op && strncmp(op, ln[h], hl) == 0 && op[hl] == 0 && pp_branch_target(ln, nl, k) == h)
+                    e = k;
+            }
+            if (e < 0)
+                continue;
+            /* H is entered by falling in (a label just before it, such as the
+             * `+` of `bne + / jmp @J / +`, is entered by a branch) */
+            k = h - 1;
+            if (k < 0 || pp_is(ln[k], "jmp") || pp_is(ln[k], "bra") || pp_is(ln[k], "brl")
+                || pp_is(ln[k], "rtl") || pp_is(ln[k], "rts") || pp_is(ln[k], "rti"))
+                break;
+            ok = 1;
+            tox = 0;
+            /* nothing outside enters the region but by H's fall-in */
+            for (k = 0; k < nl && ok; k++) {
+                if (k >= h && k <= e)
+                    continue;
+                t = pp_branch_target(ln, nl, k);
+                if (t == -2 || (t >= h && t <= e))
+                    ok = 0;
+            }
+            /* the region's own lines */
+            dirty = 1;
+            for (k = h + 1; k <= e && ok; k++) {
+                const char *l = ln[k];
+                if (pp_label_line(l)) {
+                    dirty = 1;
+                    continue;
+                }
+                if (pp_is_staging(ln, nl, k, q, q2)) {
+                    int nx = k + 4;
+                    if (nx > e || !pp_writes_a_only(ln[nx]))
+                        ok = 0;
+                    dirty = 0;
+                    k += 3;
+                    continue;
+                }
+                if (l[0] != '\t') {
+                    ok = 0;
+                    continue;
+                }
+                if (pp_is(l, "jsl") || pp_is(l, "jsr") || pp_is(l, "jml") || pp_is(l, "rtl")
+                    || pp_is(l, "rts") || pp_is(l, "rti") || pp_is(l, "mvn") || pp_is(l, "mvp")
+                    || pp_is(l, "tcd") || pp_is(l, "pld") || pp_is(l, "brk") || pp_is(l, "cop")) {
+                    ok = 0;
+                    continue;
+                }
+                t = pp_branch_target(ln, nl, k);
+                if (t == -2) {
+                    ok = 0;
+                    continue;
+                }
+                if (t >= 0 && (t < h || t > e)) {
+                    if (t == e + 1)
+                        tox = 1;            /* to the line after the region */
+                    else {
+                        lv = pp_slot_live_at(ln, nl, q, q1, t);
+                        if (lv == 0)
+                            lv = pp_slot_live_at(ln, nl, q2, q3, t);
+                        if (lv != 0)
+                            ok = 0;
+                    }
+                }
+                op = pp_operand(l);
+                if (!op || !*op)
+                    continue;
+                if (strstr(op, "tcc__r9")) {
+                    if (strcmp(op, "[tcc__r9]") != 0 && strcmp(op, "[tcc__r9],y") != 0)
+                        ok = 0;
+                    else if (dirty)
+                        ok = 0;             /* tcc__r9 read with Q moved since its staging */
+                    continue;
+                }
+                if (pp_dp_mention(op, qm) || pp_dp_mention(op, q1) || pp_dp_mention(op, q3))
+                    ok = 0;
+                else if (pp_dp_mention(op, q) || pp_dp_mention(op, q2)) {
+                    if (strcmp(op, q) != 0 && strcmp(op, q2) != 0)
+                        ok = 0;
+                    else if (pp_writes_mem(l))
+                        dirty = 1;
+                }
+            }
+            /* the line after the region, X: entered by a conditional end,
+             * or by a branch of the region. When Q is read from X on,
+             * tcc__r9 is copied back to Q where only the region leads */
+            copyat = -1;
+            if (ok && (tox || (!pp_is(ln[e], "jmp") && !pp_is(ln[e], "bra") && !pp_is(ln[e], "brl")))) {
+                int x = e + 1, outside = 0, fall = !pp_is(ln[e], "jmp") && !pp_is(ln[e], "bra")
+                                                  && !pp_is(ln[e], "brl");
+                if (x >= nl) {
+                    ok = 0;
+                    break;
+                }
+                lv = pp_slot_live_at(ln, nl, q, q1, x);
+                if (lv == 0)
+                    lv = pp_slot_live_at(ln, nl, q2, q3, x);
+                if (lv < 0)
+                    ok = 0;
+                else if (lv > 0) {
+                    for (k = 0; k < nl; k++)
+                        if ((k < h || k > e) && pp_branch_target(ln, nl, k) == x)
+                            outside = 1;
+                    if (!outside)
+                        copyat = pp_label_line(ln[x]) ? x + 1 : x;
+                    else if (fall && !tox)
+                        copyat = x;         /* between the end and X: the fall only */
+                    else
+                        ok = 0;
+                    if (ok) {
+                        for (k = copyat; k < nl && pp_label_line(ln[k]); k++)
+                            ;
+                        if (k >= nl || !pp_writes_a_only(ln[k]))
+                            ok = 0;         /* the copy clobbers A and N/Z */
+                    }
+                }
+            }
+            /* H's first instruction writes A and N/Z without reading A */
+            if (ok) {
+                for (k = h + 1; k <= e && pp_label_line(ln[k]); k++)
+                    ;
+                if (pp_is_staging(ln, nl, k, q, q2))
+                    k += 4;
+                if (k > e || !pp_writes_a_only(ln[k]))
+                    ok = 0;
+            }
+            if (!ok)
+                break;                      /* an outer loop would hold this one */
+            /* rewrite */
+            out = emalloc((nl + 8 + 1) * sizeof *out);
+            for (i = t = 0; i < nl; i++) {
+                if (i == copyat) {
+                    char *c4 = emalloc(4 * 24 + 2 * strlen(q2));
+                    char *p4 = c4;
+                    out[t++] = p4; p4 += sprintf(p4, "\tlda.b tcc__r9") + 1;
+                    out[t++] = p4; p4 += sprintf(p4, "\tsta.b %s", q) + 1;
+                    out[t++] = p4; p4 += sprintf(p4, "\tlda.b tcc__r9+2") + 1;
+                    out[t++] = p4; sprintf(p4, "\tsta.b %s", q2);
+                }
+                if (i == h) {
+                    out[t++] = ln[s];
+                    out[t++] = ln[s + 1];
+                    out[t++] = ln[s + 2];
+                    out[t++] = ln[s + 3];
+                }
+                if (i > h && i <= e && pp_is_staging(ln, nl, i, q, q2)) {
+                    if (i == s) {
+                        i += 3;             /* its lines moved before H */
+                        continue;
+                    }
+                    i += 3;
+                    continue;
+                }
+                if (i > h && i <= e && ln[i][0] == '\t') {
+                    op = pp_operand(ln[i]);
+                    if (op && (strcmp(op, q) == 0 || strcmp(op, q2) == 0)) {
+                        size_t pre = (size_t)(op - ln[i]);
+                        char *nw = emalloc(pre + 16);
+                        memcpy(nw, ln[i], pre);
+                        strcpy(nw + pre, strcmp(op, q) == 0 ? "tcc__r9" : "tcc__r9+2");
+                        out[t++] = nw;
+                        continue;
+                    }
+                }
+                out[t++] = ln[i];
+            }
+            free(ln);
+            *lnp = out;
+            *nlp = t;
+            *capp = nl + 9;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int
+peephole_r9_loop(char ***lnp, int *nlp, int *capp)
+{
+    int k, found = 0;
+    char **ln = *lnp;
+
+    if (getenv("QBE_NO_PEEP_R9LOOP"))
+        return 0;
+    /* no holes: the rule reads neighbours */
+    for (int i = k = 0; i < *nlp; i++)
+        if (ln[i])
+            ln[k++] = ln[i];
+    *nlp = k;
+    while (found < 64 && peephole_r9_loop_one(lnp, nlp, capp, 0))
+        found++;
+    return found;
+}
+
 static int
 peephole_entry(char **ln, int nl)
 {
@@ -9083,6 +9417,8 @@ relax_branches(FILE *in, FILE *out)
         nl = k;
         cap = nl + extra + 1;
     }
+    if (!getenv("QBE_NO_PEEPHOLE"))
+        peephole_r9_loop(&ln, &nl, &cap);
     if (!getenv("QBE_NO_PEEPHOLE") && peephole_entry(ln, nl)) {
         for (i = k = 0; i < nl; i++)
             if (ln[i])
