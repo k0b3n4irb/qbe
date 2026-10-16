@@ -633,6 +633,9 @@ int pinned(Ins *);
 void gcm(Fn *);
 void ivar(Fn *);
 
+/* reassoc.c */
+void reassoc(Fn *);
+
 /* simpl.c */
 void simpl(Fn *);
 

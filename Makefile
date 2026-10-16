@@ -5,7 +5,7 @@ PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
 
 COMMOBJ  = main.o util.o parse.o abi.o cfg.o mem.o ssa.o alias.o load.o \
-           copy.o fold.o gvn.o gcm.o ivar.o simpl.o live.o spill.o rega.o emit.o \
+           copy.o fold.o gvn.o gcm.o ivar.o reassoc.o simpl.o live.o spill.o rega.o emit.o \
            inline.o
 AMD64OBJ = amd64/targ.o amd64/sysv.o amd64/isel.o amd64/emit.o
 ARM64OBJ = arm64/targ.o arm64/abi.o arm64/isel.o arm64/emit.o

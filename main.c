@@ -236,6 +236,7 @@ finalize_and_emit(Fn *fn, FILE *out)
 		filluse(fn);
 	}
 	filldom(fn);
+	reassoc(fn);
 	gvn(fn);
 	fillcfg(fn);
 	filluse(fn);
@@ -327,6 +328,7 @@ func(Fn *fn)
 			fillcfg(fn); filluse(fn);
 		}
 		filldom(fn);
+		reassoc(fn);
 		gvn(fn);
 		fillcfg(fn); filluse(fn); simpljnz(fn); filluse(fn);
 		ivar(fn);
