@@ -21,7 +21,8 @@
  *     %m =l mul %e, 2
  *     %p =l add $buf+16, %m
  *
- * gvn, which runs next, makes %e and %m the first access's. The bound is
+ * gvn, which runs next, makes %e and %m the first access's. The symbol
+ * may come through `%t =l add $buf, c` (a union member, `u.w[i + 8]`). The bound is
  * PROVED from x's definition only, through copies — `extub` (255), `and x,
  * M` (M), `shr x, s` (0xFFFF >> s): the compiler does not reason from an out-of-bounds
  * access being undefined (owner decision, 2026-10-16). %e and %m must have
@@ -83,12 +84,38 @@ bound(Fn *fn, Ref r)
 	}
 }
 
+/* the address r stands for, when it is a symbol plus a constant: the
+ * symbol itself, or `%t =l add $sym, c` (a union member, `u.w[x]`) */
+static int
+symof(Fn *fn, Ref r, Con *out)
+{
+	Ins *d;
+	int64_t v;
+	int j;
+
+	if (rtype(r) == RCon && fn->con[r.val].type == CAddr) {
+		*out = fn->con[r.val];
+		return 1;
+	}
+	d = def1(fn, r);
+	if (!d || d->op != Oadd || d->cls != Kl)
+		return 0;
+	for (j = 0; j < 2; j++)
+		if (rtype(d->arg[j]) == RCon && fn->con[d->arg[j].val].type == CAddr
+		    && cbits(fn, d->arg[1 - j], &v)) {
+			*out = fn->con[d->arg[j].val];
+			out->bits.i += v;
+			return 1;
+		}
+	return 0;
+}
+
 void
 reassoc(Fn *fn)
 {
 	Blk *b;
 	Ins *i, *m, *e, *a, *xd;
-	Ref sym, mt, x;
+	Ref mt, x;
 	Con c;
 	int64_t k, cst, bx;
 	int s, done;
@@ -100,11 +127,9 @@ reassoc(Fn *fn)
 		for (i = b->ins; i < &b->ins[b->nins]; i++) {
 			if (i->op != Oadd || i->cls != Kl)
 				continue;
-			s = rtype(i->arg[0]) == RCon && fn->con[i->arg[0].val].type == CAddr ? 0
-			  : rtype(i->arg[1]) == RCon && fn->con[i->arg[1].val].type == CAddr ? 1 : -1;
+			s = symof(fn, i->arg[0], &c) ? 0 : symof(fn, i->arg[1], &c) ? 1 : -1;
 			if (s < 0)
 				continue;
-			sym = i->arg[s];
 			mt = i->arg[1 - s];
 			m = def1(fn, mt);
 			if (!m || m->cls != Kl || fn->tmp[mt.val].nuse != 1)
@@ -145,7 +170,6 @@ reassoc(Fn *fn)
 				e->op = Oextuh;
 				e->arg[0] = x;
 			}
-			c = fn->con[sym.val];
 			c.bits.i += cst * k;
 			i->arg[s] = newcon(&c, fn);
 			done++;
