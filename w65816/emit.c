@@ -6058,6 +6058,12 @@ emitins(Ins *i, Fn *fn)
     case Oalloc4:
     case Oalloc8:
     case Oalloc16:
+        /* Every alloc gets a fixed frame slot; a size known only at run
+         * time (a variable-length array) has none. cproc refuses VLAs, this
+         * catches any other front end (audit 04-1). */
+        if (rtype(i->arg[0]) != RCon)
+            err("alloc of a size known only at run time (a variable-length "
+                "array) is not supported on w65816");
         if (framesize == 0)
             break;  /* frameless — allocs are dead, skip */
         /* alloc returns a pointer to stack space.
