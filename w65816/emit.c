@@ -2856,7 +2856,7 @@ color_slots(Fn *fn, int base)
     int nt = fn->ntmp, words = (nt + 63) / 64;
     unsigned long long *adj;
     int *order, norder = 0, *start, maxslot = base;
-    char *seen, *occ, *cross;
+    char *seen, *occ, *cross, *addr;
     BSet live[1];
     Blk *b, *pb;
     Ins *i;
@@ -2867,6 +2867,11 @@ color_slots(Fn *fn, int base)
     int opnd_share = phi_share && !getenv("QBE_NO_OPND_SHARE");
     int *pref;                  /* an argument's phi result */
     struct { int to, arg; } *pa;
+    /* A 32-bit add, sub, and, or, xor or copy and an operand of it: the
+     * same slot or apart, never half over each other (see below) */
+    int kl_share = phi_share && !getenv("QBE_NO_KL_SHARE");
+    struct { int to, arg; } *ex;
+    int nex = 0, nins = 0;
     char dpocc[DPF_WORDS + 2];
 
     adj = calloc((size_t)nt * words, sizeof *adj);
@@ -2879,8 +2884,42 @@ color_slots(Fn *fn, int base)
         for (p = b->phi; p; p = p->link)
             n += p->narg;
     pa = calloc(n + 1, sizeof *pa);
-    if (!adj || !seen || !order || !start || !cross || !pref || !pa)
+    for (b = fn->start; b; b = b->link)
+        nins += b->nins;
+    ex = calloc(2 * (size_t)nins + 1, sizeof *ex);
+    /* A 32-bit value that is, or leads by adds and copies to, the address
+     * of a load or a store: its add may be folded into the access
+     * (far_decomp_all), which then reads the operands where the access is,
+     * after the result has been written. Such a result never shares its
+     * operand's slot (`str += n; c = *str;` read str + n + n). */
+    addr = calloc(nt, 1);
+    if (!adj || !seen || !order || !start || !cross || !pref || !pa || !ex || !addr)
         die("out of memory");
+    for (b = fn->start; b; b = b->link)
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (isload(i->op) && rtype(i->arg[0]) == RTmp)
+                addr[i->arg[0].val] = 1;
+            if (isstore(i->op) && rtype(i->arg[1]) == RTmp)
+                addr[i->arg[1].val] = 1;
+            if ((i->op == Oblit0 || i->op == Oblit1) && rtype(i->arg[0]) == RTmp)
+                addr[i->arg[0].val] = 1;
+            if (i->op == Oblit0 && rtype(i->arg[1]) == RTmp)
+                addr[i->arg[1].val] = 1;
+        }
+    for (changed = 1; changed;) {
+        changed = 0;
+        for (b = fn->start; b; b = b->link)
+            for (i = b->ins; i < &b->ins[b->nins]; i++) {
+                if (rtype(i->to) != RTmp || !addr[i->to.val]
+                    || !(i->op == Oadd || i->op == Osub || i->op == Ocopy))
+                    continue;
+                for (k = 0; k < 2; k++)
+                    if (rtype(i->arg[k]) == RTmp && !addr[i->arg[k].val]) {
+                        addr[i->arg[k].val] = 1;
+                        changed = 1;
+                    }
+            }
+    }
     for (b = fn->start; b; b = b->link)
         for (p = b->phi; p; p = p->link) {
             if (rtype(p->to) != RTmp || p->to.val < Tmp0)
@@ -2951,13 +2990,32 @@ color_slots(Fn *fn, int base)
                 t = i->to.val;
                 for (u = 0; bsiter(live, &u); u++)
                     slot_edge(adj, words, t, u);
-                for (k = 0; k < 2; k++)
-                    if (rtype(i->arg[k]) == RTmp
-                        && !(opnd_share && i->cls == Kw
-                             && fn->tmp[i->arg[k].val].cls == Kw
-                             && (i->op == Oadd || i->op == Osub || i->op == Oand
-                                 || i->op == Oor || i->op == Oxor || i->op == Ocopy)))
-                        slot_edge(adj, words, t, i->arg[k].val);
+                for (k = 0; k < 2; k++) {
+                    int word_op = i->op == Oadd || i->op == Osub || i->op == Oand
+                                  || i->op == Oor || i->op == Oxor || i->op == Ocopy;
+                    if (rtype(i->arg[k]) != RTmp)
+                        continue;
+                    if (opnd_share && word_op && i->cls == Kw
+                        && fn->tmp[i->arg[k].val].cls == Kw)
+                        continue;
+                    /* A 32-bit one reads each word of its operands before
+                     * it writes the same word of its result (low, then
+                     * high): the result may take an operand's slot
+                     * exactly, which keeps a loop-carried value in place
+                     * (the phi move becomes a copy onto itself). Half
+                     * over it, it would overwrite the high word it has
+                     * yet to read: the pair is kept apart or equal, as a
+                     * phi and its argument are. The slot-ownership check
+                     * stops the build if a lowering reads a word after
+                     * writing it. QBE_NO_KL_SHARE=1 for an A/B. */
+                    if (kl_share && word_op && i->cls == Kl && i->arg[k].val >= Tmp0
+                        && fn->tmp[i->arg[k].val].cls == Kl && !addr[t]) {
+                        ex[nex].to = t;
+                        ex[nex++].arg = i->arg[k].val;
+                        continue;
+                    }
+                    slot_edge(adj, words, t, i->arg[k].val);
+                }
                 bsclr(live, t);
             }
             for (k = 0; k < 2; k++)
@@ -3051,10 +3109,21 @@ color_slots(Fn *fn, int base)
                         occ[su + a] = 1;
             }
         }
-        /* the slot of the phi it feeds, or of an argument already placed */
-        for (k = 0; want && k < 2; k++) {
+        /* the slot of the phi it feeds, or of an argument already placed;
+         * then that of an operand or result it may share exactly (ex) */
+        for (k = 0; k < 2 + nex; k++) {
             int su;
+            if (k < 2 && !want)
+                continue;
             u = k == 0 ? want : 0;
+            if (k >= 2) {
+                if (ex[k - 2].to == t)
+                    u = ex[k - 2].arg;
+                else if (ex[k - 2].arg == t)
+                    u = ex[k - 2].to;
+                else
+                    continue;
+            }
             if (k == 0 && want && fn->tmp[want].slot < 0) {
                 /* the phi is not placed yet: another of its arguments */
                 for (a = 0; a < npa; a++)
@@ -3089,12 +3158,14 @@ color_slots(Fn *fn, int base)
                     ;
             }
             /* and no other partner of t half over it */
-            for (n2 = 0; a == w && n2 < npa; n2++) {
+            for (n2 = 0; a == w && n2 < npa + nex; n2++) {
                 int v, sv;
-                if (pa[n2].to == t)
-                    v = pa[n2].arg;
-                else if (pa[n2].arg == t)
-                    v = pa[n2].to;
+                int pto = n2 < npa ? pa[n2].to : ex[n2 - npa].to;
+                int parg = n2 < npa ? pa[n2].arg : ex[n2 - npa].arg;
+                if (pto == t)
+                    v = parg;
+                else if (parg == t)
+                    v = pto;
                 else
                     continue;
                 sv = fn->tmp[v].slot;
@@ -3115,12 +3186,14 @@ color_slots(Fn *fn, int base)
         /* Not the same slot, then not half of it either: a phi and its
          * argument have no edge between them, and first fit would let two
          * 32-bit ones overlap by one word. */
-        for (a = 0; a < npa; a++) {
+        for (a = 0; a < npa + nex; a++) {
             int su, wu;
-            if (pa[a].to == t)
-                u = pa[a].arg;
-            else if (pa[a].arg == t)
-                u = pa[a].to;
+            int pto = a < npa ? pa[a].to : ex[a - npa].to;
+            int parg = a < npa ? pa[a].arg : ex[a - npa].arg;
+            if (pto == t)
+                u = parg;
+            else if (parg == t)
+                u = pto;
             else
                 continue;
             su = fn->tmp[u].slot;
@@ -3153,6 +3226,8 @@ color_slots(Fn *fn, int base)
     free(occ);
     free(pref);
     free(pa);
+    free(ex);
+    free(addr);
     free(cross);
     free(adj);
     free(seen);
@@ -4431,20 +4506,42 @@ emitins(Ins *i, Fn *fn)
         /* === Kl (32-bit) bitwise AND — independent halves, no carry ===
          * Each half is and'd against the matching half of the other operand.
          * A-cache swap optimisation skipped for the Kl path (rarely
-         * profitable when both halves must be touched). */
+         * profitable when both halves must be touched). A constant half of
+         * $FFFF is the identity and is not emitted (`x & 0x00FFFFFF`, a
+         * 24-bit address: its low word was `and.w #65535`). */
         if (i->cls == Kl) {
-            emitload(r0, fn);
-            emitop2("and", r1, fn);
-            emitstore(i->to, fn);
+            int lo_id = rtype(r1) == RCon && fn->con[r1.val].type == CBits
+                        && (fn->con[r1.val].bits.i & 0xFFFF) == 0xFFFF;
+            int hi_id = rtype(r1) == RCon && fn->con[r1.val].type == CBits
+                        && ((fn->con[r1.val].bits.i >> 16) & 0xFFFF) == 0xFFFF;
+            /* the result in its operand's own slot (color_slots' exact
+             * share): an identity half is already there */
+            int same = rtype(r0) == RTmp && r0.val >= Tmp0 && rtype(i->to) == RTmp
+                       && i->to.val >= Tmp0 && fn->tmp[r0.val].slot >= 0
+                       && fn->tmp[r0.val].slot == fn->tmp[i->to.val].slot
+                       && !(alias_opt && r0.val - Tmp0 < MAX_ALIAS_TEMPS && temp_alias[r0.val - Tmp0])
+                       && !(alias_opt && i->to.val - Tmp0 < MAX_ALIAS_TEMPS && temp_alias[i->to.val - Tmp0]);
+            if (!(lo_id && same)) {
+                emitload(r0, fn);
+                if (!lo_id)
+                    emitop2("and", r1, fn);
+                emitstore(i->to, fn);
+            } else
+                slot_wrote(i->to, 0);   /* the word is the result's now */
             /* addr_only dest: its high half is never read, and
              * mark_addr_only_kl let the operands skip theirs on that
              * promise (is_high_dead_propagating). Computing it anyway
              * read a high word nobody wrote — the Kl invariant stopped
              * the build on `a[x & 7]` with a long x (difftest, 2026-10-08). */
-            if (!ref_to_is_addr_only(i->to)) {
+            if (!ref_to_is_addr_only(i->to) && !(hi_id && same)) {
                 emit_load_high(r0, fn, 0);
-                emitop2_high("and", r1, fn);
+                if (!hi_id)
+                    emitop2_high("and", r1, fn);
                 emit_store_high(i->to, fn);
+            } else if (hi_id && same
+                       && !(i->to.val - Tmp0 < MAX_ALLOC_TEMPS && temp_narrow[i->to.val - Tmp0])) {
+                note_high_written(i->to);   /* the high word is the result's too */
+                slot_wrote(i->to, 1);
             }
             acache_invalidate();
             break;
