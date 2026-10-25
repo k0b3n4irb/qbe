@@ -1234,6 +1234,25 @@ is_high_dead_propagating(int op)
     }
 }
 
+/* A 32-bit multiply by a constant power of two above 1 is a left shift:
+ * when its result's high half is dead, the emitter computes the low half
+ * from the operand's low half alone (Omul, the skip_high path), so the
+ * operand's high half is dead too. `tab[i]` with a u16 i: the index is
+ * widened to 32 bits, multiplied by the element size and used as a 16-bit
+ * X; the widening's `lda #0 / sta hi` was written for nobody (point 4 of
+ * .claude/notes/chantiers/loop_carried_u32.md, 2026-10-25). */
+static int
+is_pow2_mul(Ins *i, Fn *fn)
+{
+    int64_t v;
+
+    if (i->op != Omul || i->cls != Kl || rtype(i->arg[1]) != RCon
+        || fn->con[i->arg[1].val].type != CBits || getenv("QBE_NO_MUL_HIGH_DEAD"))
+        return 0;
+    v = fn->con[i->arg[1].val].bits.i;
+    return v > 1 && v < (1LL << 31) && (v & (v - 1)) == 0;
+}
+
 static void
 mark_addr_only_kl(Fn *fn)
 {
@@ -1332,7 +1351,8 @@ mark_addr_only_kl(Fn *fn)
 
                 /* Propagating use? Op is one of the high-dead-propagating
                  * binary/unary ops AND the op produces Kl. */
-                if (i->cls == Kl && is_high_dead_propagating(i->op)) {
+                if (i->cls == Kl && (is_high_dead_propagating(i->op)
+                                     || (a == 0 && is_pow2_mul(i, fn)))) {
                     prop_use[idx]++;
                     continue;
                 }
@@ -1375,7 +1395,7 @@ mark_addr_only_kl(Fn *fn)
         for (b = fn->start; b; b = b->link) {
             for (i = b->ins; i < &b->ins[b->nins]; i++) {
                 if (i->cls != Kl) continue;
-                if (!is_high_dead_propagating(i->op)) continue;
+                if (!is_high_dead_propagating(i->op) && !is_pow2_mul(i, fn)) continue;
                 if (rtype(i->to) != RTmp || i->to.val < Tmp0) continue;
                 int dst_idx = i->to.val - Tmp0;
                 if (dst_idx < 0 || dst_idx >= MAX_ALIAS_TEMPS) continue;
@@ -1960,6 +1980,71 @@ far_store_via_ptr(Ins *i, Fn *fn)
         return 0;
     if (getallocslot(r1, fn) >= 0)
         return 0;   /* the address IS a stack local — bank 0 by construction */
+    return 1;
+}
+
+/* A 32-bit far load whose only use is the 32-bit add right after it
+ * (2026-10-25, point 3 of .claude/notes/chantiers/loop_carried_u32.md):
+ *     %v =l load [far]          lda.l tab,x / sta v / lda.l tab+2,x / sta v+2
+ *     %s =l add %v, %w          lda v / clc / adc w / sta s / lda v+2 / ...
+ * becomes `lda.l tab,x / clc / adc w / sta s / lda.l tab+2,x / adc w+2 /
+ * sta s+2`: the value goes from the table to the adc, not through a slot.
+ * Between the two halves only stores and the other operand's `adc` run,
+ * which leave X, Y, tcc__r9 and the carry alone (the high half's operand
+ * is ldy / iny at most). The other operand is a slotted temp or a
+ * constant; the loaded value has no other use. QBE_NO_LOAD_ADD_FUSE=1. */
+static int
+try_fuse_kl_load_add(Ins *i, Blk *b, Fn *fn)
+{
+    Ins *a;
+    Ref v, w;
+    char opnd[96];
+    const char *sfx;
+    int k, vidx, skip_high, aidx;
+
+    if (i->op != Oload || i->cls != Kl || !is_far(i) || i + 1 >= &b->ins[b->nins]
+        || getenv("QBE_NO_LOAD_ADD_FUSE"))
+        return 0;
+    v = i->to;
+    if (rtype(v) != RTmp || v.val < Tmp0 || ref_to_is_addr_only(v))
+        return 0;
+    vidx = v.val - Tmp0;
+    if (vidx >= MAX_ALIAS_TEMPS || temp_use_count[vidx] != 1)
+        return 0;
+    a = i + 1;
+    if (a->op != Oadd || a->cls != Kl || rtype(a->to) != RTmp || a->to.val < Tmp0)
+        return 0;
+    aidx = far_addr_idx(a->to);
+    if (aidx >= 0 && far_decomp_all[aidx])
+        return 0;                       /* folded into its accesses: not emitted */
+    if (req(a->arg[0], v) && !req(a->arg[1], v))
+        w = a->arg[1];
+    else if (req(a->arg[1], v) && !req(a->arg[0], v))
+        w = a->arg[0];
+    else
+        return 0;
+    if (rtype(w) == RCon) {
+        if (fn->con[w.val].type != CBits)
+            return 0;
+    } else if (rtype(w) != RTmp || w.val < Tmp0 || fn->tmp[w.val].slot < 0
+               || fn->tmp[w.val].cls != Kl
+               || (w.val - Tmp0 < MAX_ALLOC_TEMPS && temp_narrow[w.val - Tmp0])
+               || (alias_opt && w.val - Tmp0 < MAX_ALIAS_TEMPS && temp_alias[w.val - Tmp0]))
+        return 0;
+    skip_high = ref_to_is_addr_only(a->to);
+    emit_rep20();
+    k = emit_far_operand(i, i->arg[0], fn, opnd, sizeof opnd, &sfx);
+    fprintf(outf, "	lda%s %s\n", sfx, opnd);
+    fprintf(outf, "	clc\n");
+    emitop2("adc", w, fn);
+    emitstore(a->to, fn);
+    if (!skip_high) {
+        emit_far_operand_hi(i->arg[0], fn, k, opnd, sizeof opnd);
+        fprintf(outf, "	lda%s %s\n", sfx, opnd);
+        emitop2_high("adc", w, fn);      /* no clc: the carry of the low half */
+        emit_store_high(a->to, fn);
+    }
+    acache_invalidate();
     return 1;
 }
 
@@ -9944,6 +10029,10 @@ w65816_emitfn(Fn *fn, FILE *f)
              * idiom). Consumes the two following instructions. */
             if (try_fuse_bytepair_store(i, b, fn)) {
                 i += 2;
+                continue;
+            }
+            if (try_fuse_kl_load_add(i, b, fn)) {
+                i += 1;
                 continue;
             }
 
