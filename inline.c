@@ -616,11 +616,17 @@ splice_fn(Fn *caller, Blk *blk, int call_idx, Fn *callee)
     bmap = emalloc(nb * sizeof bmap[0]);
     for (b = callee->start; b; b = b->link) {
         c = newblk();
-        snprintf(c->name, NString, "inl%d.%.40s", seq, b->name);
+        /* OpenSNES: the label keeps the callee's name (inl51_userInput.3.if_false):
+         * a profile or a symbol map names the routine that was spliced in,
+         * not only its number. What makes the label unique is at its head, the
+         * splice's number and the block's index in the callee, where a long
+         * chain of nested names is never cut; the front end's own numbering
+         * (if_false.7), at the tail, is cut first and not relied upon. */
+        snprintf(c->name, NString, "inl%d_%.22s.%d.%.40s", seq, callee->name, b->visit, b->name);
         bmap[b->visit] = c;
     }
     cont = newblk();
-    snprintf(cont->name, NString, "inl%d.ret", seq);
+    snprintf(cont->name, NString, "inl%d_%.22s.ret", seq, callee->name);
 
     retval = emalloc(nb * sizeof retval[0]);
     retblk = emalloc(nb * sizeof retblk[0]);
