@@ -598,6 +598,18 @@ check_high_read(Ref r, Fn *fn)
 #define SLOT_OWN_MAX (8192 + 64)
 static int slot_owner[SLOT_OWN_MAX];
 static Fn *slot_fn;
+/* color_slots: the temp each one-word copy copies. A copy and its source
+ * may share a slot, and the same value has then two names. */
+static int *slot_copyof;
+static int slot_ncopyof;
+
+static int
+copy_root(int t)
+{
+    while (t < slot_ncopyof && slot_copyof[t])
+        t = slot_copyof[t];
+    return t;
+}
 
 static void
 slot_owner_reset(void)
@@ -629,7 +641,7 @@ slot_read(Ref r, int half, Fn *fn)
     if (s < 0 || s + half >= SLOT_OWN_MAX)
         return;
     o = slot_owner[s + half];
-    if (o < 0 || o == (int)r.val)
+    if (o < 0 || copy_root(o) == copy_root(r.val))
         return;
     if (getenv("QBE_SLOT_CHECK_WARN")) {
         fprintf(stderr, "qbe: %%%s read from slot %d last written by %%%s in %s\n",
@@ -2931,6 +2943,26 @@ narrow_ok(int op)
     }
 }
 
+/* Is this instruction a one-word copy of a temp? The extensions that only
+ * add a high half nobody reads, or that have none to add. */
+static int
+word_copy(Ins *i, Fn *fn)
+{
+    int t = i->to.val;
+
+    if (rtype(i->arg[0]) != RTmp || i->arg[0].val < Tmp0
+        || fn->tmp[i->arg[0].val].cls != Kw)
+        return 0;
+    switch (i->op) {
+    case Oextsh: case Oextuh: case Oextsw: case Oextuw:
+        break;
+    default:
+        return 0;
+    }
+    return i->cls == Kw
+           || (t - Tmp0 < MAX_ALLOC_TEMPS && temp_narrow[t - Tmp0]);
+}
+
 /* words of frame a temp takes: 2 for a 32-bit one, unless narrow */
 #define SLOT_WORDS(fn, t) ((fn)->tmp[t].cls == Kl \
     && !((t) - Tmp0 < MAX_ALLOC_TEMPS && temp_narrow[(t) - Tmp0]) ? 2 : 1)
@@ -2955,6 +2987,10 @@ color_slots(Fn *fn, int base)
     /* A 32-bit add, sub, and, or, xor or copy and an operand of it: the
      * same slot or apart, never half over each other (see below) */
     int kl_share = phi_share && !getenv("QBE_NO_KL_SHARE");
+    /* An extension whose result is one word (a Kw, or a narrow Kl) is a
+     * copy of its operand: see below. */
+    int copy_share = phi_share && !getenv("QBE_NO_COPY_SHARE");
+    int *copyof;                /* the temp this one is a copy of */
     struct { int to, arg; } *ex;
     int nex = 0, nins = 0;
     char dpocc[DPF_WORDS + 2];
@@ -2965,6 +3001,10 @@ color_slots(Fn *fn, int base)
     start = calloc(nt, sizeof *start);
     cross = calloc(nt, 1);
     pref = calloc(nt, sizeof *pref);
+    copyof = calloc(nt, sizeof *copyof);
+    free(slot_copyof);
+    slot_copyof = copyof;
+    slot_ncopyof = nt;
     for (b = fn->start, n = 0; b; b = b->link)
         for (p = b->phi; p; p = p->link)
             n += p->narg;
@@ -2978,7 +3018,7 @@ color_slots(Fn *fn, int base)
      * after the result has been written. Such a result never shares its
      * operand's slot (`str += n; c = *str;` read str + n + n). */
     addr = calloc(nt, 1);
-    if (!adj || !seen || !order || !start || !cross || !pref || !pa || !ex || !addr)
+    if (!adj || !seen || !order || !start || !cross || !pref || !copyof || !pa || !ex || !addr)
         die("out of memory");
     for (b = fn->start; b; b = b->link)
         for (i = b->ins; i < &b->ins[b->nins]; i++) {
@@ -3073,8 +3113,24 @@ color_slots(Fn *fn, int base)
             }
             if (rtype(i->to) == RTmp && i->to.val >= Tmp0) {
                 t = i->to.val;
+                /* A copy interferes with nothing because of its source:
+                 * while both live they hold one value, and in SSA neither
+                 * is written again (the move that writes a phi source is
+                 * on an edge its copy, defined after the phi, cannot be
+                 * live across). Sharing the slot leaves `lda S / sta S`,
+                 * and frees the slot the copy would have taken. */
+                if (copy_share && word_copy(i, fn))
+                    copyof[t] = i->arg[0].val;
                 for (u = 0; bsiter(live, &u); u++)
-                    slot_edge(adj, words, t, u);
+                    if (u != copyof[t])
+                        slot_edge(adj, words, t, u);
+                if (copyof[t]) {
+                    ex[nex].to = t;
+                    ex[nex++].arg = copyof[t];
+                    bsclr(live, t);
+                    bsset(live, i->arg[0].val);
+                    continue;
+                }
                 for (k = 0; k < 2; k++) {
                     int word_op = i->op == Oadd || i->op == Osub || i->op == Oand
                                   || i->op == Oor || i->op == Oxor || i->op == Ocopy;
@@ -3155,13 +3211,31 @@ color_slots(Fn *fn, int base)
                         if (add) {
                             int x;
                             for (x = n * 64; x < n * 64 + 64 && x < nt; x++)
-                                if (add >> (x % 64) & 1)
+                                if ((add >> (x % 64) & 1) && x != copyof[u]) {
                                     slot_edge(adj, words, u, x);
-                            changed = 1;
+                                    changed = 1;
+                                }
                         }
                     }
                 }
             }
+    }
+
+    /* A copy and its source are placed together: the source first, or the
+     * copy takes a first-fit slot the source cannot join. */
+    for (n = 0; n < norder; n++) {
+        int y;
+
+        if (!copyof[order[n]])
+            continue;
+        for (y = n + 1; y < norder && order[y] != copyof[order[n]]; y++)
+            ;
+        if (y < norder) {
+            int v = order[y];
+
+            memmove(order + n + 1, order + n, (size_t)(y - n) * sizeof *order);
+            order[n] = v;
+        }
     }
 
     occ = calloc((size_t)(base + 2 * nt + 4), 1);
@@ -7415,6 +7489,32 @@ peephole(char **ln, int nl)
             if (xs[0] && pp_stack(xs) && pp_moves_sp(ln[i]))
                 xs[0] = 0;
 
+            /* a copy onto itself: lda S / sta S (a store sets no flag) */
+            if (pp_is(ln[i], "lda") && pp_slot(op) && j < nl && pp_is(ln[j], "sta")
+                && strcmp(pp_operand(ln[j]), op) == 0
+                && strncmp(ln[i] + 4, ln[j] + 4, 2) == 0) {
+                ln[j] = 0;
+                removed++;
+                j = pp_next(ln, nl, i);
+            }
+
+            /* reload across an ldx, which leaves A alone: sta S / ldx P / lda S.
+             * The flags of the load are looked after as for the reload below */
+            if (pp_is(ln[i], "sta") && pp_slot(op) && j < nl && pp_is(ln[j], "ldx")) {
+                int j2 = pp_next(ln, nl, j);
+
+                if (j2 < nl && pp_is(ln[j2], "lda") && strcmp(pp_operand(ln[j2]), op) == 0
+                    && strncmp(ln[i] + 4, ln[j2] + 4, 2) == 0) {
+                    for (k = pp_next(ln, nl, j2); k < nl && pp_is(ln[k], "sta");
+                         k = pp_next(ln, nl, k))
+                        ;
+                    if (k < nl && ln[k][0] == '\t' && !pp_barrier(ln[k]) && !pp_is(ln[k], "php")) {
+                        ln[j2] = 0;
+                        removed++;
+                    }
+                }
+            }
+
             /* reload: sta S / lda S */
             if (pp_is(ln[i], "sta") && pp_slot(op) && j < nl && pp_is(ln[j], "lda")
                 && strcmp(pp_operand(ln[j]), op) == 0
@@ -7707,7 +7807,7 @@ pp_a_is_slot_before(char **ln, int i, const char *op)
                 return 0;
             continue;                           /* i is the branch: i-- next */
         }
-        if (pp_is(ln[i], "cmp") || pp_cond_branch(ln[i]))
+        if (pp_is(ln[i], "cmp") || pp_is(ln[i], "ldx") || pp_cond_branch(ln[i]))
             continue;
         o = pp_operand(ln[i]);
         return (pp_is(ln[i], "lda") || pp_is(ln[i], "sta")) && o && strcmp(o, op) == 0;
@@ -8822,6 +8922,60 @@ peephole_forward_store(char **ln, int nl)
     return removed;
 }
 
+/* A store to a direct-page slot nothing reads again (2026-10-31): the value
+ * is used from A on every path, `lda big,x / sta T / cmp old,x / beq J / sta
+ * old,x` or `sta T / ldx I / sta out,x`. The straight-line dead-store rule
+ * cannot see it: the slot is simply never read. pp_slot_live_at reads the
+ * whole function. A store sets no flag, so removing it asks nothing of the
+ * lines around it. A function that names a direct-page slot in any form
+ * but the plain operand (indexed, indirect) is left alone, and so is a
+ * store to a slot that a word access at the byte below overlaps.
+ * QBE_NO_PEEP_SLOTDEAD=1 turns it off. */
+static int
+peephole_slotdead(char **ln, int nl)
+{
+    int i, j, a8 = 0, removed = 0;
+    const char *op;
+    char s1[32], s0[32];
+
+    if (getenv("QBE_NO_PEEP_SLOTDEAD"))
+        return 0;
+    for (i = 0; i < nl; i++)
+        if (ln[i] && strstr(ln[i], "tcc__lf")) {
+            const char *l = ln[i];
+
+            l += strspn(l, "+-");
+            op = pp_operand(l);
+            if (!op || (strncmp(op, "tcc__lf+", 8) != 0) || !pp_slot(op))
+                return 0;
+        }
+    for (i = 0; i < nl; i++) {
+        if (!ln[i])
+            continue;
+        if (strncmp(ln[i], "\tsep #$20", 9) == 0 || strncmp(ln[i], "\tsep #$30", 9) == 0)
+            a8 = 1;
+        else if (strncmp(ln[i], "\trep #$20", 9) == 0 || strncmp(ln[i], "\trep #$30", 9) == 0)
+            a8 = 0;
+        if (a8 || strncmp(ln[i], "\tsta.b tcc__lf+", 15) != 0)
+            continue;
+        op = pp_operand(ln[i]);
+        if (atoi(op + 8) > 0) {
+            snprintf(s0, sizeof s0, "tcc__lf+%d", atoi(op + 8) - 1);
+            for (j = 0; j < nl; j++)
+                if (ln[j] && strstr(ln[j], s0) && strcmp(strstr(ln[j], s0), s0) == 0)
+                    break;
+            if (j < nl)
+                continue;
+        }
+        snprintf(s1, sizeof s1, "tcc__lf+%d", atoi(op + 8) + 1);
+        if (pp_slot_live_at(ln, nl, op, s1, pp_next(ln, nl, i)) == 0) {
+            ln[i] = 0;
+            removed++;
+        }
+    }
+    return removed;
+}
+
 /* A counted loop whose test is at its top (2026-10-16):
  *
  *     @C:  lda.b S / beq @J            @C:  lda.b S / beq @J
@@ -9518,6 +9672,22 @@ peephole_entry(char **ln, int nl)
     return removed;
 }
 
+/* A store gone can leave a load gone, and that a store before it. */
+static int
+slotdead_sweep(char **ln, int nl)
+{
+    int i, k, pass;
+
+    for (pass = 0; pass < 4 && peephole_slotdead(ln, nl); pass++) {
+        peephole(ln, nl);
+        for (i = k = 0; i < nl; i++)
+            if (ln[i])
+                ln[k++] = ln[i];
+        nl = k;
+    }
+    return nl;
+}
+
 static void
 relax_branches(FILE *in, FILE *out)
 {
@@ -9579,6 +9749,8 @@ relax_branches(FILE *in, FILE *out)
             nl = k;
         }
     }
+    if (!getenv("QBE_NO_PEEPHOLE"))
+        nl = slotdead_sweep(ln, nl);
     if (!getenv("QBE_NO_PEEPHOLE") && peephole_dec_loop(ln, nl)) {
         /* the rule writes `beq + / jmp @B / +` as one line: split it */
         int extra = 0;
@@ -9612,6 +9784,13 @@ relax_branches(FILE *in, FILE *out)
             if (ln[i])
                 ln[k++] = ln[i];
         nl = k;
+        /* the load it took was often the last read of a slot */
+        if (peephole_slotdead(ln, nl)) {
+            for (i = k = 0; i < nl; i++)
+                if (ln[i])
+                    ln[k++] = ln[i];
+            nl = k;
+        }
     }
     for (i = 0; i < nl; i++) {
         if (!ln[i])

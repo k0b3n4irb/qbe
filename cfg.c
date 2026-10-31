@@ -729,3 +729,99 @@ cmplast(Fn *fn)
 		e[-1] = c;
 	}
 }
+
+/* OpenSNES (2026-10-31): a load whose value only one way out of its block
+ * needs goes down that way, when that successor has this block for only
+ * predecessor. `sx = px[i] - c; sy = py[i]; if (sx + 31 >= W || sy + 31 >= H)`
+ * reads py[] for the second test alone: on the first exit the load is saved,
+ * and on the other it stands against its use instead of between the
+ * subtraction and its test, where it forced a store and a reload of sx.
+ * Only loads, not volatile, with nothing after them in the block that
+ * writes memory or has an effect of its own; a use in a phi refuses. The
+ * address of the load goes with it when nothing else reads it.
+ * QBE_NO_SINK_LOAD=1 turns it off.
+ * requires use dom rpo pred; maintains use. */
+static int
+sinkone(Fn *fn, Blk *b, Ins *i)
+{
+	Tmp *t;
+	Blk *c, *ub, *cand[2];
+	Ins *d, *v, k[2];
+	Use *u;
+	uint nk;
+	int x, ok;
+
+	if (rtype(i->to) != RTmp)
+		return 0;
+	t = &fn->tmp[i->to.val];
+	if (!t->nuse)
+		return 0;
+	cand[0] = b->s1;
+	cand[1] = b->s2;
+	c = 0;
+	for (x=0; x<2 && !c; x++) {
+		if (cand[x] == b || cand[x]->npred != 1 || cand[x]->phi)
+			continue;
+		ok = 1;
+		for (u=t->use; u<&t->use[t->nuse]; u++) {
+			ub = fn->rpo[u->bid];
+			if ((u->type != UIns && u->type != UJmp)
+			|| !dom(cand[x], ub))
+				ok = 0;
+		}
+		if (ok)
+			c = cand[x];
+	}
+	if (!c)
+		return 0;
+	nk = 0;
+	d = 0;
+	if (rtype(i->arg[0]) == RTmp && fn->tmp[i->arg[0].val].nuse == 1)
+		for (d=b->ins; d<i; d++)
+			if (req(d->to, i->arg[0]) && d->op == Oadd)
+				break;
+	if (d == i)
+		d = 0;
+	if (d)
+		k[nk++] = *d;
+	k[nk++] = *i;
+	v = emalloc((c->nins + 2) * sizeof *v);
+	memcpy(v, k, nk * sizeof *v);
+	memcpy(v + nk, c->ins, c->nins * sizeof *v);
+	idup(c, v, c->nins + nk);
+	free(v);
+	/* i first: it is above nothing the other needs */
+	memmove(i, i+1, (&b->ins[b->nins] - (i+1)) * sizeof *i);
+	b->nins--;
+	if (d) {
+		memmove(d, d+1, (&b->ins[b->nins] - (d+1)) * sizeof *d);
+		b->nins--;
+	}
+	return 1;
+}
+
+void
+sinkload(Fn *fn)
+{
+	Blk *b;
+	Ins *i;
+
+	if (getenv("QBE_NO_SINK_LOAD"))
+		return;
+	for (b=fn->start; b; b=b->link) {
+		if (b->jmp.type != Jjnz || b->s1 == b->s2)
+			continue;
+		for (i=&b->ins[b->nins]; i>b->ins;) {
+			i--;
+			if (isload(i->op) && !(i->volat & 1)) {
+				if (sinkone(fn, b, i)) {
+					filluse(fn);
+					i = &b->ins[b->nins];
+				}
+				continue;
+			}
+			if (optab[i->op].pinned)
+				break;
+		}
+	}
+}

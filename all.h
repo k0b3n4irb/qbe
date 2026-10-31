@@ -573,6 +573,7 @@ int threadjnz(Fn *);
 void simpljnz(Fn *);
 void cmplast(Fn *);
 void filldom(Fn *);
+void sinkload(Fn *);
 int sdom(Blk *, Blk *);
 int dom(Blk *, Blk *);
 void fillfron(Fn *);

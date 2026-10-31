@@ -258,6 +258,9 @@ finalize_and_emit(Fn *fn, FILE *out)
 		 * must be adjacent to be fused */
 		filluse(fn);
 		cmplast(fn);
+		filluse(fn);
+		filldom(fn);
+		sinkload(fn);
 	}
 	filllive(fn);
 	fillloop(fn);
@@ -340,6 +343,7 @@ func(Fn *fn)
 		fillcfg(fn);
 		if (T.skiprega) {
 			filluse(fn); cmplast(fn);
+			filluse(fn); filldom(fn); sinkload(fn);
 		}
 		filllive(fn); fillloop(fn); fillcost(fn);
 		if (!T.skiprega) {
