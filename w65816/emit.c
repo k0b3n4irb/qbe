@@ -93,6 +93,17 @@ static int dp_frame;
  * time was in functions that call, 145 of the 250 instructions of the
  * heaviest one stack-relative. QBE_NO_DP_TEMPS=1 turns it off. */
 #define DPSLOT 8192
+/* 2026-11-04: a leaf that needs more than DPF_WORDS words used to go
+ * whole onto the stack — one word too many and every temp paid `lda n,s`,
+ * a prologue and an epilogue, and lost the peephole's direct-page rules.
+ * emitfn now colours such a leaf a second time with this flag set, and
+ * color_slots() treats it as it treats a function that calls: every temp
+ * is "not cross" (there is no call), so the costliest ones take the
+ * sixteen words of tcc__lf (DPSLOT + n) and only the overflow keeps a
+ * stack slot. Safe for the reason the all-in leaf frame is (see dp_frame
+ * below). Not for a leaf with an object on the stack or a dynamic alloc:
+ * those keep the stack frame they had. QBE_NO_LEAF_SPLIT=1 turns it off. */
+static int leaf_split;
 #define SOFF(slot) (dp_frame ? DPF_BASE + (slot) * 2 \
     : (slot) >= DPSLOT ? DPF_BASE + ((slot) - DPSLOT) * 2 : ((slot) + 1) * 2)
 
@@ -3241,10 +3252,11 @@ color_slots(Fn *fn, int base)
     occ = calloc((size_t)(base + 2 * nt + 4), 1);
     if (!occ)
         die("out of memory");
-    /* direct-page temps only for a function that calls (a leaf has the
-     * whole frame there, or none of it: emitfn decides after this), and
-     * only while a stack slot number cannot reach DPSLOT */
-    mixed = ncalls > 0 && !fn->leaf && !fn->dynalloc
+    /* direct-page temps for a function that calls, and for a leaf that
+     * did not fit the direct page whole (leaf_split: emitfn colours it a
+     * second time; a leaf that fits has the whole frame there, decided
+     * after this), and only while a stack slot number cannot reach DPSLOT */
+    mixed = ((ncalls > 0 && !fn->leaf) || leaf_split) && !fn->dynalloc
             && base + 2 * nt + 4 < DPSLOT && !getenv("QBE_NO_DP_TEMPS");
     for (n = 0; n < norder; n++) {
         t = order[n];
@@ -9973,12 +9985,36 @@ w65816_emitfn(Fn *fn, FILE *f)
                 temp_noslot[t - Tmp0] = 1;
 
     /* Assign slots to any unassigned temps (when skiprega is set) */
-    fn->slot = assignslots(fn);
+    leaf_split = 0;
+    {
+        int base0 = fn->slot, t;
+        int *slot0 = malloc((size_t)fn->ntmp * sizeof *slot0);
+
+        if (!slot0)
+            die("out of memory");
+        for (t = 0; t < fn->ntmp; t++)
+            slot0[t] = fn->tmp[t].slot;
+        fn->slot = assignslots(fn);
+        /* A leaf one word too big for the direct page: colour it again,
+         * the costliest temps in tcc__lf and the rest on the stack (see
+         * leaf_split), from the state the first colouring started from. */
+        if (fn->leaf && !fn->dynalloc && w65816_alloc_slots == 0
+            && fn->slot > DPF_WORDS
+            && !getenv("QBE_NO_DP_FRAME") && !getenv("QBE_NO_LEAF_SPLIT")
+            && !getenv("QBE_NO_SLOT_COLOR")) {
+            for (t = 0; t < fn->ntmp; t++)
+                fn->tmp[t].slot = slot0[t];
+            fn->slot = base0;
+            leaf_split = 1;
+            fn->slot = assignslots(fn);
+        }
+        free(slot0);
+    }
 
     /* Total frame size: alloc slots + temp slots + 1 for alignment */
     framesize = (fn->slot + 1) * 2;
     dp_frame = 0;
-    if (fn->leaf && !fn->dynalloc && w65816_alloc_slots == 0
+    if (fn->leaf && !leaf_split && !fn->dynalloc && w65816_alloc_slots == 0
         && fn->slot >= 1 && fn->slot <= DPF_WORDS
         && !getenv("QBE_NO_DP_FRAME")) {
         dp_frame = 1;       /* SOFF() now names tcc__lf */
