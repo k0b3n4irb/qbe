@@ -249,8 +249,22 @@ dedupins(Fn *fn, Blk *b, Ins *i)
 	Ins *i1;
 
 	normins(fn, i);
-	if (i->op == Onop || pinned(i))
+	if (i->op == Onop)
 		return;
+	if (pinned(i)) {
+		/* OpenSNES: an integer div / rem is pinned because it may
+		 * trap, so gcm must not move it; with both operands constant
+		 * it is folded all the same. foldint() refuses a zero divisor
+		 * and INT_MIN / -1 at the class width (16 bits for Kw, 32 for
+		 * Kl here), which stay run-time operations. `19391 / 3584`
+		 * called __sdiv16 until then (2026-11-07). */
+		if (isdivwl(i)) {
+			r = foldref(fn, i);
+			if (!req(r, R))
+				killins(fn, i, r);
+		}
+		return;
+	}
 
 	assert(!req(i->to, R));
 	assoccon(fn, b, i);

@@ -630,6 +630,7 @@ int zeroval(Fn *, Blk *, Ref, int, int *);
 void gvn(Fn *);
 
 /* gcm.c */
+int isdivwl(Ins *);
 int pinned(Ins *);
 void gcm(Fn *);
 void ivar(Fn *);

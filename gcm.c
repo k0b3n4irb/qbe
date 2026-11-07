@@ -2,7 +2,7 @@
 
 #define NOBID (-1u)
 
-static int
+int
 isdivwl(Ins *i)
 {
 	switch (i->op) {
