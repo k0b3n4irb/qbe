@@ -1951,6 +1951,61 @@ emit_far_ptr_store(Ins *i, Fn *fn)
     acache_invalidate();
 }
 
+/* A6a R1: may this byte load read a word and keep its low byte? A 16-bit
+ * read costs one memory cycle more than an 8-bit one and saves the
+ * `sep #$20` / `rep #$20` around it (6 cycles, 4 bytes). The byte above
+ * the one wanted is read too: harmless on RAM and ROM (the 24-bit address
+ * carries into the next bank, which is RAM, a mirror or ROM on every map
+ * the SDK ships), harmful on a hardware register with a read side effect
+ * ($2137-$213F, $2180, $4016/7, $4210/1, a coprocessor's registers). So:
+ *
+ *   - never for a volatile access (`volat` bit 0): a register is read
+ *     through a volatile lvalue (`REG_*` in snes/registers.h, `vu8`);
+ *   - yes for a named symbol (plain, const or FAR, indexed or not), a frame
+ *     slot or a stack local, and a pointer known only at run time;
+ *   - for an address with a compile-time constant part (`*(u8 *)0x2138`,
+ *     `((u8 *)0x4210)[i]`): only when that constant is below $2000 (a
+ *     field offset, low RAM) or in banks $7E/$7F. Everything else that may
+ *     be an I/O address — $2000-$7FFF and the coprocessor windows — keeps
+ *     the 8-bit read even though the access is not volatile.
+ *
+ * QBE_NO_BYTE_WORD=1 turns it off. */
+static int
+byte_con_safe(Fn *fn, Ref r)
+{
+    Con *c;
+    long long v;
+
+    if (rtype(r) != RCon)
+        return 1;
+    c = &fn->con[r.val];
+    if (c->type != CBits)
+        return 1;                       /* a symbol: an object of ours */
+    v = c->bits.i;
+    return (v & 0xFFFF) < 0x2000
+        || ((v >> 16) & 0xFF) == 0x7E || ((v >> 16) & 0xFF) == 0x7F;
+}
+
+static int
+byte_load_as_word(Ins *i, Fn *fn)
+{
+    Ref a = i->arg[0];
+    int idx;
+
+    if (i->volat & 1)
+        return 0;
+    if (getenv("QBE_NO_BYTE_WORD"))
+        return 0;
+    if (!byte_con_safe(fn, a))
+        return 0;
+    idx = far_addr_idx(a);
+    if (idx >= 0 && far_decomp_kind[idx] != FAR_NONE
+        && (!byte_con_safe(fn, far_decomp_base[idx])
+            || !byte_con_safe(fn, far_decomp_idx[idx])))
+        return 0;
+    return 1;
+}
+
 /* B2: far LOAD through a runtime pointer (word or byte; the Kl case is
  * emit_far_ptr_load_kl). Loads into A; the caller does the extend/store.
  * `byte` selects 8-bit A for the load itself. */
@@ -1963,6 +2018,8 @@ emit_far_ptr_load(Ins *i, Fn *fn, int byte)
     emit_far_operand(i, i->arg[0], fn, opnd, sizeof opnd, &sfx);
     if (byte)
         emit_sep20();
+    else
+        emit_rep20();
     fprintf(outf, "\tlda%s %s\n", sfx, opnd);
     if (byte)
         emit_rep20();
@@ -3802,6 +3859,7 @@ emitins(Ins *i, Fn *fn)
 {
     Ref r0, r1;
     Con *c;
+    int bw;
 
     r0 = i->arg[0];
     r1 = i->arg[1];
@@ -5918,36 +5976,42 @@ emitins(Ins *i, Fn *fn)
 
     case Oloadsb:
     case Oloadub:
-        /* Load byte from memory, zero/sign extend to 16-bit */
+        /* Load byte from memory, zero/sign extend to 16-bit. A6a R1: a
+         * word read when byte_load_as_word() says the byte above may be
+         * read too; the mask below keeps the low byte either way. */
+        bw = byte_load_as_word(i, fn);
         if (is_far(i) && rtype(r0) == RCon
             && fn->con[r0.val].type == CAddr) {
             /* cst/far + folded symbol address: absolute LONG — the linker
              * supplies the 24-bit address, correct in any bank (#121, B2) */
             Con *c0 = &fn->con[r0.val];
-            emit_sep20();
+            if (bw) emit_rep20(); else emit_sep20();
             fprintf(outf, "\tlda.l %s", stripsym(str(c0->sym.id)));
             if (c0->bits.i)
                 fprintf(outf, "+%d", (int)c0->bits.i);
             fprintf(outf, "\n");
             emit_rep20();
+            acache_invalidate();
         } else if (is_far(i) && !isvreg(r0) && getallocslot(r0, fn) < 0) {
             /* cst/far + runtime pointer: bank-honouring byte read
              * (#121, B2) — decomposed operand or [tcc__r9] */
-            emit_far_ptr_load(i, fn, 1);
+            emit_far_ptr_load(i, fn, !bw);
         } else if (isvreg(r0)) {
             /* Pointer in virtual register - use indirect */
-            emit_sep20();
+            if (bw) emit_rep20(); else emit_sep20();
             fprintf(outf, "\tlda ($%02X)\n", regaddr(r0.val));
             emit_rep20();
+            acache_invalidate();
         } else if (rtype(r0) == RCon && fn->con[r0.val].type == CAddr) {
             /* Direct load from global/extern symbol */
             Con *c = &fn->con[r0.val];
-            emit_sep20();
+            if (bw) emit_rep20(); else emit_sep20();
             fprintf(outf, "\tlda.w %s", stripsym(str(c->sym.id)));
             if (c->bits.i)
                 fprintf(outf, "+%d", (int)c->bits.i);
             fprintf(outf, "\n");
             emit_rep20();
+            acache_invalidate();
         } else {
             /* Pointer in stack slot - load addr, then indirect through X.
              * The address load MUST be 16-bit: a preceding Ostoreb leaves
@@ -5962,9 +6026,11 @@ emitins(Ins *i, Fn *fn)
             emit_rep20();
             emitload(r0, fn);  /* Load pointer value to A (16-bit) */
             fprintf(outf, "\ttax\n");  /* Transfer to X */
-            emit_sep20();
+            if (!bw)
+                emit_sep20();
             fprintf(outf, "\tlda.l $0000,x\n");  /* Load byte from memory */
             emit_rep20();
+            acache_invalidate();
         }
         fprintf(outf, "\tand.w #$00FF\n");  /* Zero extend */
         if (i->op == Oloadsb) {
