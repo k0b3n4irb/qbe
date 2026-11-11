@@ -8120,11 +8120,110 @@ leave:
     return res;
 }
 
+static int pp_a_and_flags_dead_at(char **ln, int nl, int n);
+
+/* Are N and Z dead after line i — set again before anything reads them?
+ * The straight line after i: a store or a flag-neutral line passes, a line
+ * that sets N and Z without reading them ends the walk (dead), anything
+ * else — a branch, a label, php, a line not known — answers no. (Only N and
+ * Z: for a load or a transfer that is all the line changes.) */
+static int
+pp_nz_dead_after(char **ln, int nl, int i)
+{
+    static const char *pass[] = { "sta", "stz", "stx", "sty", "clc", "sec",
+        "pha", "phx", "phy", "nop", 0 };
+    static const char *setnz[] = { "lda", "ldx", "ldy", "and", "ora", "eor",
+        "adc", "sbc", "cmp", "cpx", "cpy", "inx", "iny", "dex", "dey",
+        "tax", "tay", "txa", "tya", "tyx", "txy", "pla", "plx", "ply", 0 };
+    int j, n, q;
+
+    for (j = pp_next(ln, nl, i), n = 0; j < nl && n < 8; j = pp_next(ln, nl, j), n++) {
+        const char *lj = ln[j];
+        if (lj[0] != '\t')
+            return 0;                   /* a label: other ways in */
+        for (q = 0; setnz[q]; q++)
+            if (pp_is(lj, setnz[q]))
+                return 1;
+        if (strcmp(lj, "\tinc a") == 0 || strcmp(lj, "\tdec a") == 0
+            || strcmp(lj, "\tasl a") == 0 || strcmp(lj, "\tlsr a") == 0
+            || strcmp(lj, "\trol a") == 0 || strcmp(lj, "\tror a") == 0)
+            return 1;
+        for (q = 0; pass[q]; q++)
+            if (pp_is(lj, pass[q]))
+                break;
+        if (!pass[q])
+            return 0;
+    }
+    return 0;
+}
+
+/* Is the accumulator 16 bits wide at line t? The nearest `rep` / `sep` of
+ * the accumulator before it says, or a block label (the emitter enters
+ * every block with a 16-bit accumulator), or the function's entry. */
+static int
+pp_a16_at(char **ln, int t)
+{
+    int q;
+
+    for (q = t - 1; q >= 0; q--) {
+        if (!ln[q])
+            continue;
+        if (ln[q][0] == '@')
+            return 1;
+        if ((strncmp(ln[q], "\tsep #$", 7) == 0 || strncmp(ln[q], "\trep #$", 7) == 0)
+            && (strtol(ln[q] + 7, 0, 16) & 0x20))
+            return ln[q][1] == 'r';
+    }
+    return 1;
+}
+
+/* A6a R2: `lda P / clc / adc.b S` (or `lda P / and|ora|eor.b S`), S the
+ * counter: the operation is commutative, so the loop rule writes it
+ * `t[xy]a / clc / adc P` — A, N, Z, C and V come out the same. Returns
+ * the line of `lda P` (> b), or -1. P must not name S. */
+static int
+pp_alu_of_slot(char **ln, int b, int t, const char *s)
+{
+    const char *l = ln[t], *p;
+    int q;
+
+    if (getenv("QBE_NO_PEEP_LOOPY"))
+        return -1;                      /* part of the same rule, off with it */
+    if (!(pp_is(l, "adc") || pp_is(l, "and") || pp_is(l, "ora") || pp_is(l, "eor"))
+        || strncmp(l + 4, ".b ", 3) != 0 || strcmp(pp_operand(l), s) != 0)
+        return -1;
+    for (q = t - 1; q > b && !ln[q]; q--)
+        ;
+    if (q <= b)
+        return -1;
+    if (pp_is(l, "adc")) {
+        if (strcmp(ln[q], "\tclc") != 0)
+            return -1;
+        for (q--; q > b && !ln[q]; q--)
+            ;
+        if (q <= b)
+            return -1;
+    }
+    if (!pp_is(ln[q], "lda"))
+        return -1;
+    p = pp_operand(ln[q]);
+    if (!p || !*p)
+        return -1;
+    if (strstr(p, "tcc__lf")) {
+        /* another plain slot: not S, not its high byte */
+        char s1[64];
+        snprintf(s1, sizeof s1, "tcc__lf+%d", atoi(s + 8) + 1);
+        if (!pp_slot(p) || strcmp(p, s) == 0 || strcmp(p, s1) == 0)
+            return -1;
+    }
+    return q;
+}
+
 static int
 peephole_loop_x(char **ln, int nl)
 {
     int i, j, k, e, b, t, c, found = 0, bodytop, reads, stepend, cmpline, ldaline;
-    int conv_b[64], conv_e[64], nconv;
+    int conv_b[64], conv_e[64], conv_r[64], nconv, pass;
     const char *why;
 #define WHY(r) do { if (why) fprintf(stderr, "loopx: %s: %s\n", s, r); } while (0)
     const char *op, *s, *lbl;
@@ -8275,17 +8374,8 @@ peephole_loop_x(char **ln, int nl)
             continue;
         }
 
-        /* another converted loop inside or around this one: X is taken */
-        {
-            int bad = 0;
-            for (t = 0; t < nconv; t++)
-                if (!(e < conv_b[t] || conv_e[t] < b))
-                    bad = 1;
-            if (bad || nconv >= 64) {
-                WHY("overlaps a converted loop");
-                continue;
-            }
-        }
+        if (nconv >= 64)
+            continue;
 
         /* the counter dies with the loop: S is not live at any exit — the
          * fall-through after the bottom branch, and every branch or jump
@@ -8318,13 +8408,29 @@ peephole_loop_x(char **ln, int nl)
             }
         }
 
-        /* the region's lines: X, S, calls, labels, the first touch of A */
-        {
+        /* the region's lines: the index register, S, calls, labels, the
+         * first touch of A. X first; when the region writes X (a table
+         * lookup through `tax`, a second index), Y (A6a R2): the same
+         * rewrite with ldy / cpy / tya / iny, provided nothing in the region
+         * writes Y but the counter's own reads — `ldy.b S` and the `tay` of
+         * `lda.b S / tay`, which go: Y is S already. `ldx.b S` becomes
+         * `tyx` there. */
+        for (pass = 0; pass < 2; pass++) {
             int bad = 0, top_ldx = 0, top_lda_tax = 0, a_seen = 0, nsta = 0, after_step = 0;
+            int yreg = pass == 1;
+            if (yreg && getenv("QBE_NO_PEEP_LOOPY"))
+                break;
+            for (t = 0; t < nconv; t++)
+                if (conv_r[t] == yreg && !(e < conv_b[t] || conv_e[t] < b))
+                    bad = 1;
+            if (bad) {
+                WHY(yreg ? "overlaps a loop converted to Y" : "overlaps a loop converted to X");
+                continue;
+            }
             t = bodytop;
-            if (strncmp(ln[t], "\tldx.b ", 7) == 0 && strcmp(pp_operand(ln[t]), s) == 0)
+            if (!yreg && strncmp(ln[t], "\tldx.b ", 7) == 0 && strcmp(pp_operand(ln[t]), s) == 0)
                 top_ldx = 1;
-            else if (strncmp(ln[t], "\tlda.b ", 7) == 0 && strcmp(pp_operand(ln[t]), s) == 0) {
+            else if (!yreg && strncmp(ln[t], "\tlda.b ", 7) == 0 && strcmp(pp_operand(ln[t]), s) == 0) {
                 int t2 = pp_next(ln, nl, t);
                 if (t2 < reads && strcmp(ln[t2], "\ttax") == 0)
                     top_lda_tax = 1;
@@ -8371,10 +8477,43 @@ peephole_loop_x(char **ln, int nl)
                     }
                     continue;
                 }
-                if (pp_writes_x(l) || pp_is(l, "jsl") || pp_is(l, "jsr")
+                op = pp_operand(l);
+                if (strcmp(l, yreg ? "\ttay" : "\ttax") == 0) {
+                    /* the counter's register written: only right after
+                     * `lda.b S` (it holds S already; the pair goes) */
+                    int p = t - 1;
+                    while (p > b && !ln[p])
+                        p--;
+                    if (!(strncmp(ln[p], "\tlda.b ", 7) == 0 && strcmp(pp_operand(ln[p]), s) == 0)
+                        || !pp_a16_at(ln, p)) {
+                        /* with an 8-bit accumulator the transfer copies the
+                         * hidden byte too: not S */
+                        if (why) fprintf(stderr, "loopx: %s: region writes the counter's register: %s\n", s, l);
+                        bad = 1;
+                    }
+                    continue;           /* a transfer leaves A alone */
+                }
+                if ((strncmp(l, "\tldy.b ", 7) == 0 || strncmp(l, "\tldx.b ", 7) == 0)
+                    && strcmp(op, s) == 0) {
+                    /* ld<counter's register> S goes (its flags must be dead:
+                     * refuse otherwise); ld<the other> S becomes a transfer */
+                    if (l[3] == (yreg ? 'y' : 'x')
+                        && !pp_nz_dead_after(ln, nl, t)) {
+                        if (why) fprintf(stderr, "loopx: %s: flags of the reload read: %s\n", s, l);
+                        bad = 1;
+                    }
+                    continue;
+                }
+                if ((!yreg && (pp_writes_x(l) || pp_is(l, "phx")))
+                    || (yreg && (pp_is(l, "ldy") || pp_is(l, "tay") || pp_is(l, "txy")
+                                 || pp_is(l, "ply") || pp_is(l, "iny") || pp_is(l, "dey")
+                                 || pp_is(l, "phy") || pp_is(l, "plp") || pp_is(l, "rti")
+                                 || ((pp_is(l, "rep") || pp_is(l, "sep"))
+                                     && (strtol(op + 2, 0, 16) & 0x10))))
+                    || pp_is(l, "jsl") || pp_is(l, "jsr")
                     || pp_is(l, "mvn") || pp_is(l, "mvp") || pp_is(l, "jml")
-                    || pp_is(l, "rtl") || pp_is(l, "rts") || pp_is(l, "phx")) {
-                    if (why) fprintf(stderr, "loopx: %s: region writes X or calls: %s\n", s, l);
+                    || pp_is(l, "rtl") || pp_is(l, "rts")) {
+                    if (why) fprintf(stderr, "loopx: %s: region writes %c or calls: %s\n", s, yreg ? 'Y' : 'X', l);
                     bad = 1;
                     continue;
                 }
@@ -8392,7 +8531,8 @@ peephole_loop_x(char **ln, int nl)
                     if (pp_writes_a(l))
                         after_step = 0;
                 }
-                op = pp_operand(l);
+                if (pp_mentions_slot(op, s, s1) && pp_alu_of_slot(ln, b, t, s) > 0)
+                    continue;           /* lda P / [clc] / op S -> t[xy]a / [clc] / op P */
                 if (pp_mentions_slot(op, s, s1)) {
                     if (!(strncmp(l, "\tlda.b ", 7) == 0 && strcmp(op, s) == 0)) {
                         if (why) fprintf(stderr, "loopx: %s: S touched: %s\n", s, l);
@@ -8422,19 +8562,50 @@ peephole_loop_x(char **ln, int nl)
 
             /* the rewrite */
             ln[i] = emalloc(strlen(s) + 8);
-            sprintf((char *)ln[i], "\tldx.b %s", s);
+            sprintf((char *)ln[i], yreg ? "\tldy.b %s" : "\tldx.b %s", s);
             ln[j] = emalloc(strlen(bound) + 8);
-            sprintf((char *)ln[j], "\tcpx.w %s", bound);
+            sprintf((char *)ln[j], yreg ? "\tcpy.w %s" : "\tcpx.w %s", bound);
             if (top_ldx)
                 ln[bodytop] = 0;
             if (top_lda_tax) {
                 ln[pp_next(ln, nl, bodytop)] = 0;
                 ln[bodytop] = 0;
             }
-            for (t = pp_next(ln, nl, b); t < cmpline; t = pp_next(ln, nl, t))
-                if (ln[t] && t != ldaline && !(t >= reads && t <= stepend)
-                    && strncmp(ln[t], "\tlda.b ", 7) == 0 && strcmp(pp_operand(ln[t]), s) == 0)
-                    ln[t] = "\ttxa";
+            for (t = pp_next(ln, nl, b); t < cmpline; t = pp_next(ln, nl, t)) {
+                int n2;
+                if (!ln[t] || t == ldaline || (t >= reads && t <= stepend)
+                    || ln[t][0] != '\t' || strcmp(pp_operand(ln[t]), s) != 0)
+                    continue;
+                if (strncmp(ln[t], "\tlda.b ", 7) == 0) {
+                    const char *treg = yreg ? "\ttay" : "\ttax";    /* the counter's */
+                    const char *toth = yreg ? "\ttax" : "\ttay";    /* the other's */
+                    n2 = pp_next(ln, nl, t);
+                    if (n2 < cmpline && strcmp(ln[n2], treg) == 0) {
+                        /* lda S / t[ay|ax]: the register is S. The pair goes
+                         * when A and the flags are dead after it; else the
+                         * transfer to A alone (N/Z of the same value) */
+                        if (pp_a_and_flags_dead_at(ln, nl, pp_next(ln, nl, n2)))
+                            ln[t] = 0;
+                        else
+                            ln[t] = yreg ? "\ttya" : "\ttxa";
+                        ln[n2] = 0;
+                    } else if (n2 < cmpline && strcmp(ln[n2], toth) == 0
+                               && pp_a16_at(ln, t) && pp_a_dead_after(ln, nl, n2)) {
+                        ln[t] = yreg ? "\ttyx" : "\ttxy";   /* N/Z of the value, as tax / tay */
+                        ln[n2] = 0;
+                    } else
+                        ln[t] = yreg ? "\ttya" : "\ttxa";
+                } else if ((n2 = pp_alu_of_slot(ln, b, t, s)) > 0) {
+                    char *nw = emalloc(strlen(ln[n2]) + 1);
+                    memcpy(nw, ln[t], 4);           /* "\tadc" */
+                    strcpy(nw + 4, ln[n2] + 4);     /* lda's width and operand */
+                    ln[t] = nw;
+                    ln[n2] = yreg ? "\ttya" : "\ttxa";
+                } else if (strncmp(ln[t], yreg ? "\tldx.b " : "\tldy.b ", 7) == 0)
+                    ln[t] = yreg ? "\ttyx" : "\ttxy";
+                else if (strncmp(ln[t], yreg ? "\tldy.b " : "\tldx.b ", 7) == 0)
+                    ln[t] = 0;
+            }
             {
                 int slots[8], ns = 0;
                 for (t = reads; t <= stepend; t++)
@@ -8445,23 +8616,24 @@ peephole_loop_x(char **ln, int nl)
                 k = 0;
                 if (c <= 2) {
                     for (t = 0; t < c; t++)
-                        ln[slots[k++]] = "\tinx";
+                        ln[slots[k++]] = yreg ? "\tiny" : "\tinx";
                 } else {
-                    ln[slots[k++]] = "\ttxa";
+                    ln[slots[k++]] = yreg ? "\ttya" : "\ttxa";
                     ln[slots[k++]] = "\tclc";
                     snprintf(step, sizeof step, "\tadc.w #%d", c);
                     ln[slots[k]] = emalloc(strlen(step) + 1);
                     strcpy((char *)ln[slots[k]], step);
                     k++;
-                    ln[slots[k++]] = "\ttax";   /* the adc form has four lines */
+                    ln[slots[k++]] = yreg ? "\ttay" : "\ttax";   /* the adc form has four lines */
                 }
             }
             if (ldaline >= 0)
                 ln[ldaline] = 0;
             ln[cmpline] = emalloc(strlen(bound) + 8);
-            sprintf((char *)ln[cmpline], "\tcpx.w %s", bound);
+            sprintf((char *)ln[cmpline], yreg ? "\tcpy.w %s" : "\tcpx.w %s", bound);
             conv_b[nconv] = i;          /* from the entry test to the bottom branch */
             conv_e[nconv] = e;
+            conv_r[nconv] = yreg;
             nconv++;
             found++;
 
@@ -8490,6 +8662,7 @@ peephole_loop_x(char **ln, int nl)
                     }
                 }
             }
+            break;
         }
     }
     return found;
