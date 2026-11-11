@@ -7532,6 +7532,17 @@ leave:
     return removed;
 }
 
+static int pp_nz_dead_after(char **ln, int nl, int i);
+
+/* Is the line before i (the previous one still there) a label? */
+static int
+pp_label_before(char **ln, int i)
+{
+    for (i--; i >= 0 && !ln[i]; i--)
+        ;
+    return i >= 0 && ln[i][0] != '\t';
+}
+
 static int
 peephole(char **ln, int nl)
 {
@@ -7577,8 +7588,16 @@ peephole(char **ln, int nl)
             }
 
             /* reload across an ldx, which leaves A alone: sta S / ldx P / lda S.
-             * The flags of the load are looked after as for the reload below */
-            if (pp_is(ln[i], "sta") && pp_slot(op) && j < nl && pp_is(ln[j], "ldx")) {
+             * The flags of the load are looked after as for the reload below.
+             * A6a R3: also across ldy and the index transfers (tyx, txy),
+             * which leave A and S alone too, and when the line after the
+             * stores is a block label (the end of a loop body before its
+             * step) followed by a line that sets N and Z (pp_nz_dead_after):
+             * `sta S / tyx / lda S / sta.w buf,x` survived both ways. */
+            if (pp_is(ln[i], "sta") && pp_slot(op) && j < nl
+                && (pp_is(ln[j], "ldx") || (!getenv("QBE_NO_PEEP_AFLOW")
+                    && (pp_is(ln[j], "ldy") || strcmp(ln[j], "\ttyx") == 0
+                        || strcmp(ln[j], "\ttxy") == 0)))) {
                 int j2 = pp_next(ln, nl, j);
 
                 if (j2 < nl && pp_is(ln[j2], "lda") && strcmp(pp_operand(ln[j2]), op) == 0
@@ -7586,7 +7605,8 @@ peephole(char **ln, int nl)
                     for (k = pp_next(ln, nl, j2); k < nl && pp_is(ln[k], "sta");
                          k = pp_next(ln, nl, k))
                         ;
-                    if (k < nl && ln[k][0] == '\t' && !pp_barrier(ln[k]) && !pp_is(ln[k], "php")) {
+                    if ((k < nl && ln[k][0] == '\t' && !pp_barrier(ln[k]) && !pp_is(ln[k], "php"))
+                        || (!getenv("QBE_NO_PEEP_AFLOW") && pp_nz_dead_after(ln, nl, j2))) {
                         ln[j2] = 0;
                         removed++;
                     }
@@ -8125,8 +8145,11 @@ static int pp_a_and_flags_dead_at(char **ln, int nl, int n);
 /* Are N and Z dead after line i — set again before anything reads them?
  * The straight line after i: a store or a flag-neutral line passes, a line
  * that sets N and Z without reading them ends the walk (dead), anything
- * else — a branch, a label, php, a line not known — answers no. (Only N and
- * Z: for a load or a transfer that is all the line changes.) */
+ * else — a branch, an anonymous label, php, a line not known — answers no.
+ * A block label `@name:` is walked through (A6a R3): the question is about
+ * the way that falls into it, and others joining there bring their own
+ * flags. (Only N and Z: for a load or a transfer that is all the line
+ * changes.) */
 static int
 pp_nz_dead_after(char **ln, int nl, int i)
 {
@@ -8139,8 +8162,10 @@ pp_nz_dead_after(char **ln, int nl, int i)
 
     for (j = pp_next(ln, nl, i), n = 0; j < nl && n < 8; j = pp_next(ln, nl, j), n++) {
         const char *lj = ln[j];
+        if (lj[0] == '@' && lj[strlen(lj) - 1] == ':')
+            continue;                   /* a block label: the fall-through goes on */
         if (lj[0] != '\t')
-            return 0;                   /* a label: other ways in */
+            return 0;                   /* an anonymous label, or a line not known */
         for (q = 0; setnz[q]; q++)
             if (pp_is(lj, setnz[q]))
                 return 1;
@@ -8849,7 +8874,11 @@ peephole_xflow(char **ln, int nl)
                 }
 
                 /* 1. what the line does to the slots' values */
-                if (pp_is(l, "jsl") || pp_is(l, "jsr")) {
+                if (pp_is(l, "jsl") || pp_is(l, "jsr") || pp_is(l, "mvn") || pp_is(l, "mvp")
+                    || pp_is(l, "tcd") || pp_is(l, "pld")) {
+                    /* a call; a block move (it writes memory, the frame
+                     * included); the direct page moved (A6a R3: the A half
+                     * of this analysis now removes loads) */
                     a = x = XF_NONE;
                 } else {
                     w = pp_writes_mem(l) || pp_is(l, "stx") || pp_is(l, "sty");
@@ -8927,10 +8956,35 @@ peephole_xflow(char **ln, int nl)
         }
     } while (changed);
 
+    /* A function that stages a far pointer in tcc__r9: peephole_r9_loop,
+     * later, takes the staging out of a loop only when the loop's first
+     * line writes A without reading it, so the load that opens a block
+     * stays there (A6a R3: removing it cost the r9 rule a loop, 16
+     * cycles a turn for 4) */
+    int stages_r9 = 0;
+    for (k = 0; k < nl; k++)
+        if (ln[k] && strcmp(ln[k], "\tsta.b tcc__r9") == 0)
+            stages_r9 = 1;
+
     /* the redundant loads */
     for (i = 0; i < nl; i++) {
         int j, p, sk, so;
 
+        /* A6a R3: `lda S` with A already equal to S on every way in goes,
+         * unless N and Z of that load are read before something sets them
+         * again (pp_nz_dead_after): they are all the load changes. The
+         * fill's loop body `lda S / sta.l buf,x / inx / inx / cpx / bcc`,
+         * entered with A = S from the store before the test and from its
+         * own back edge, loses its load. 16-bit A only. */
+        if (ln[i] && ln[i][0] == '\t' && pp_is(ln[i], "lda") && ina[i] >= 0 && !a8v[i]
+            && (sk = xf_slot(pp_operand(ln[i]), &so)) != 0
+            && kind[ina[i]] == sk && offv[ina[i]] == so
+            && !getenv("QBE_NO_PEEP_AFLOW") && pp_nz_dead_after(ln, nl, i)
+            && !(stages_r9 && i > 0 && pp_label_before(ln, i))) {
+            ln[i] = 0;
+            removed++;
+            continue;
+        }
         if (!ln[i] || ln[i][0] != '\t' || inx[i] < 0)
             continue;
         if (strcmp(ln[i], "\ttax") == 0 && ina[i] == inx[i]) {
