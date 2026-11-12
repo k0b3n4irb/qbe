@@ -7587,6 +7587,31 @@ peephole(char **ln, int nl)
                 j = pp_next(ln, nl, i);
             }
 
+            /* A6a R5: two masks in a row are one, `and.w #K1 / and.w #K2`
+             * -> `and.w #(K1 & K2)`: A and N, Z come out the same (a byte
+             * read and its zero extension each masked it) */
+            if (strncmp(ln[i], "\tand.w #", 8) == 0 && j < nl
+                && strncmp(ln[j], "\tand.w #", 8) == 0 && !getenv("QBE_NO_PEEP_AND2")) {
+                const char *p1 = ln[i] + 8, *p2 = ln[j] + 8;
+                char *e1, *e2;
+                long k1 = *p1 == '$' ? strtol(p1 + 1, &e1, 16) : strtol(p1, &e1, 10);
+                long k2 = *p2 == '$' ? strtol(p2 + 1, &e2, 16) : strtol(p2, &e2, 10);
+
+                if (*e1 == 0 && *e2 == 0 && e1 != p1 && e2 != p2) {
+                    long km = k1 & k2 & 0xFFFF;
+                    char *nw = emalloc(24);
+
+                    if (km == 0xFF)
+                        strcpy(nw, "\tand.w #$00FF");
+                    else
+                        sprintf(nw, "\tand.w #%ld", km);
+                    ln[i] = nw;
+                    ln[j] = 0;
+                    removed++;
+                    j = pp_next(ln, nl, i);
+                }
+            }
+
             /* reload across an ldx, which leaves A alone: sta S / ldx P / lda S.
              * The flags of the load are looked after as for the reload below.
              * A6a R3: also across ldy and the index transfers (tyx, txy),
