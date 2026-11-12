@@ -6764,6 +6764,675 @@ static Ref fork_ref;
 static void branch_fork(void) { fork_valid = acache_valid; fork_ref = acache_ref; }
 static void branch_join(void) { acache_valid = fork_valid; acache_ref = fork_ref; }
 
+/* A jump table for a tree of compares on one value (L2, 2026-11-12).
+ *
+ * cproc lowers a `switch` to a binary search: blocks that compare the value
+ * with a constant (`ceqw v, k` then `cultw v, k`) and branch, down to the
+ * case blocks. The tree stays in the IR, where every pass understands it (a
+ * QBE block has two successors); the table is an emission of it. jt_find
+ * recognises, before the blocks are emitted, a region of blocks that do
+ * nothing but compare ONE 16-bit temporary against constants and branch:
+ *
+ *   - its root: any block whose last instruction is such a compare (or whose
+ *     jnz tests v itself), the instructions before it emitted as usual;
+ *   - its members: entered from the region only, no phi, and nothing but
+ *     the one compare and its jnz, or an empty block that jumps;
+ *   - its exits: every successor outside the region (the cases, the default).
+ *
+ * The region is then evaluated on all 65 536 values of v: f(v) is the exit
+ * the compares lead to. The default D is the exit most values reach, the
+ * cases the values that reach another one; [MIN, MIN + RANGE) is the
+ * smallest window (cyclic, on 16 bits) that holds them all. Emitted:
+ *
+ *       lda v                  (when A does not hold it)
+ *       sec / sbc.w #MIN       (when MIN is not 0)
+ *       cmp.w #RANGE / bcc + / jmp @D / +
+ *       asl a
+ *       tax
+ *       jmp (@jtt.N,x)         reads the table through the program bank
+ *   ...
+ *   @jtt.N:  .dw f(MIN), f(MIN+1), ...    (before the function's .ENDS)
+ *
+ * which equals f for every v by construction: a value outside the window
+ * reaches D in the tree, and each slot holds f of its value. Nothing of the
+ * region's members is emitted. An exit whose edges carry phi moves is
+ * reached through a stub `@jts.N.k: <moves> / jmp @exit`; the moves of every
+ * edge of the region into one exit must be the same (else the tree stays).
+ *
+ * The text passes. A `jmp (abs,x)` has as many successors as the table,
+ * which no text pass knows. While they run, the function's text holds in
+ * its place a group they all read right:
+ *
+ *       asl a / tax / bvs @t1 / ... / bvs @tk-1 / jmp @tk
+ *
+ * one branch per distinct target: the state at each target is the state at
+ * the `tax`, as the real jump gives it, and nothing falls through the group.
+ * No pass reads a `bvs` for its condition. relax_branches then finds the
+ * group again, line for line, and writes `jmp (@jtt.N,x)` in place of the
+ * branches before it bounds any distance; a group a pass has touched (the
+ * `tax` the jump reads and no branch shows, a branch moved) is an internal
+ * compiler error, never a jump through a stale X. The table itself is
+ * printed after the passes, before `.ENDS`: no pass sees a data line.
+ *
+ * QBE_NO_JUMP_TABLE=1 turns it off; QBE_JT_TRACE=1 says, for every region
+ * of two compares or more, whether it became a table and why not. */
+typedef struct {
+    Blk *root;
+    Ref v;
+    int min, range, ncases;
+    int rootcmp;        /* the root ends on a compare (fused, not emitted) */
+    int ntgt;
+    Blk **tgt;          /* the exits, tgt[0] the default */
+    Blk **rep;          /* a region block with an edge to tgt[j] */
+    int *entry;         /* range entries: an index into tgt */
+    char *fake;         /* the group the rewrite looks for (staged emission) */
+    int seq;
+} JTab;
+static JTab *jt_tab;
+static int jt_n, jt_cap, jt_seq, jt_staged, jt_trace;
+static int *jt_role;    /* by block id: -1, -2 a member not emitted, k >= 0 root of table k */
+static char *jt_tail;   /* the tables' text, printed before .ENDS */
+static size_t jt_tail_len, jt_tail_cap;
+static char jt_fnname[NString];
+
+/* The thresholds, decided on the measures of the commit that brought the
+ * table (cycles and bytes, tree against table, 2 to 100 cases, strides 1 to
+ * 6): at least JT_MIN_CASES values that do not reach the default and as
+ * many compares in the region, and a window of at most JT_DENSITY slots a
+ * compare — the tree's size is its compares, the table's its slots (two
+ * bytes each, holes included). A range test (`x >= 32 && x < 128`: two
+ * compares, ninety-six values) is not a dispatch, and is refused by that
+ * rule rather than turned into ninety-six slots of one target. */
+#define JT_MIN_CASES 4
+#define JT_DENSITY 3
+#define JT_MAX_RANGE 1024
+
+static void
+jt_tail_add(const char *s)
+{
+    size_t n = strlen(s);
+
+    if (jt_tail_len + n + 1 > jt_tail_cap) {
+        size_t cap = (jt_tail_cap ? jt_tail_cap * 2 : 1024) + n;
+        char *nb = emalloc(cap);
+        if (jt_tail)
+            memcpy(nb, jt_tail, jt_tail_len);
+        free(jt_tail);
+        jt_tail = nb;
+        jt_tail_cap = cap;
+    }
+    memcpy(jt_tail + jt_tail_len, s, n + 1);
+    jt_tail_len += n;
+}
+
+/* The 16-bit compare a block ends on, against a constant: 1, with the
+ * operation as `v OP k` (v the temporary, k the constant on 16 bits). A
+ * compare of two temporaries, of 32 bits, or whose result is read by
+ * anything but the block's jnz: 0. */
+static int
+jt_cmp(Fn *fn, Blk *b, Ref *v, int *op, unsigned *k)
+{
+    Ins *i;
+    Ref a0, a1, t;
+    int o, cidx, swapped = 0;
+    int64_t kv;
+
+    if (b->jmp.type != Jjnz || b->nins == 0)
+        return 0;
+    i = &b->ins[b->nins - 1];
+    o = i->op;
+    if (o < Oceqw || o > Ocultw || !req(i->to, b->jmp.arg)
+        || rtype(i->to) != RTmp || i->to.val < Tmp0)
+        return 0;
+    cidx = i->to.val - Tmp0;
+    if (cidx >= MAX_ALIAS_TEMPS || temp_use_count[cidx] != 0)
+        return 0;
+    a0 = i->arg[0];
+    a1 = i->arg[1];
+    if (rtype(a0) == RCon && rtype(a1) == RTmp) {
+        t = a0; a0 = a1; a1 = t;
+        swapped = 1;
+    }
+    if (rtype(a0) != RTmp || a0.val < Tmp0 || rtype(a1) != RCon
+        || fn->con[a1.val].type != CBits || fn->tmp[a0.val].cls != Kw)
+        return 0;
+    /* the low 16 bits, as the compare is emitted (emitop2: `cmp.w #K` of
+     * K & $FFFF): the folder may leave `-3` as 4294967293 */
+    kv = fn->con[a1.val].bits.i;
+    if (swapped)
+        switch (o) {    /* k OP v is v OP' k */
+        case Ocsltw: o = Ocsgtw; break;
+        case Ocsgtw: o = Ocsltw; break;
+        case Ocslew: o = Ocsgew; break;
+        case Ocsgew: o = Ocslew; break;
+        case Ocultw: o = Ocugtw; break;
+        case Ocugtw: o = Ocultw; break;
+        case Oculew: o = Ocugew; break;
+        case Ocugew: o = Oculew; break;
+        default: break;
+        }
+    *v = a0;
+    *op = o;
+    *k = (unsigned)kv & 0xFFFF;
+    return 1;
+}
+
+static int
+jt_eval(int op, unsigned a, unsigned b)
+{
+    int sa = (short)a, sb = (short)b;
+
+    switch (op) {
+    case Oceqw: return a == b;
+    case Ocnew: return a != b;
+    case Ocsltw: return sa < sb;
+    case Ocslew: return sa <= sb;
+    case Ocsgtw: return sa > sb;
+    case Ocsgew: return sa >= sb;
+    case Ocultw: return a < b;
+    case Oculew: return a <= b;
+    case Ocugtw: return a > b;
+    case Ocugew: return a >= b;
+    }
+    die("jt_eval: not a compare");
+}
+
+/* What a member block does with v: 'c' a compare (op, k), 'z' a jnz on v
+ * itself (v != 0), 'j' an empty jump; 0 when it is not a member's shape. */
+static int
+jt_member_shape(Fn *fn, Blk *b, Ref v, int *op, unsigned *k)
+{
+    Ref w;
+
+    if (b->phi)
+        return 0;
+    /* an empty jump into a block with phis is a case of its own: its edge
+     * carries that case's moves (a `switch` that sets one variable) */
+    if (b->nins == 0 && b->jmp.type == Jjmp)
+        return b->s1->phi ? 0 : 'j';
+    if (b->nins == 0 && b->jmp.type == Jjnz && req(b->jmp.arg, v)) {
+        *op = Ocnew;
+        *k = 0;
+        return 'z';
+    }
+    if (b->nins == 1 && jt_cmp(fn, b, &w, op, k) && req(w, v))
+        return 'c';
+    return 0;
+}
+
+static void
+jt_why(Fn *fn, Blk *root, const char *why, int ncmp)
+{
+    if (jt_trace)
+        fprintf(stderr, "jt: %s: @%s: tree kept (%d compares): %s\n",
+                fn->name, root->name, ncmp, why);
+}
+
+/* Recognise the regions of fn and decide which become tables. */
+static void
+jt_find(Fn *fn)
+{
+    char *in;
+    int *exitof, *cnt;
+    unsigned short *f;
+    Blk **reg, *b, *s;
+    uint n;
+
+    jt_n = 0;
+    jt_tail_len = 0;
+    if (jt_tail)
+        jt_tail[0] = 0;
+    free(jt_role);
+    jt_role = emalloc(fn->nblk * sizeof *jt_role);
+    for (n = 0; n < fn->nblk; n++)
+        jt_role[n] = -1;
+    snprintf(jt_fnname, sizeof jt_fnname, "%s", fn->name);
+    jt_trace = getenv("QBE_JT_TRACE") != 0;
+    if (getenv("QBE_NO_JUMP_TABLE"))
+        return;
+    in = emalloc(fn->nblk);
+    exitof = emalloc(fn->nblk * sizeof *exitof);
+    reg = emalloc(fn->nblk * sizeof *reg);
+    cnt = emalloc((fn->nblk + 1) * sizeof *cnt);
+    f = emalloc(65536 * sizeof *f);
+
+    for (n = 0; n < fn->nblk; n++) {
+        Blk *root = fn->rpo[n], *tg[2];
+        Ref v;
+        int op, nreg, ncmp, grew, r, e, nexit, ok, d, j, p;
+        unsigned k, x;
+        const char *why = 0;
+
+        if (jt_role[root->id] != -1)
+            continue;
+        if (!jt_cmp(fn, root, &v, &op, &k)) {
+            if (root->jmp.type != Jjnz || rtype(root->jmp.arg) != RTmp
+                || root->jmp.arg.val < Tmp0 || fn->tmp[root->jmp.arg.val].cls != Kw)
+                continue;
+            v = root->jmp.arg;      /* jnz on v itself */
+        }
+        /* grow the region from the root */
+        memset(in, 0, fn->nblk);
+        in[root->id] = 1;
+        reg[0] = root;
+        nreg = 1;
+        ncmp = 1;
+        do {
+            grew = 0;
+            for (r = 0; r < nreg; r++) {
+                tg[0] = reg[r]->s1;
+                tg[1] = reg[r]->jmp.type == Jjnz ? reg[r]->s2 : 0;
+                for (e = 0; e < 2; e++) {
+                    int sop;
+                    unsigned sk;
+                    char shape;
+
+                    s = tg[e];
+                    if (!s || in[s->id] || s == root || jt_role[s->id] != -1)
+                        continue;
+                    shape = jt_member_shape(fn, s, v, &sop, &sk);
+                    if (!shape)
+                        continue;
+                    for (p = 0; p < (int)s->npred; p++)
+                        if (!in[s->pred[p]->id])
+                            break;
+                    if (p < (int)s->npred)
+                        continue;
+                    in[s->id] = 1;
+                    reg[nreg++] = s;
+                    if (shape != 'j')
+                        ncmp++;
+                    grew = 1;
+                }
+            }
+        } while (grew);
+        if (ncmp < 2)
+            continue;               /* one test: an `if`, not a dispatch */
+
+        /* the exits; an edge back to the root is a loop the table cannot be */
+        nexit = 0;
+        for (r = 0; r < nreg; r++) {
+            tg[0] = reg[r]->s1;
+            tg[1] = reg[r]->jmp.type == Jjnz ? reg[r]->s2 : 0;
+            for (e = 0; e < 2; e++) {
+                s = tg[e];
+                if (!s)
+                    continue;
+                if (s == root) {
+                    why = "an edge of the region goes back to its root";
+                    break;
+                }
+                if (in[s->id])
+                    continue;
+                for (j = 0; j < nexit; j++)
+                    if (cnt[j] == (int)s->id)
+                        break;
+                if (j == nexit)
+                    cnt[nexit++] = s->id;
+            }
+            if (why)
+                break;
+        }
+        if (why) {
+            jt_why(fn, root, why, ncmp);
+            continue;
+        }
+        for (j = 0; j < (int)fn->nblk; j++)
+            exitof[j] = -1;
+        for (j = 0; j < nexit; j++)
+            exitof[cnt[j]] = j;
+
+        /* f(v) for every v */
+        ok = 1;
+        for (x = 0; x < 65536 && ok; x++) {
+            int steps = 0, sop;
+            unsigned sk;
+
+            b = root;
+            while (in[b->id]) {
+                int c;
+                if (++steps > nreg) {
+                    ok = 0;     /* cannot be: the members form no cycle */
+                    break;
+                }
+                if (b == root) {
+                    if (jt_cmp(fn, root, &v, &sop, &sk))
+                        c = jt_eval(sop, x, sk);
+                    else
+                        c = x != 0;
+                    b = c ? b->s1 : b->s2;
+                    continue;
+                }
+                switch (jt_member_shape(fn, b, v, &sop, &sk)) {
+                case 'j':
+                    b = b->s1;
+                    break;
+                case 'c': case 'z':
+                    b = jt_eval(sop, x, sk) ? b->s1 : b->s2;
+                    break;
+                default:
+                    die("jt_find: a member lost its shape");
+                }
+            }
+            if (ok)
+                f[x] = exitof[b->id];
+        }
+        if (!ok) {
+            jt_why(fn, root, "the region does not end", ncmp);
+            continue;
+        }
+        /* the default: the exit most values reach */
+        for (j = 0; j < nexit; j++)
+            cnt[j] = 0;
+        for (x = 0; x < 65536; x++)
+            cnt[f[x]]++;
+        d = 0;
+        for (j = 1; j < nexit; j++)
+            if (cnt[j] > cnt[d])
+                d = j;
+        {
+            /* the smallest cyclic window holding every case: the complement
+             * of the longest run of default values */
+            int ncases = 65536 - cnt[d], best = 0, bstart = 0, run = 0, rstart = 0, lead;
+            unsigned min, range;
+            JTab *t;
+
+            if (ncases == 0) {
+                jt_why(fn, root, "every value reaches one exit", ncmp);
+                continue;
+            }
+            for (lead = 0; lead < 65536 && f[lead] == d; lead++)
+                ;
+            for (x = 0; x < 65536; x++) {
+                if (f[x] == d) {
+                    if (!run)
+                        rstart = x;
+                    run++;
+                } else
+                    run = 0;
+                if (run > best) {
+                    best = run;
+                    bstart = rstart;
+                }
+            }
+            if (run + lead > best && run) {    /* the run that wraps */
+                best = run + lead;
+                bstart = rstart;
+            }
+            min = (unsigned)(bstart + best) & 0xFFFF;
+            range = 65536 - best;
+            if (jt_trace)
+                fprintf(stderr, "jt: %s: @%s: %d compares, %d cases, min %u, range %u, %d exits\n",
+                        fn->name, root->name, ncmp, ncases, min, range, nexit);
+            {
+                int mincases = getenv("QBE_JT_MIN_CASES") ? atoi(getenv("QBE_JT_MIN_CASES")) : JT_MIN_CASES;
+                int density = getenv("QBE_JT_DENSITY") ? atoi(getenv("QBE_JT_DENSITY")) : JT_DENSITY;
+                if (ncases < mincases || ncmp < mincases) {
+                    jt_why(fn, root, "too few cases", ncmp);
+                    continue;
+                }
+                if (range > JT_MAX_RANGE || range > (unsigned)ncmp * density) {
+                    jt_why(fn, root, "too sparse", ncmp);
+                    continue;
+                }
+            }
+            /* phi moves: one set per exit, whatever the edge of the region;
+             * none may read a compare's result (it is never computed) */
+            for (b = fn->start; b && !why; b = b->link) {
+                Phi *ph;
+                if (exitof[b->id] < 0)
+                    continue;
+                for (ph = b->phi; ph && !why; ph = ph->link) {
+                    Ref a = R;
+                    int seen = 0;
+                    for (p = 0; p < (int)ph->narg; p++) {
+                        if (!in[ph->blk[p]->id])
+                            continue;
+                        if (seen && !req(ph->arg[p], a))
+                            why = "the edges into one case carry different phi moves";
+                        a = ph->arg[p];
+                        seen = 1;
+                        if (rtype(a) == RTmp)
+                            for (r = 0; r < nreg; r++)
+                                if (reg[r]->nins
+                                    && req(reg[r]->ins[reg[r]->nins - 1].to, a))
+                                    why = "a phi reads a compare of the region";
+                    }
+                }
+            }
+            if (why) {
+                jt_why(fn, root, why, ncmp);
+                continue;
+            }
+
+            /* taken */
+            if (jt_n == jt_cap) {
+                JTab *nt = emalloc((jt_cap ? jt_cap * 2 : 8) * sizeof *nt);
+                if (jt_tab)
+                    memcpy(nt, jt_tab, jt_n * sizeof *nt);
+                free(jt_tab);
+                jt_tab = nt;
+                jt_cap = jt_cap ? jt_cap * 2 : 8;
+            }
+            t = &jt_tab[jt_n];
+            memset(t, 0, sizeof *t);
+            t->root = root;
+            t->v = v;
+            t->min = min;
+            t->range = range;
+            t->ncases = ncases;
+            t->rootcmp = jt_cmp(fn, root, &v, &op, &k);
+            t->seq = ++jt_seq;
+            t->ntgt = nexit;
+            t->tgt = emalloc(nexit * sizeof *t->tgt);
+            t->rep = emalloc(nexit * sizeof *t->rep);
+            /* tgt[0] is the default */
+            for (j = 0; j < nexit; j++)
+                t->tgt[j] = 0;
+            for (b = fn->start; b; b = b->link)
+                if (exitof[b->id] >= 0) {
+                    int slot = exitof[b->id];
+                    slot = slot == d ? 0 : (slot < d ? slot + 1 : slot);
+                    t->tgt[slot] = b;
+                }
+            for (j = 0; j < nexit; j++) {
+                if (!t->tgt[j])
+                    die("jt_find: an exit is not in the function");
+                t->rep[j] = 0;
+                for (r = 0; r < nreg && !t->rep[j]; r++)
+                    if (reg[r]->s1 == t->tgt[j]
+                        || (reg[r]->jmp.type == Jjnz && reg[r]->s2 == t->tgt[j]))
+                        t->rep[j] = reg[r];
+            }
+            t->entry = emalloc(range * sizeof *t->entry);
+            for (x = 0; x < range; x++) {
+                int ex = f[(min + x) & 0xFFFF];
+                t->entry[x] = ex == d ? 0 : (ex < d ? ex + 1 : ex);
+            }
+            jt_role[root->id] = jt_n;
+            for (r = 1; r < nreg; r++)
+                jt_role[reg[r]->id] = -2;
+            jt_n++;
+            if (jt_trace)
+                fprintf(stderr, "jt: %s: @%s: table %d, %d cases, min %u, range %u\n",
+                        fn->name, root->name, t->seq, ncases, min, range);
+        }
+    }
+    free(in);
+    free(exitof);
+    free(reg);
+    free(cnt);
+    free(f);
+}
+
+/* The phi moves of the edge from -> to, as text (empty when none). */
+static char *
+jt_moves(Blk *from, Blk *to, Fn *fn)
+{
+    FILE *save = outf, *tmp = tmpfile();
+    long size;
+    char *s;
+
+    if (!tmp)
+        die("jump table: no temporary file");
+    outf = tmp;
+    acache_invalidate();
+    slot_owner_reset();
+    emitphimoves(from, to, fn);
+    acache_invalidate();
+    outf = save;
+    fflush(tmp);
+    size = ftell(tmp);
+    rewind(tmp);
+    s = emalloc(size + 1);
+    if (fread(s, 1, size, tmp) != (size_t)size)
+        die("jump table: cannot read the moves back");
+    s[size] = 0;
+    fclose(tmp);
+    return s;
+}
+
+/* Emit table k in place of its root's branch. */
+static void
+emit_jt(int k, Fn *fn)
+{
+    JTab *t = &jt_tab[k];
+    char **lbl, **mv, buf[NString + 32], *fake;
+    int j, x, nf, *used;
+    size_t fl;
+
+    fused_cmp = 0;
+    fused_nz32 = 0;
+    emit_rep20();
+    lbl = emalloc(t->ntgt * sizeof *lbl);
+    mv = emalloc(t->ntgt * sizeof *mv);
+    used = emalloc(t->ntgt * sizeof *used);
+    /* the moves first, captured: they are emitted in the stubs below */
+    for (j = 0; j < t->ntgt; j++) {
+        mv[j] = jt_moves(t->rep[j], t->tgt[j], fn);
+        lbl[j] = emalloc(NString + 32);
+        if (mv[j][0])
+            sprintf(lbl[j], "jts.%d.%d", t->seq, j);
+        else
+            sprintf(lbl[j], "%s", t->tgt[j]->name);
+        used[j] = 0;
+    }
+    slot_owner_reset();
+    emitload(t->v, fn);
+    if (t->min) {
+        fprintf(outf, "\tsec\n");
+        fprintf(outf, "\tsbc.w #%d\n", t->min);
+    }
+    acache_invalidate();
+    if (t->range < 65536) {
+        fprintf(outf, "\tcmp.w #%d\n", t->range);
+        fprintf(outf, "\tbcc +\n");
+        fprintf(outf, "\tjmp @%s\n", lbl[0]);
+        fprintf(outf, "+\n");
+    }
+    fprintf(outf, "\tasl a\n");
+    fprintf(outf, "\ttax\n");
+    x_invalidate();
+    /* the group: one branch per distinct target, in table order */
+    for (x = 0; x < t->range; x++)
+        used[t->entry[x]] = 1;
+    nf = 0;
+    for (j = 0; j < t->ntgt; j++)
+        nf += used[j];
+    fl = strlen("\tasl a\n\ttax\n") + 1;
+    for (j = 0; j < t->ntgt; j++)
+        if (used[j])
+            fl += strlen(lbl[j]) + 8;
+    fake = emalloc(fl);
+    strcpy(fake, "\tasl a\n\ttax\n");
+    for (j = 0; j < t->ntgt; j++) {
+        if (!used[j])
+            continue;
+        sprintf(buf, "\t%s @%s\n", --nf ? "bvs" : "jmp", lbl[j]);
+        strcat(fake, buf);
+    }
+    t->fake = fake;
+    if (jt_staged)
+        fputs(fake + strlen("\tasl a\n\ttax\n"), outf);
+    else
+        fprintf(outf, "\tjmp (@jtt.%d,x)\n", t->seq);
+    /* the stubs */
+    for (j = 0; j < t->ntgt; j++) {
+        if (!mv[j][0])
+            continue;
+        fprintf(outf, "@%s:\n", lbl[j]);
+        fputs(mv[j], outf);
+        emit_rep20();
+        fprintf(outf, "\tjmp @%s\n", t->tgt[j]->name);
+    }
+    acache_invalidate();
+    x_invalidate();
+    r9_invalidate();
+    slot_owner_reset();
+    /* the table, printed before .ENDS */
+    sprintf(buf, "@jtt.%d:\n", t->seq);
+    jt_tail_add(buf);
+    for (x = 0; x < t->range; x++) {
+        jt_tail_add(x % 8 ? ", @" : (x ? "\n\t.dw @" : "\t.dw @"));
+        jt_tail_add(lbl[t->entry[x]]);
+    }
+    jt_tail_add("\n");
+    for (j = 0; j < t->ntgt; j++) {
+        free(lbl[j]);
+        free(mv[j]);
+    }
+    free(lbl);
+    free(mv);
+    free(used);
+}
+
+static int pp_next(char **ln, int nl, int i);
+
+/* relax_branches: each table's group back to its jump, in emission order.
+ * The group must be there line for line. */
+static void
+jt_rewrite(char **ln, int nl)
+{
+    int k, i, m, from = 0;
+
+    for (k = 0; k < jt_n; k++) {
+        JTab *t = &jt_tab[k];
+        char *dup = emalloc(strlen(t->fake) + 1), *lines[4096], *p, *jl;
+        int nlines = 0, at = -1, idx[4096];
+
+        strcpy(dup, t->fake);
+        for (p = strtok(dup, "\n"); p; p = strtok(0, "\n")) {
+            if (nlines == 4096)
+                die("jump table: group too long");
+            lines[nlines++] = p;
+        }
+        for (i = from; i < nl && at < 0; i++) {
+            int q = i;
+            if (!ln[i] || strcmp(ln[i], lines[0]) != 0)
+                continue;
+            for (m = 0; m < nlines; m++) {
+                if (q >= nl || strcmp(ln[q], lines[m]) != 0)
+                    break;
+                idx[m] = q;
+                q = pp_next(ln, nl, q);
+            }
+            if (m == nlines)
+                at = i;
+        }
+        if (at < 0)
+            err("internal compiler error: the dispatch of jump table %d in %s "
+                "was changed by a text pass (compiler/qbe/w65816/emit.c, jt_rewrite); "
+                "QBE_NO_JUMP_TABLE=1 keeps the compare tree", t->seq, jt_fnname);
+        jl = emalloc(32);
+        sprintf(jl, "\tjmp (@jtt.%d,x)", t->seq);
+        ln[idx[2]] = jl;
+        for (m = 3; m < nlines; m++)
+            ln[idx[m]] = 0;
+        from = idx[nlines - 1] + 1;
+        free(dup);
+    }
+}
+
 /* Loop rotation (2026-10-11). A block that ends in `jmp @T`, where T is
  * nothing but a compare and the branch on it (the condition of a `for` or a
  * `while`), emits T's compare and branch itself instead of jumping to them:
@@ -6783,6 +7452,8 @@ rotatable(Blk *t)
 
     if (t->jmp.type != Jjnz || t->nins != 1)
         return 0;
+    if (jt_role && jt_role[t->id] != -1)
+        return 0;               /* a table's root: its branch is the dispatch */
     i = t->ins;
     if (!is_cmp_op(i->op)
         || (is_kl_cmp(i->op) && i->op != Oceql && i->op != Ocnel)
@@ -10122,9 +10793,14 @@ relax_branches(FILE *in, FILE *out)
             nl = k;
         }
     }
+    /* L2: each table's group becomes its jump before any distance is
+     * bounded (the table itself is printed before .ENDS, below) */
+    jt_rewrite(ln, nl);
     for (i = 0; i < nl; i++) {
         if (!ln[i])
             continue;
+        if (jt_tail_len && strcmp(ln[i], ".ENDS") == 0)
+            fputs(jt_tail, out);
         inv = (i + 2 < nl && ln[i + 1] && ln[i + 2]) ? inverted_branch(ln[i]) : 0;
         if (inv && strncmp(ln[i + 1], "\tjmp @", 6) == 0 && strcmp(ln[i + 2], "+") == 0) {
             target = ln[i + 1] + 5;         /* "@name" */
@@ -10498,6 +11174,15 @@ w65816_emitfn(Fn *fn, FILE *f)
         fprintf(outf, "\tsta.b tcc__fp\n");
     }
 
+    /* L2: the regions that become jump tables; their members are not
+     * emitted, so a block whose layout successor is one of them now falls
+     * to the next block that is */
+    jt_staged = staged != 0;
+    jt_find(fn);
+    for (b = fn->start; b; b = b->link)
+        while (b->link && jt_role[b->link->id] == -2)
+            b->link = b->link->link;
+
     acache_invalidate();
     amode_8bit = 0;  /* Start in 16-bit mode (calling convention) */
     for (b = fn->start; b; b = b->link) {
@@ -10622,6 +11307,12 @@ w65816_emitfn(Fn *fn, FILE *f)
                 }
                 fprintf(outf, "\trtl\n");
             }
+        } else if (jt_role[b->id] >= 0) {
+            if (jt_tab[jt_role[b->id]].rootcmp && !fused_cmp)
+                err("internal compiler error: the compare of jump table root @%s "
+                    "in %s was emitted (compiler/qbe/w65816/emit.c, emit_jt)",
+                    b->name, fn->name);
+            emit_jt(jt_role[b->id], fn);
         } else {
             /* Ensure 16-bit before jump (phi moves use 16-bit lda/sta) */
             emit_rep20();
@@ -10629,6 +11320,8 @@ w65816_emitfn(Fn *fn, FILE *f)
         }
     }
 
+    if (!staged && jt_tail_len)
+        fputs(jt_tail, outf);
     fprintf(outf, ".ENDS\n");
     if (staged) {
         relax_branches(staged, real);
