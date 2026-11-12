@@ -23,11 +23,15 @@
  *
  * gvn, which runs next, makes %e and %m the first access's. The symbol
  * may come through `%t =l add $buf, c` (a union member, `u.w[i + 8]`). The bound is
- * PROVED from x's definition only, through copies — `extub` (255), `and x,
- * M` (M), `shr x, s` (0xFFFF >> s): the compiler does not reason from an out-of-bounds
+ * PROVED from x's definition, through copies — `extub` (255), `and x,
+ * M` (M), `shr x, s` (0xFFFF >> s) — or, since 2026-11-11 (A6a R4), from
+ * a test `cultw x, N` that dominates the add (testbound: a loop's counter
+ * in its body): the compiler does not reason from an out-of-bounds
  * access being undefined (owner decision, 2026-10-16). %e and %m must have
- * no other use; the old add is left to gcm, which drops it when unused.
- * QBE_NO_REASSOC=1 switches the pass off. requires use; maintains it. */
+ * no other use; the old add goes when %e was its only use (else it is
+ * left to gcm, which drops it when unused).
+ * QBE_NO_REASSOC=1 switches the pass off, QBE_NO_REASSOC_LOOP=1 the loop
+ * bound alone. requires use, dom; maintains use. */
 
 static int
 cbits(Fn *fn, Ref r, int64_t *v)
@@ -82,6 +86,55 @@ bound(Fn *fn, Ref r)
 	default:
 		return -1;
 	}
+}
+
+/* r through its copies */
+static Ref
+rootof(Fn *fn, Ref r)
+{
+	Ins *d;
+
+	for (int n = 0; n < 8 && (d = def1(fn, r)) && d->op == Ocopy; n++)
+		r = d->arg[0];
+	return r;
+}
+
+/* A6a R4: an upper bound of the 16-bit value r at block `at`, proved by a
+ * test that dominates it: a block h ending in `jnz %c, @s, ...` with
+ * %c = `cultw r, N` (or `culew r, N`), @s entered from h alone and
+ * dominating `at`. Every way to `at` then took the true edge of that test,
+ * and r, an SSA value, is the one tested: r <= N - 1 (N). A loop's counter
+ * in its body, the shape of `for (i = 0; i < N; i += 8) buf[i + 1] = v`.
+ * Like bound(), nothing is inferred from an access being out of bounds.
+ * -1 when no such test. requires dom. */
+static int64_t
+testbound(Fn *fn, Ref r, Blk *at)
+{
+	Blk *h, *s;
+	Ins *d;
+	int64_t n, v, best;
+
+	if (getenv("QBE_NO_REASSOC_LOOP"))
+		return -1;
+	r = rootof(fn, r);
+	best = -1;
+	for (h = fn->start; h; h = h->link) {
+		if (h->jmp.type != Jjnz || rtype(h->jmp.arg) != RTmp)
+			continue;
+		d = def1(fn, rootof(fn, h->jmp.arg));
+		if (!d || (d->op != Ocultw && d->op != Oculew)
+		    || !req(rootof(fn, d->arg[0]), r) || !cbits(fn, d->arg[1], &n))
+			continue;
+		s = h->s1;
+		if (!s || s == h->s2 || s->npred != 1 || s->pred[0] != h || !dom(s, at))
+			continue;
+		v = d->op == Ocultw ? n - 1 : n;
+		if (v < 0 || v > 0xFFFF)
+			continue;
+		if (best < 0 || v < best)
+			best = v;
+	}
+	return best;
 }
 
 /* the address r stands for, when it is a symbol plus a constant: the
@@ -159,9 +212,16 @@ reassoc(Fn *fn)
 			if (cst <= 0 || cst > 0x7FFF || rtype(x) != RTmp)
 				continue;
 			bx = bound(fn, x);
+			if (bx < 0 && fn->tmp[e->arg[0].val].bid < fn->nblk)
+				bx = testbound(fn, x, fn->rpo[fn->tmp[e->arg[0].val].bid]);
 			if (bx < 0 || bx + cst > 0x7FFF)
 				continue;
-			/* rewrite: e = ext(x) (extub b when x is extub b), sym += cst * k */
+			/* rewrite: e = ext(x) (extub b when x is extub b), sym += cst * k.
+			 * The old add goes now when e was its only use (A6a R4): left
+			 * for gcm, it was still a use of x when ivar looked, and a
+			 * loop counter with one more use is not rewritten. */
+			if (fn->tmp[e->arg[0].val].nuse == 1)
+				*a = (Ins){.op = Onop};
 			xd = def1(fn, x);
 			if (xd && xd->op == Oextub) {
 				e->op = Oextub;
