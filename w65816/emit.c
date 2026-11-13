@@ -10917,20 +10917,29 @@ relax_branches(FILE *in, FILE *out)
     free(buf);
 }
 
-/* L4 S0 (2026-11-13): the count of static frames, comments only.
- * With QBE_SFRAME_DUMP=1 each function is followed, after its `.ENDS`
- * and after every text pass has run (nothing reads these lines but the
- * count, devtools/sframe/sframe_count.py), by what a static frame would
- * take from it: whether the compiler alone could decide it (and why not),
- * its stack temp bytes, its parameter bytes, and every call of its IR
- * (direct callee, or `*` for a call through a pointer) with the bytes of
- * its arguments. Nothing here changes a byte of the object. */
+/* L4 side table (S0 2026-11-13 as a count, S1 2026-11-14 always written):
+ * comments only, so nothing here changes a byte of the object. Each
+ * function is followed, after its `.ENDS` and after every text pass has
+ * run, by what a static frame takes from it: whether the compiler alone
+ * could decide it (and why not), its stack temp bytes, its parameter
+ * bytes, the bytes of its static frame (`sf=`, 0 until S3 gives one), and
+ * every call of its IR (direct callee, or `*` for a call through a
+ * pointer) with the bytes of its arguments. `opensnes-rom place` builds
+ * the program's call graph from these lines; `opensnes-rom check` derives
+ * the same graph from the instruction lines and refuses the link when the
+ * two differ, so a call the table omits cannot hide a re-entry.
+ * Written for every function, frames on or off: the library's C ships its
+ * table with its objects (contest point 2).
+ * QBE_SFRAME_FAULT=noedge leaves out the first direct call of every
+ * function: the check must refuse the link (its provoked fault). */
 static void
 sframe_dump(Fn *fn, FILE *f)
 {
     Blk *b;
     Ins *i;
     const char *why = 0;
+    const char *fault = getenv("QBE_SFRAME_FAULT");
+    int noedge = fault && strcmp(fault, "noedge") == 0;
     int alloc_w = w65816_alloc_slots;
     int stack_b = framesize > 2 ? (fn->slot - alloc_w) * 2 : 0;
     int dpw = 0, t;
@@ -10951,7 +10960,7 @@ sframe_dump(Fn *fn, FILE *f)
     else if (large_frame_mode)
         why = "largeframe";
     fprintf(f, "; sframe fn %s export=%d addrtaken=%d leaf=%d alloc=%d dynalloc=%d"
-               " framesize=%d stack=%d params=%d lf=%d large=%d cand=%s\n",
+               " framesize=%d stack=%d params=%d lf=%d large=%d sf=0 cand=%s\n",
             fn->name, fn->lnk.export != 0, addrtaken(fn->name) != 0, fn->leaf != 0,
             alloc_w * 2, fn->dynalloc != 0, framesize, stack_b, caller_param_bytes,
             dpw * 2, large_frame_mode, why ? why : "yes");
@@ -10964,10 +10973,14 @@ sframe_dump(Fn *fn, FILE *f)
                 continue;
             for (a = i; a > b->ins && isarg((a - 1)->op); a--)
                 argb += (a - 1)->cls == Kl ? 4 : 2;
-            if (rtype(i->arg[0]) == RCon && fn->con[i->arg[0].val].type == CAddr)
+            if (rtype(i->arg[0]) == RCon && fn->con[i->arg[0].val].type == CAddr) {
+                if (noedge) {
+                    noedge = 0;
+                    continue;
+                }
                 fprintf(f, "; sframe call %s %s %d\n", fn->name,
                         str(fn->con[i->arg[0].val].sym.id), argb);
-            else
+            } else
                 fprintf(f, "; sframe call %s * %d\n", fn->name, argb);
         }
 }
@@ -11447,17 +11460,18 @@ w65816_emitfn(Fn *fn, FILE *f)
         fclose(staged);
         outf = real;
     }
-    if (getenv("QBE_SFRAME_DUMP"))
-        sframe_dump(fn, real);
+    sframe_dump(fn, real);
 }
 
 void
 w65816_emitfin(FILE *f)
 {
-    /* L4 S0: every name this unit takes the address of (data, or code
-     * other than a direct call's target): the count's indirect edges */
-    if (getenv("QBE_SFRAME_DUMP"))
-        for (int k = 0; k < addrtaken_count(); k++)
-            fprintf(f, "; sframe addr %s\n", addrtaken_name(k));
+    /* L4 side table: every name this unit takes the address of (data, or
+     * code other than a direct call's target): the indirect edges; then
+     * the line that says the unit carries a table (a text without it is
+     * read with the coarse edge by opensnes-rom place) */
+    for (int k = 0; k < addrtaken_count(); k++)
+        fprintf(f, "; sframe addr %s\n", addrtaken_name(k));
+    fprintf(f, "; sframe table 1\n");
     fprintf(f, "\n; End of generated code\n");
 }
