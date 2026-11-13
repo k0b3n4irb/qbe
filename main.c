@@ -145,6 +145,19 @@ addrtaken_note(const char *name)
 	strcpy(taken_name[taken_n++], name);
 }
 
+/* L4 S0 (QBE_SFRAME_DUMP): the set, read back by the count's comment lines */
+int
+addrtaken_count(void)
+{
+	return taken_n;
+}
+
+const char *
+addrtaken_name(int i)
+{
+	return taken_name[i];
+}
+
 int
 addrtaken(const char *name)
 {

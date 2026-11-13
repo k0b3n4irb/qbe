@@ -10917,6 +10917,61 @@ relax_branches(FILE *in, FILE *out)
     free(buf);
 }
 
+/* L4 S0 (2026-11-13): the count of static frames, comments only.
+ * With QBE_SFRAME_DUMP=1 each function is followed, after its `.ENDS`
+ * and after every text pass has run (nothing reads these lines but the
+ * count, devtools/sframe/sframe_count.py), by what a static frame would
+ * take from it: whether the compiler alone could decide it (and why not),
+ * its stack temp bytes, its parameter bytes, and every call of its IR
+ * (direct callee, or `*` for a call through a pointer) with the bytes of
+ * its arguments. Nothing here changes a byte of the object. */
+static void
+sframe_dump(Fn *fn, FILE *f)
+{
+    Blk *b;
+    Ins *i;
+    const char *why = 0;
+    int alloc_w = w65816_alloc_slots;
+    int stack_b = framesize > 2 ? (fn->slot - alloc_w) * 2 : 0;
+    int dpw = 0, t;
+
+    for (t = Tmp0; t < fn->ntmp; t++)
+        if (fn->tmp[t].slot >= DPSLOT && fn->tmp[t].slot - DPSLOT + 1 > dpw)
+            dpw = fn->tmp[t].slot - DPSLOT + 1;
+    if (fn->lnk.export)
+        why = "exported";
+    else if (addrtaken(fn->name))
+        why = "addrtaken";
+    else if (fn->leaf)
+        why = "leaf";
+    else if (fn->dynalloc)
+        why = "dynalloc";
+    else if (alloc_w > 0)
+        why = "alloc";
+    else if (large_frame_mode)
+        why = "largeframe";
+    fprintf(f, "; sframe fn %s export=%d addrtaken=%d leaf=%d alloc=%d dynalloc=%d"
+               " framesize=%d stack=%d params=%d lf=%d large=%d cand=%s\n",
+            fn->name, fn->lnk.export != 0, addrtaken(fn->name) != 0, fn->leaf != 0,
+            alloc_w * 2, fn->dynalloc != 0, framesize, stack_b, caller_param_bytes,
+            dpw * 2, large_frame_mode, why ? why : "yes");
+    for (b = fn->start; b; b = b->link)
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            Ins *a;
+            int argb = 0;
+
+            if (i->op != Ocall)
+                continue;
+            for (a = i; a > b->ins && isarg((a - 1)->op); a--)
+                argb += (a - 1)->cls == Kl ? 4 : 2;
+            if (rtype(i->arg[0]) == RCon && fn->con[i->arg[0].val].type == CAddr)
+                fprintf(f, "; sframe call %s %s %d\n", fn->name,
+                        str(fn->con[i->arg[0].val].sym.id), argb);
+            else
+                fprintf(f, "; sframe call %s * %d\n", fn->name, argb);
+        }
+}
+
 void
 w65816_emitfn(Fn *fn, FILE *f)
 {
@@ -11392,10 +11447,17 @@ w65816_emitfn(Fn *fn, FILE *f)
         fclose(staged);
         outf = real;
     }
+    if (getenv("QBE_SFRAME_DUMP"))
+        sframe_dump(fn, real);
 }
 
 void
 w65816_emitfin(FILE *f)
 {
+    /* L4 S0: every name this unit takes the address of (data, or code
+     * other than a direct call's target): the count's indirect edges */
+    if (getenv("QBE_SFRAME_DUMP"))
+        for (int k = 0; k < addrtaken_count(); k++)
+            fprintf(f, "; sframe addr %s\n", addrtaken_name(k));
     fprintf(f, "\n; End of generated code\n");
 }

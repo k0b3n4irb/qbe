@@ -591,6 +591,8 @@ void coalesce(Fn *);
 
 /* inline.c (OpenSNES function inlining chantier) */
 int addrtaken(const char *);
+int addrtaken_count(void);
+const char *addrtaken_name(int);
 void inline_record(Fn *);
 void inline_check(Fn *);
 void inline_record_dat_ref(const char *name);
