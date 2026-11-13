@@ -123,8 +123,173 @@ static int dp_frame;
  * below). Not for a leaf with an object on the stack or a dynamic alloc:
  * those keep the stack frame they had. QBE_NO_LEAF_SPLIT=1 turns it off. */
 static int leaf_split;
-#define SOFF(slot) (dp_frame ? DPF_BASE + (slot) * 2 \
-    : (slot) >= DPSLOT ? DPF_BASE + ((slot) - DPSLOT) * 2 : ((slot) + 1) * 2)
+
+/* G1 probe (2026-11-13, `.claude/notes/chantiers/gap_lots/G1_ir_probe.md`):
+ * a third colour, "lives in X / Y". A 16-bit temp, or a web of them joined
+ * by phis and one-word copies, never live across a call, gets register X or
+ * Y instead of its frame slot: its definition is `tax` / `tay`, a read
+ * `txa` / `tya`, an index `sym,x` for nothing or `sym,y`. While a function
+ * is emitted with the colour, each candidate's slot number is replaced by
+ * XYSLOT + k, so that any emit path that would still read or write the slot
+ * (an ALU operand, a high half, a phi cycle) reaches SOFF() with it and
+ * refuses the candidate. The emission is the proof: every IR instruction's
+ * text is read back, and a write of the register that is not the colour's
+ * own while a value of that colour is live after it, or read by it, refuses
+ * that value; so does a `tax` whose N / Z flags something reads. The
+ * function is emitted again without the refused values until nothing is
+ * refused. QBE_NO_XY_COLOUR=1 turns it off. */
+#define XYSLOT 30000
+#define XY_MAX 64
+static int xy_n;                    /* candidates of this function */
+static int xy_tmp[XY_MAX];          /* the temp of candidate k */
+static int xy_reg[XY_MAX];          /* 1 = X, 2 = Y, 0 = not coloured */
+static int xy_orig[XY_MAX];         /* its slot from color_slots */
+static int xy_web[XY_MAX];          /* candidates of one web share a register */
+static unsigned char xy_fail[XY_MAX]; /* 1 refused for any register, 2 for this one */
+/* why, for QBE_XY_TRACE: 1 a slot path (an ALU operand, a high half...), 2 a
+ * store with an 8-bit accumulator, 4 flags read after the `tax`, 8 two phi
+ * moves on one edge, 16 the colour's own write over a live value, 32 the
+ * emitter writes the register while the value lives, 64 an index read after
+ * the colour changed it, 128 `sym,y` on a form without abs,y */
+static unsigned char xy_why[XY_MAX];
+static int xy_tried[XY_MAX];        /* registers refused (bit 0 X, bit 1 Y) */
+static int xy_pref[XY_MAX];         /* the register to try first */
+static int xy_ban0[XY_MAX];         /* registers not tried at all */
+static int *xy_k_of;                /* temp -> candidate, -1 */
+static int xy_ntmp;
+static int xy_fn_regs;              /* registers the colour uses in this function */
+static long *xy_own;                /* file positions of the colour's own writes */
+static int xy_nown, xy_capown;
+static long *xy_defpos;             /* positions of the definitions (flags check) */
+static int *xy_defk;
+static int xy_ndef, xy_capdef;
+static int xy_trace;
+static unsigned char xy_adj[XY_MAX][XY_MAX];   /* candidates that interfere */
+static int xy_rec;                  /* chunks are recorded (an attempt) */
+static void xy_chunk_open(Blk *b, int idx);
+
+static int
+xy_find(int *web, int v)
+{
+    while (web[v] != v)
+        v = web[v];
+    return v;
+}
+
+static int
+soff(int slot)
+{
+    if (slot >= XYSLOT && slot < XYSLOT + XY_MAX) {
+        xy_fail[slot - XYSLOT] |= 1, xy_why[slot - XYSLOT] |= 1;
+        slot = xy_orig[slot - XYSLOT];
+    }
+    return dp_frame ? DPF_BASE + slot * 2
+        : slot >= DPSLOT ? DPF_BASE + (slot - DPSLOT) * 2 : (slot + 1) * 2;
+}
+#define SOFF(slot) soff(slot)
+
+/* The register of a coloured temp (1 X, 2 Y), 0 for anything else. */
+static int
+xy_of(Ref r)
+{
+    int k;
+
+    if (rtype(r) != RTmp || r.val < Tmp0 || (int)r.val >= xy_ntmp || !xy_k_of)
+        return 0;
+    k = xy_k_of[r.val];
+    return k >= 0 ? xy_reg[k] : 0;
+}
+
+static FILE *xy_att;                /* the attempt's text */
+
+/* The next line written is the colour's own. Not while a jump table's
+ * moves are captured apart (emit_jt): there the write counts as anyone's,
+ * which can only refuse more. Returns whether it was noted. */
+static int
+xy_note_own(void)
+{
+    if (outf != xy_att)
+        return 0;
+    if (xy_nown == xy_capown) {
+        xy_capown = xy_capown ? 2 * xy_capown : 64;
+        xy_own = realloc(xy_own, xy_capown * sizeof *xy_own);
+        if (!xy_own)
+            die("out of memory");
+    }
+    fflush(outf);
+    xy_own[xy_nown++] = ftell(outf);
+    return 1;
+}
+
+/* A write of the colour's register that defines temp r: noted as the
+ * colour's own, and as a definition whose flags are checked. */
+static void
+xy_note_def(Ref r)
+{
+    if (xy_ndef == xy_capdef) {
+        xy_capdef = xy_capdef ? 2 * xy_capdef : 64;
+        xy_defpos = realloc(xy_defpos, xy_capdef * sizeof *xy_defpos);
+        xy_defk = realloc(xy_defk, xy_capdef * sizeof *xy_defk);
+        if (!xy_defpos || !xy_defk)
+            die("out of memory");
+    }
+    if (!xy_note_own())
+        return;
+    xy_defpos[xy_ndef] = xy_own[xy_nown - 1];
+    xy_defk[xy_ndef++] = xy_k_of[r.val];
+}
+
+/* G1 probe: `%t = add %u, k` (k = +-1, +-2), %t and %u in one register:
+ * `inx` / `iny` / `dex` / `dey`, the N and Z of the result as `tax` would
+ * leave them. */
+static void x_invalidate(void);
+
+static int
+xy_step(Ins *i, Fn *fn)
+{
+    int rg = xy_of(i->to), v, n;
+    Ref u = i->arg[0], k = i->arg[1];
+
+    if (!rg || (i->op != Oadd && i->op != Osub))
+        return 0;
+    if (i->op == Oadd && xy_of(k) == rg && rtype(u) == RCon) {
+        u = i->arg[1];
+        k = i->arg[0];
+    }
+    if (xy_of(u) != rg || rtype(k) != RCon || fn->con[k.val].type != CBits)
+        return 0;
+    v = (int)(fn->con[k.val].bits.i & 0xFFFF);
+    if (i->op == Osub)
+        v = (-v) & 0xFFFF;
+    if (v == 1 || v == 2)
+        n = v;
+    else if (v == 0xFFFF || v == 0xFFFE)
+        n = v - 0x10000;
+    else
+        return 0;
+    for (; n; n += n > 0 ? -1 : 1) {
+        if (n == 1 || n == -1)
+            xy_note_def(i->to);
+        else
+            xy_note_own();
+        fprintf(outf, "	%s%c\n", n > 0 ? "in" : "de", rg == 1 ? 'x' : 'y');
+    }
+    if (rg == 1)
+        x_invalidate();
+    return 1;
+}
+
+/* G1 probe: a value X or Y holds against a constant, `cpx` / `cpy` (the
+ * same N, Z and C as `lda / cmp`). */
+static int
+xy_cmp_imm(Ref r, Ref k, Fn *fn)
+{
+    if (!xy_of(r) || rtype(k) != RCon || fn->con[k.val].type != CBits)
+        return 0;
+    fprintf(outf, "	cp%c.w #%d\n", xy_of(r) == 1 ? 'x' : 'y',
+            (int)(fn->con[k.val].bits.i & 0xFFFF));
+    return 1;
+}
 
 static void
 emit_stack_load(int frame_off, int sp_adjust)
@@ -769,6 +934,8 @@ r9_invalidate(void)
  * stands X is that temp's value: `p->a; p->b` loads X once. */
 static Ref x_ref;
 static int x_valid;
+/* G1 probe: the last far operand took a Y-held index (`sym,y`) */
+static int far_y_index;
 
 static void
 x_invalidate(void)
@@ -1761,6 +1928,23 @@ x_load(Ref r, Fn *fn)
     if (x_valid && req(x_ref, r) && !getenv("QBE_NO_X_CACHE"))
         return;
     emit_rep20();
+    if (xy_of(r)) {
+        /* G1 probe: X holds it, or Y does (`tyx` leaves A alone) */
+        if (xy_of(r) == 2)
+            fprintf(outf, "\ttyx\n");
+        else if (getenv("QBE_XY_FAULT")) {
+            /* negative control: a `tax` too many overwrites the value X
+             * holds. FAULT=1 declares it the colour's own (a proof that
+             * trusts it: the differential tests must fail); FAULT=2 does
+             * not (the emission's proof must refuse the value) */
+            if (atoi(getenv("QBE_XY_FAULT")) == 1)
+                xy_note_own();
+            fprintf(outf, "\ttax\n");
+        }
+        x_ref = r;
+        x_valid = 1;
+        return;
+    }
     emitload(r, fn);
     fprintf(outf, "\ttax\n");
     acache_invalidate();
@@ -1839,9 +2023,11 @@ emit_far_decomp_operand(Ref a, Fn *fn, char *buf, size_t n)
     case FAR_BASE_IDX:
         emit_cst_ptr_setup(far_decomp_base[idx], fn);
         emit_rep20();
-        emitload(far_decomp_idx[idx], fn);      /* low 16 bits of the index */
-        fprintf(outf, "\ttay\n");
-        acache_invalidate();
+        if (xy_of(far_decomp_idx[idx]) != 2) {  /* G1 probe: Y holds it */
+            emitload(far_decomp_idx[idx], fn);  /* low 16 bits of the index */
+            fprintf(outf, "\ttay\n");
+            acache_invalidate();
+        }
         snprintf(buf, n, "[tcc__r9],y");
         break;
     default:
@@ -1861,8 +2047,8 @@ emit_far_decomp_operand_hi(Ref a, Fn *fn, char *buf, size_t n)
     switch (far_decomp_kind[idx]) {
     case FAR_SYM_IDX:
         c = &fn->con[far_decomp_base[idx].val];
-        snprintf(buf, n, "%s+%d,x", stripsym(str(c->sym.id)),
-                 (int)c->bits.i + 2);
+        snprintf(buf, n, "%s+%d,%c", stripsym(str(c->sym.id)),
+                 (int)c->bits.i + 2, far_y_index ? 'y' : 'x');
         break;
     case FAR_BASE_CON:
         c = &fn->con[far_decomp_idx[idx].val];
@@ -1893,6 +2079,23 @@ static int
 emit_far_operand(Ins *ins, Ref a, Fn *fn, char *buf, size_t n, const char **sfx)
 {
     int k = far_decomp_of(a);
+
+    far_y_index = 0;
+    if (k == FAR_SYM_IDX && near_indexed[far_addr_idx(a)] == NEAR_SYM
+        && (ins->volat & 6) == 0 && !getenv("QBE_NO_NEAR_ABS")
+        && xy_of(far_decomp_idx[far_addr_idx(a)]) == 2) {
+        /* G1 probe: a plain object indexed by a value Y holds, `sym,y`
+         * (absolute: abs,y exists for the loads, stores and ALU forms;
+         * there is no long,y, so a FAR or const object takes `tyx`) */
+        Con *c = &fn->con[far_decomp_base[far_addr_idx(a)].val];
+        if ((int)c->bits.i)
+            snprintf(buf, n, "%s+%d,y", stripsym(str(c->sym.id)), (int)c->bits.i);
+        else
+            snprintf(buf, n, "%s,y", stripsym(str(c->sym.id)));
+        far_y_index = 1;
+        *sfx = ".w";
+        return k;
+    }
     if (k != FAR_NONE) {
         emit_far_decomp_operand(a, fn, buf, n);
     } else {
@@ -3470,6 +3673,150 @@ color_slots(Fn *fn, int base)
         if (s + w > maxslot)
             maxslot = s + w;
     }
+
+    /* G1 probe: the candidates of the X/Y colour, by web (a phi and its
+     * arguments, a one-word copy and its source), costliest first. A web
+     * whose members interfere with one another would need a move: not a
+     * candidate. emitfn gives the registers and proves them. */
+    xy_n = 0;
+    free(xy_k_of);
+    xy_k_of = 0;
+    xy_ntmp = 0;
+    if (!getenv("QBE_NO_XY_COLOUR")) {
+        int *web = calloc(nt, sizeof *web), *ok = calloc(nt, 1 + sizeof *ok);
+        unsigned *wcost = calloc(nt, sizeof *wcost);
+        int x, y, r;
+        unsigned char *useful;
+
+        xy_k_of = malloc(nt * sizeof *xy_k_of);
+        if (!web || !ok || !wcost || !xy_k_of)
+            die("out of memory");
+        xy_ntmp = nt;
+        for (t = 0; t < nt; t++) {
+            xy_k_of[t] = -1;
+            web[t] = t;
+            ok[t] = t >= Tmp0 && fn->tmp[t].slot >= 0 && !cross[t]
+                    && (fn->tmp[t].cls == Kw
+                        || (fn->tmp[t].cls == Kl && t - Tmp0 < MAX_ALLOC_TEMPS
+                            && temp_narrow[t - Tmp0]))
+                    && !(t - Tmp0 < MAX_ALLOC_TEMPS && temp_noslot[t - Tmp0]);
+        }
+#define XY_FIND(v) xy_find(web, (v))
+        for (a = 0; a < npa; a++) {
+            x = XY_FIND(pa[a].to); y = XY_FIND(pa[a].arg);
+            if (x != y)
+                web[y] = x;
+        }
+        for (t = Tmp0; t < nt; t++)
+            if (copyof[t]) {
+                x = XY_FIND(t); y = XY_FIND(copyof[t]);
+                if (x != y)
+                    web[y] = x;
+            }
+        /* a web is a candidate when every member is, no two interfere,
+         * and one of them is what a register is for: carried round a loop
+         * (a phi), or the index of an access (a value read once, right
+         * after it is made, gains nothing in X) */
+        useful = calloc(nt, 1);
+        if (!useful)
+            die("out of memory");
+        for (a = 0; a < npa; a++)
+            useful[pa[a].to] = useful[pa[a].arg] = 1;
+        for (x = 0; x < nt - Tmp0 && x < MAX_ALIAS_TEMPS; x++) {
+            Ref ri = far_decomp_idx[x];
+            if (far_decomp_kind[x] == FAR_NONE)
+                continue;
+            /* and which register it wants: Y for `[tcc__r9],y`, X for
+             * a long-indexed or near-pointer access (no long,y) */
+            if (far_decomp_kind[x] == FAR_NEAR_DEREF)
+                useful[x + Tmp0] |= 1 | 4;
+            if (rtype(ri) == RTmp && ri.val >= Tmp0 && (int)ri.val < nt)
+                useful[ri.val] |= 1 | (far_decomp_kind[x] == FAR_BASE_IDX ? 8
+                                       : far_decomp_kind[x] == FAR_SYM_IDX
+                                         && near_indexed[x] != NEAR_SYM ? 4 : 0);
+        }
+        /* an access to a FAR or const object through `sym + index` is long
+         * even when the address is a plain symbol's form (emit_far_operand) */
+        for (b = fn->start; b; b = b->link)
+            for (i = b->ins; i < &b->ins[b->nins]; i++) {
+                Ref ad = isload(i->op) ? i->arg[0] : isstore(i->op) ? i->arg[1] : R;
+                int ax = far_addr_idx(ad);
+                if (ax < 0 || ax >= nt - Tmp0 || far_decomp_kind[ax] != FAR_SYM_IDX
+                    || (near_indexed[ax] == NEAR_SYM && (i->volat & 6) == 0))
+                    continue;
+                if (rtype(far_decomp_idx[ax]) == RTmp && far_decomp_idx[ax].val >= Tmp0
+                    && (int)far_decomp_idx[ax].val < nt)
+                    useful[far_decomp_idx[ax].val] |= 4;
+            }
+        for (x = 0; x < nt - Tmp0 && x < MAX_ALIAS_TEMPS; x++) {
+            Ref rb = far_decomp_base[x];
+            if (far_decomp_kind[x] == FAR_NONE)
+                continue;
+            if (far_decomp_kind[x] == FAR_BASE_CON && near_indexed[x] == NEAR_PTR
+                && rtype(rb) == RTmp && rb.val >= Tmp0 && (int)rb.val < nt)
+                useful[rb.val] |= 1 | 4;
+        }
+        for (t = Tmp0; t < nt; t++) {
+            r = XY_FIND(t);
+            if (!ok[t])
+                ok[r] = 0;
+            if (useful[t])
+                useful[r] |= 2 | (useful[t] & 12);
+            wcost[r] += fn->tmp[t].cost;
+        }
+        for (t = Tmp0; t < nt; t++)
+            if (XY_FIND(t) == t && !(useful[t] & 2))
+                ok[t] = 0;
+        for (t = Tmp0; t < nt; t++) {
+            r = XY_FIND(t);
+            if (!ok[r])
+                continue;
+            for (u = Tmp0; u < t; u++)
+                if (XY_FIND(u) == r && (adj[(size_t)t * words + u / 64] >> (u % 64) & 1))
+                    ok[r] = 0;
+        }
+        /* costliest webs first, while XY_MAX members fit */
+        for (;;) {
+            int best = -1, cnt = 0;
+            for (t = Tmp0; t < nt; t++)
+                if (XY_FIND(t) == t && ok[t] && wcost[t] > 0
+                    && (best < 0 || wcost[t] > wcost[best]))
+                    best = t;
+            if (best < 0)
+                break;
+            ok[best] = 0;
+            for (t = Tmp0; t < nt; t++)
+                cnt += XY_FIND(t) == best;
+            if (xy_n + cnt > XY_MAX)
+                continue;
+            for (t = Tmp0; t < nt; t++)
+                if (XY_FIND(t) == best) {
+                    xy_tmp[xy_n] = t;
+                    xy_web[xy_n] = best;
+                    xy_orig[xy_n] = fn->tmp[t].slot;
+                    xy_reg[xy_n] = 0;
+                    xy_tried[xy_n] = 0;
+                    xy_pref[xy_n] = (useful[best] & 12) == 8 ? 2 : 1;
+                    /* a register that would only be copied into the other
+                     * one at each access (`tyx` for a long index, `txy`
+                     * for `[tcc__r9],y`) gains nothing over the slot the
+                     * text rules already keep in X or Y: not tried */
+                    xy_ban0[xy_n] = (useful[best] & 4 ? 2 : 0)
+                                    | ((useful[best] & 12) == 8 ? 1 : 0);
+                    xy_k_of[t] = xy_n++;
+                }
+        }
+#undef XY_FIND
+        /* the interference the registers need: between candidates */
+        for (x = 0; x < xy_n; x++)
+            for (y = 0; y < xy_n; y++)
+                xy_adj[x][y] = x != y && (adj[(size_t)xy_tmp[x] * words + xy_tmp[y] / 64]
+                                          >> (xy_tmp[y] % 64) & 1);
+        free(web);
+        free(ok);
+        free(wcost);
+        free(useful);
+    }
     free(occ);
     free(pref);
     free(pa);
@@ -3547,6 +3894,14 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
 
     if (acache_has(r)) {
         last_load_emitted = 0;
+        return;
+    }
+    if (xy_of(r)) {
+        /* G1 probe: N and Z of the value, as the load gave them; with an
+         * 8-bit accumulator the low byte, as `lda` would */
+        fprintf(outf, xy_of(r) == 1 ? "\ttxa\n" : "\ttya\n");
+        last_load_emitted = 1;
+        acache_invalidate();
         return;
     }
 
@@ -3642,6 +3997,20 @@ emitstore(Ref r, Fn *fn)
 
     if (req(r, R))
         return;
+
+    if (xy_of(r)) {
+        /* G1 probe. With an 8-bit accumulator `tax` copies the hidden
+         * byte too: refused. */
+        int k = xy_k_of[r.val];
+        if (amode_8bit)
+            xy_fail[k] |= 1, xy_why[k] |= 2;
+        xy_note_def(r);
+        fprintf(outf, xy_of(r) == 1 ? "\ttax\n" : "\ttay\n");
+        if (xy_of(r) == 1)
+            x_invalidate();
+        acache_set(r);
+        return;
+    }
 
     /* Leaf opt: skip store to aliased temp (A already has the value).
      * Disabled for Kl — the alias mechanism tracks a single 16-bit slot
@@ -6550,6 +6919,52 @@ static void
 emit_one_phimove(Phi *p, Ref arg, int parked, Fn *fn)
 {
     int dstslot = fn->tmp[p->to.val].slot;
+    int rd = xy_of(p->to), ra = parked ? 0 : xy_of(arg);
+
+    /* G1 probe: a phi coloured X or Y, or an argument that is */
+    if (rd) {
+        if (ra == rd)
+            return;                     /* the register holds it already */
+        if (ra) {
+            xy_note_def(p->to);
+            fprintf(outf, rd == 1 ? "\ttyx\n" : "\ttxy\n");
+        } else if (rtype(arg) == RCon && fn->con[arg.val].type == CBits) {
+            xy_note_def(p->to);
+            fprintf(outf, "\tld%c.w #%d\n", rd == 1 ? 'x' : 'y',
+                    (int)(fn->con[arg.val].bits.i & 0xFFFF));
+        } else {
+            if (parked)
+                fprintf(outf, "\tlda.b tcc__r10\n");
+            else
+                emitload(arg, fn);
+            xy_note_def(p->to);
+            fprintf(outf, rd == 1 ? "\ttax\n" : "\ttay\n");
+            acache_invalidate();
+        }
+        if (rd == 1)
+            x_invalidate();
+        return;
+    }
+    if (ra) {
+        /* into a slot: the register's value, a Kl phi's high word 0 (a Kw
+         * argument; a 32-bit one has a high half the colour does not
+         * hold, and SOFF refuses it below) */
+        if (p->cls == Kl && fn->tmp[arg.val].cls == Kl) {
+            xy_fail[xy_k_of[arg.val]] |= 1, xy_why[xy_k_of[arg.val]] |= 1;
+            return;
+        }
+        fprintf(outf, ra == 1 ? "\ttxa\n" : "\ttya\n");
+        emit_stack_store(SOFF(dstslot), 0);
+        slot_wrote(p->to, 0);
+        if (p->cls == Kl) {
+            fprintf(outf, "\tlda.w #0\n");
+            emit_stack_store(SOFF(dstslot) + 2, 0);
+            slot_wrote(p->to, 1);
+            note_high_written(p->to);
+        }
+        acache_invalidate();
+        return;
+    }
 
     /* Kl (4-byte far pointer / 32-bit) phi args must move BOTH halves: the
      * low/offset word at (slot+1)*2 and the high/bank word at
@@ -6678,6 +7093,19 @@ emitphimoves(Blk *from, Blk *to, Fn *fn)
         arg[nmv] = p->arg[n];
         done[nmv] = parked[nmv] = 0;
         nmv++;
+    }
+
+    /* G1 probe: a move that writes X or Y and another that reads the same
+     * register on this edge would depend on their order: refused */
+    for (k = 0; k < nmv; k++) {
+        int rd = xy_of(mv[k]->to);
+        if (!rd || xy_of(arg[k]) == rd)
+            continue;
+        for (j = 0; j < nmv; j++)
+            if (j != k && xy_of(arg[j]) == rd) {
+                xy_fail[xy_k_of[mv[k]->to.val]] |= 1, xy_why[xy_k_of[mv[k]->to.val]] |= 8;
+                xy_fail[xy_k_of[arg[j].val]] |= 1, xy_why[xy_k_of[arg[j].val]] |= 8;
+            }
     }
 
     if (nmv && getenv("QBE_DBG_PHI"))
@@ -7575,11 +8003,15 @@ emitjmp(Blk *b, Fn *fn)
                 else
                     emit_scmp_w(fused_cmp_r0, fused_cmp_r1, fn);
             } else if (swap) {
-                emitload(fused_cmp_r1, fn);
-                emitop2("cmp", fused_cmp_r0, fn);
+                if (!xy_cmp_imm(fused_cmp_r1, fused_cmp_r0, fn)) {
+                    emitload(fused_cmp_r1, fn);
+                    emitop2("cmp", fused_cmp_r0, fn);
+                }
             } else {
-                emitload(fused_cmp_r0, fn);
-                emitop2("cmp", fused_cmp_r1, fn);
+                if (!xy_cmp_imm(fused_cmp_r0, fused_cmp_r1, fn)) {
+                    emitload(fused_cmp_r0, fn);
+                    emitop2("cmp", fused_cmp_r1, fn);
+                }
             }
             acache_invalidate();
             if (b->s1 == next) {
@@ -9160,6 +9592,10 @@ peephole_loop_x(char **ln, int nl)
             int yreg = pass == 1;
             if (yreg && getenv("QBE_NO_PEEP_LOOPY"))
                 break;
+            /* G1 probe: a register the X/Y colour holds values in is not
+             * free at the loop's edges */
+            if (xy_fn_regs & (yreg ? 2 : 1))
+                continue;
             for (t = 0; t < nconv; t++)
                 if (conv_r[t] == yreg && !(e < conv_b[t] || conv_e[t] < b))
                     bad = 1;
@@ -10153,7 +10589,7 @@ static int
 peephole_fuse_indexed(char **ln, int nl)
 {
     static const char *ops[] = { "cmp", "adc", "sbc", "and", "ora", "eor", 0 };
-    int i, j, k, m, n, o, xs, plain, nosrc, removed = 0;
+    int i, j, k, m, n, o, xs, plain, yidx, nosrc, removed = 0;
     const char *op1, *t, *y;
     char t1[64], *nl2;
 
@@ -10168,7 +10604,12 @@ peephole_fuse_indexed(char **ln, int nl)
             continue;
         k = (int)strlen(op1);
         plain = !nosrc && fuse_plain_src(op1);
-        if (!plain && (ln[i][4] != '.' || k < 3 || strcmp(op1 + k - 2, ",x") != 0
+        /* G1 probe: `lda.w sym,y` (a value the X/Y colour keeps in Y) is
+         * a source too, abs,y being an operand of every operation here */
+        yidx = !plain && ln[i][4] == '.' && ln[i][5] == 'w' && k >= 3
+               && strcmp(op1 + k - 2, ",y") == 0 && !strchr(op1, '[')
+               && !strchr(op1, '(') && op1[0] != '$';
+        if (!plain && !yidx && (ln[i][4] != '.' || k < 3 || strcmp(op1 + k - 2, ",x") != 0
                        || strchr(op1, '[') || strchr(op1, '(')
                        || op1[0] == '$' || (ln[i][5] != 'w' && ln[i][5] != 'l')))
             continue;                   /* a named symbol, indexed by X */
@@ -10190,6 +10631,8 @@ peephole_fuse_indexed(char **ln, int nl)
                 break;
             if (pp_is(ln[m], "ldx"))
                 xs = 1;
+            if (pp_is(ln[m], "ldy") && yidx)
+                break;                  /* Y moved: no source any more */
         }
         if (m >= nl || !pp_is(ln[m], "lda"))
             continue;
@@ -10227,7 +10670,7 @@ peephole_fuse_indexed(char **ln, int nl)
         }
         nl2 = emalloc(strlen(op1) + 8);
         sprintf(nl2, "\t%s.%c %s", ops[k], ln[i][5], op1);
-        if (xs) {
+        if (xs && !yidx) {
             /* X held S at the load; it must again at the operation, and
              * what the moved ldx left in X must be dead after it */
             int x = fuse_x_source(ln, i), w;
@@ -10985,228 +11428,11 @@ sframe_dump(Fn *fn, FILE *f)
         }
 }
 
-void
-w65816_emitfn(Fn *fn, FILE *f)
+static void
+emitfn_body(Fn *fn, FILE *staged)
 {
     Blk *b;
     Ins *i;
-    int slot;
-
-    FILE *real = f, *staged = getenv("QBE_NO_SHORT_BRANCH") ? 0 : tmpfile();
-
-    outf = staged ? staged : f;
-
-    /* 2-pass parse mode: every fn's abi0 has already run during pass 1,
-     * so the w65816_alloc_size[] / w65816_alloc_slots globals hold the
-     * LAST function's data. Restore this fn's snapshot before we read. */
-    w65816_restore_alloc_state(fn);
-    w65816_check_temps(fn);   /* later passes add temps */
-
-    /* S5 (2026-10-08): abi0 photographed the size of every alloc before
-     * the optimizer ran. A local or a parameter that `promote` then turned
-     * into temps has no alloc instruction left, and still got its words
-     * of frame: 2 to 4 bytes per promoted variable in every call. Keep
-     * only the allocs that are still defined. */
-    if (!getenv("QBE_KEEP_DEAD_ALLOCS")) {
-        static unsigned char live_alloc[MAX_ALLOC_TEMPS];
-        Blk *ab;
-        Ins *ai;
-        memset(live_alloc, 0, sizeof(live_alloc));
-        for (ab = fn->start; ab; ab = ab->link)
-            for (ai = ab->ins; ai < &ab->ins[ab->nins]; ai++)
-                if ((ai->op == Oalloc4 || ai->op == Oalloc8
-                     || ai->op == Oalloc16)
-                    && rtype(ai->to) == RTmp && ai->to.val >= Tmp0
-                    && ai->to.val - Tmp0 < MAX_ALLOC_TEMPS)
-                    live_alloc[ai->to.val - Tmp0] = 1;
-        for (int j = 0; j < MAX_ALLOC_TEMPS; j++)
-            if (w65816_alloc_size[j] > 0 && !live_alloc[j]) {
-                w65816_alloc_slots -= w65816_alloc_size[j];
-                w65816_alloc_size[j] = 0;
-            }
-    }
-
-    /* No FPU and no soft-float library. Only conversions and compares
-     * stopped the build until 2026-10-08: `a * 2.5f` was emitted as a
-     * 16-bit integer multiply of the low word, `a + b` as an integer add.
-     * Whatever floating-point value is still here after constant folding
-     * is refused; `(int)(1.5 * 256)` was folded and is not. */
-    {
-        Blk *fb;
-        Ins *fi;
-        Phi *fp;
-        int isflt = 0;
-        for (fb = fn->start; fb && !isflt; fb = fb->link) {
-            for (fp = fb->phi; fp; fp = fp->link)
-                isflt |= KBASE(fp->cls) == 1;
-            for (fi = fb->ins; fi < &fb->ins[fb->nins]; fi++)
-                isflt |= KBASE(fi->cls) == 1
-                      || fi->op == Ostores || fi->op == Ostored;
-        }
-        if (isflt)
-            err("function %s uses floating-point arithmetic, which this target "
-                "does not have (no FPU, no soft-float library): use the "
-                "fixed-point types, fixed in <snes/math.h> or fixed32 in "
-                "<snes/fixed32.h>. A floating constant is "
-                "fine where the compiler can fold it, e.g. (int)(1.5 * 256)",
-                fn->name);
-    }
-
-    /*
-     * Compute allocslot[] offsets from w65816_alloc_size[] (set by abi0)
-     * Alloc temps get stack slots first (lowest offsets from SP)
-     */
-    slot = 0;
-    for (int j = 0; j < MAX_ALLOC_TEMPS; j++) {
-        if (w65816_alloc_size[j] > 0) {
-            allocslot[j] = slot;
-            slot += w65816_alloc_size[j];
-        } else {
-            allocslot[j] = -1;
-        }
-    }
-
-    /* Reserve slots for allocs in fn->slot so assignslots starts after them */
-    fn->slot = slot;
-
-    /* S5 (2026-10-08): which temps never touch their slot is decided
-     * BEFORE the slots are assigned, so that they get none: a temp that is
-     * a parameter read in place, or one whose store is skipped because
-     * its only use takes it from A. They used to be coloured like the
-     * others and the frame carried their words. None of these analyses
-     * reads a slot number or the frame size. */
-    leaf_opt = (fn->leaf || all_calls_are_tail(fn)) && !fn->dynalloc;
-    alias_opt = leaf_opt || (!fn->dynalloc && !getenv("QBE_NO_NONLEAF_ALIAS"));
-    count_temp_uses(fn);
-    mark_near_indexed(fn);      /* S4: is_far() reads it, so first */
-    build_alias_table(fn);
-    mark_dead_stores(fn);
-    mark_high_zero(fn);
-    mark_far_decomp(fn);        /* B2: before addr_only (feeds it) */
-    mark_addr_only_kl(fn);
-    /* S5 (2026-10-09): a 32-bit temp of which only the low half is ever
-     * read — an address, an index — is one word wide on the stack. Its
-     * high half is neither computed (the skip_high paths) nor stored
-     * (emit_store_high returns at once), and a read of it is the
-     * high-half invariant's internal error. Not for a phi result: the
-     * edge moves write both halves of their destination directly. */
-    memset(temp_narrow, 0, sizeof(temp_narrow));
-    if (!getenv("QBE_NO_NARROW_KL")) {
-        Blk *nb; Ins *ni;
-        for (nb = fn->start; nb; nb = nb->link)
-            for (ni = nb->ins; ni < &nb->ins[nb->nins]; ni++)
-                if (rtype(ni->to) == RTmp && ni->to.val >= Tmp0
-                    && ni->to.val - Tmp0 < MAX_ALLOC_TEMPS
-                    && fn->tmp[ni->to.val].cls == Kl
-                    && ref_to_is_addr_only(ni->to)
-                    && narrow_ok(ni->op))
-                    temp_narrow[ni->to.val - Tmp0] = 1;
-    }
-    memset(temp_noslot, 0, sizeof(temp_noslot));
-    if (!getenv("QBE_SLOT_FOR_ALL"))
-        for (int t = Tmp0; t < fn->ntmp && t - Tmp0 < MAX_ALIAS_TEMPS; t++)
-            if (fn->tmp[t].cls != Kl
-                && ((alias_opt && temp_alias[t - Tmp0] != 0)
-                    || temp_is_dead_store[t - Tmp0]))
-                temp_noslot[t - Tmp0] = 1;
-
-    /* Assign slots to any unassigned temps (when skiprega is set) */
-    leaf_split = 0;
-    {
-        int base0 = fn->slot, t;
-        int *slot0 = malloc((size_t)fn->ntmp * sizeof *slot0);
-
-        if (!slot0)
-            die("out of memory");
-        for (t = 0; t < fn->ntmp; t++)
-            slot0[t] = fn->tmp[t].slot;
-        fn->slot = assignslots(fn);
-        /* A leaf one word too big for the direct page: colour it again,
-         * the costliest temps in tcc__lf and the rest on the stack (see
-         * leaf_split), from the state the first colouring started from. */
-        if (fn->leaf && !fn->dynalloc && w65816_alloc_slots == 0
-            && fn->slot > dpf_words()
-            && !getenv("QBE_NO_DP_FRAME") && !getenv("QBE_NO_LEAF_SPLIT")
-            && !getenv("QBE_NO_SLOT_COLOR")) {
-            for (t = 0; t < fn->ntmp; t++)
-                fn->tmp[t].slot = slot0[t];
-            fn->slot = base0;
-            leaf_split = 1;
-            fn->slot = assignslots(fn);
-        }
-        free(slot0);
-    }
-
-    /* Total frame size: alloc slots + temp slots + 1 for alignment */
-    framesize = (fn->slot + 1) * 2;
-    dp_frame = 0;
-    if (fn->leaf && !leaf_split && !fn->dynalloc && w65816_alloc_slots == 0
-        && fn->slot >= 1 && fn->slot <= dpf_words()
-        && !getenv("QBE_NO_DP_FRAME")) {
-        dp_frame = 1;       /* SOFF() now names tcc__lf */
-        framesize = 0;      /* nothing on the stack: parameters at 4,s */
-    }
-    /* No slot at all: no frame, and the frame size is 0, not the 2 bytes
-     * of alignment. The prologue already allocates nothing below 4 bytes
-     * (`framesize > 2`), but a parameter is read at framesize +
-     * PARAM_OFFSET + n: with 2 left here, a function that has parameters,
-     * makes calls and keeps nothing on the stack read every parameter 2
-     * bytes too high. It could not exist while each parameter was copied
-     * into a slot; textInit() became one the day they stopped being
-     * (S5, 2026-10-08: 25 examples lost their text). */
-    if (fn->slot == 0)
-        framesize = 0;
-    argbytes = 0;  /* Reset argument tracking for this function */
-
-    /* Leaf function optimization: enabled for true leaf functions (no calls)
-     * AND for "tail-only" non-leaf functions where every Ocall is in tail
-     * position (last insn of a return block, returning the call's result).
-     *
-     * Why this is safe for tail-only non-leaf:
-     *   - Before reaching any Ocall in this function, no JSL has fired
-     *     yet, so caller's parameter area is still intact and any temp
-     *     aliased to a negative caller slot reads valid data.
-     *   - Each Ocall in tail position will be emitted as `jml` (no return
-     *     PC pushed, no own frame teardown needed) per the existing TCO
-     *     path in detect_block_tail_call + the Ocall handler. Because
-     *     no return ever lands here, post-call temp state is irrelevant.
-     *
-     * Why it would NOT be safe for a non-tail call: a JSL pushes a 3-byte
-     * return address onto the stack mid-function, and any SSA temp that
-     * needs to live across that point would be clobbered if it had no
-     * frame slot. The original "Non-leaf functions MUST have a frame"
-     * comment is correct for that case — we're only relaxing it for the
-     * sub-case where there IS no across-call live range because the
-     * function never executes past the call. */
-    /* leaf_opt, alias_opt and the analyses that say which temps never
-     * touch their slot are computed above, before the slots are assigned
-     * (S5, 2026-10-08). */
-    skip_dead_retstore_temp = -1;
-    memset(temp_high_written, 0, sizeof(temp_high_written));
-    slot_fn = fn;
-    slot_owner_reset();
-    r9_invalidate();
-    caller_param_bytes = count_fn_param_bytes(fn);
-
-    /* Frame elimination: if all temps are aliased or dead-retval, go frameless */
-    if (leaf_opt && can_be_frameless(fn))
-        framesize = 0;
-
-    /* Large-frame mode (chantier A6.8): if the function's frame plus
-     * worst-case param-access offset can exceed 255 bytes, switch to
-     * indirect addressing via tcc__fp. Threshold leaves headroom for
-     * argbytes growth during call setup. The threshold sits below 256
-     * so even with a few PHA pushes during arg setup the direct mode
-     * stays valid, and we only flip to indirect for genuinely large
-     * frames where the assembler would otherwise reject the emission. */
-    large_frame_mode = (framesize >= LARGE_FRAME_THRESHOLD);
-
-    /* NOTE: temp_alias is NOT reset here. build_alias_table() already computed
-     * correct aliases. The emission pass uses these aliases via emitload_adj()
-     * and emitstore() to redirect param accesses to the caller's frame.
-     * Resetting here caused a mismatch: can_be_frameless() saw aliases,
-     * set framesize=0, but the emission lost the aliases and wrote to
-     * non-existent local slots, corrupting the caller's stack. */
 
     /* Debug: show slot assignments */
     fprintf(outf, "\n; Function: %s (framesize=%d, slots=%d, alloc_slots=%d, fn_leaf=%d, leaf_opt=%d)\n",
@@ -11330,8 +11556,17 @@ w65816_emitfn(Fn *fn, FILE *f)
         fused_nz32 = 0;
         detect_block_tail_call(b, fn);
         for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            xy_chunk_open(b, (int)(i - b->ins));
             if (!x_keeps(i))
                 x_invalidate();     /* S4: anything else may write X */
+            /* G1 probe: a one-word copy whose source and result share a
+             * register is nothing */
+            if (xy_of(i->to) && xy_of(i->to) == xy_of(i->arg[0])
+                && (i->op == Ocopy || word_copy(i, fn)))
+                continue;
+            /* ...and a step of 1 or 2 in place is `inx` / `dex` */
+            if (xy_step(i, fn))
+                continue;
             /* `cnel x, 0` used only by this block's jnz, x a Kl temp:
              * the branch tests both halves of x itself (emitjmp). */
             if (i == &b->ins[b->nins] - 1
@@ -11409,6 +11644,7 @@ w65816_emitfn(Fn *fn, FILE *f)
             emitins(i, fn);
             skip_dead_retstore_temp = -1;
         }
+        xy_chunk_open(b, -1);           /* the block's way out */
 
         if (isret(b->jmp.type)) {
             if (tail_call_ins) {
@@ -11455,12 +11691,719 @@ w65816_emitfn(Fn *fn, FILE *f)
     if (!staged && jt_tail_len)
         fputs(jt_tail, outf);
     fprintf(outf, ".ENDS\n");
+}
+
+/* === G1 probe: the X/Y colour proved by its own emission === */
+
+typedef struct { Blk *b; int idx; long pos; } XyChunk;
+static XyChunk *xy_ch;
+static int xy_nch, xy_capch;
+
+/* A new piece of text starts: instruction idx of block b, or (-1) the
+ * block's way out (branches, phi moves, epilogue). */
+static void
+xy_chunk_open(Blk *b, int idx)
+{
+    if (!xy_rec)
+        return;
+    if (xy_nch == xy_capch) {
+        xy_capch = xy_capch ? 2 * xy_capch : 256;
+        xy_ch = realloc(xy_ch, xy_capch * sizeof *xy_ch);
+        if (!xy_ch)
+            die("out of memory");
+    }
+    fflush(outf);
+    xy_ch[xy_nch].b = b;
+    xy_ch[xy_nch].idx = idx;
+    xy_ch[xy_nch].pos = ftell(outf);
+    xy_nch++;
+}
+
+/* Does this line write X (reg 1) or Y (reg 2)? */
+static int
+xy_writes(const char *l, int reg)
+{
+    static const char *both[] = { "mvn", "mvp", "jsl", "jsr", "jml", "plp", "rti", 0 };
+    static const char *wx[] = { "ldx", "tax", "tsx", "tyx", "plx", "inx", "dex", 0 };
+    static const char *wy[] = { "ldy", "tay", "txy", "ply", "iny", "dey", 0 };
+    const char **w = reg == 1 ? wx : wy;
+    int q;
+
+    if (!l || l[0] != '\t')
+        return 0;
+    for (q = 0; both[q]; q++)
+        if (pp_is(l, both[q]))
+            return 1;
+    for (q = 0; w[q]; q++)
+        if (pp_is(l, w[q]))
+            return 1;
+    if ((strncmp(l, "\trep #$", 7) == 0 || strncmp(l, "\tsep #$", 7) == 0)
+        && (strtol(l + 7, 0, 16) & 0x10))
+        return 1;
+    return 0;
+}
+
+/* Does this line read an index register as `,x` / `,y` (for Y, not
+ * through a direct-page pointer: `[tcc__r9],y` is the emitter's own)? */
+static int
+xy_indexes(const char *l, int reg)
+{
+    const char *op = pp_operand(l);
+    size_t n;
+
+    if (!op || !*op)
+        return 0;
+    n = strlen(op);
+    if (n < 2 || op[n - 2] != ',' || op[n - 1] != (reg == 1 ? 'x' : 'y'))
+        return 0;
+    return reg == 1 || (!strchr(op, '[') && !strchr(op, '('));
+}
+
+/* `sym,y` on a form the 65816 does not have: long,y, stz, inc... */
+static int
+xy_bad_y(const char *l)
+{
+    static const char *ok[] = { "lda", "sta", "adc", "sbc", "and", "ora", "eor",
+        "cmp", "ldx", 0 };
+    int q;
+
+    if (!xy_indexes(l, 2))
+        return 0;
+    if (l[4] == '.' && l[5] == 'l')
+        return 1;
+    for (q = 0; ok[q]; q++)
+        if (pp_is(l, ok[q]))
+            return 0;
+    return 1;
+}
+
+/* After line i (a `tax` / `tay`... the colour wrote where a store set no
+ * flag), does anything read N or Z before they are set again? A jump ends
+ * the walk: the emitter enters every block without a flag in hand. */
+static int
+xy_nz_dead(char **ln, int nl, int i)
+{
+    static const char *pass[] = { "sta", "stz", "stx", "sty", "clc", "sec",
+        "pha", "phx", "phy", "nop", 0 };
+    static const char *setnz[] = { "lda", "ldx", "ldy", "and", "ora", "eor",
+        "adc", "sbc", "cmp", "cpx", "cpy", "inx", "iny", "dex", "dey",
+        "tax", "tay", "txa", "tya", "tyx", "txy", "pla", "plx", "ply", 0 };
+    int j, n, q;
+
+    for (j = i + 1, n = 0; j < nl && n < 16; j++, n++) {
+        const char *lj = ln[j];
+        if (!*lj || lj[0] == ';')
+            continue;
+        if (lj[0] == '@' && lj[strlen(lj) - 1] == ':')
+            continue;
+        if (lj[0] != '\t')
+            return 0;
+        for (q = 0; setnz[q]; q++)
+            if (pp_is(lj, setnz[q]))
+                return 1;
+        if (strcmp(lj, "\tinc a") == 0 || strcmp(lj, "\tdec a") == 0
+            || strcmp(lj, "\tasl a") == 0 || strcmp(lj, "\tlsr a") == 0
+            || strcmp(lj, "\trol a") == 0 || strcmp(lj, "\tror a") == 0)
+            return 1;
+        if (pp_is(lj, "jmp") || pp_is(lj, "jml"))
+            return 1;
+        if ((pp_is(lj, "rep") || pp_is(lj, "sep")) && strncmp(lj + 4, " #$", 3) == 0) {
+            if (strtol(lj + 7, 0, 16) & 0x82)
+                return 0;
+            continue;
+        }
+        for (q = 0; pass[q]; q++)
+            if (pp_is(lj, pass[q]))
+                break;
+        if (!pass[q])
+            return 0;
+    }
+    return 0;
+}
+
+static int
+xy_is_own(long pos)
+{
+    int lo = 0, hi = xy_nown - 1;
+
+    while (lo <= hi) {
+        int m = (lo + hi) / 2;
+        if (xy_own[m] == pos)
+            return 1;
+        if (xy_own[m] < pos)
+            lo = m + 1;
+        else
+            hi = m - 1;
+    }
+    return 0;
+}
+
+/* A use of r, and of what a folded address reads at the access (the
+ * index and base of `%a =l add $sym, %idx`: the IR sees them die at the
+ * add, the emitter reads them where %a is used). */
+static void
+xy_use(BSet *s, Ref r)
+{
+    int idx;
+
+    if (rtype(r) != RTmp || r.val < Tmp0)
+        return;
+    bsset(s, r.val);
+    idx = far_addr_idx(r);
+    if (idx >= 0 && far_decomp_kind[idx] != FAR_NONE) {
+        if (rtype(far_decomp_base[idx]) == RTmp && far_decomp_base[idx].val >= Tmp0)
+            bsset(s, far_decomp_base[idx].val);
+        if (rtype(far_decomp_idx[idx]) == RTmp && far_decomp_idx[idx].val >= Tmp0)
+            bsset(s, far_decomp_idx[idx].val);
+    }
+}
+
+/* Check one piece of text: lines [l0, l1) of the attempt, `live` what is
+ * live after it, `use` / `def` the temps its instructions read and write. */
+static void
+xy_check_chunk(char **ln, long *lpos, int l0, int l1, BSet *live, BSet *use, BSet *def)
+{
+    int w[3] = { 0, 0, 0 }, own[3] = { 0, 0, 0 }, order[3] = { 0, 0, 0 }, bady = 0;
+    int j, r, k;
+
+    for (j = l0; j < l1; j++) {
+        const char *l = ln[j];
+        if (l[0] != '\t')
+            continue;
+        if (xy_is_own(lpos[j])) {
+            own[xy_writes(l, 1) ? 1 : 2] = 1;
+            continue;
+        }
+        for (r = 1; r <= 2; r++) {
+            if (xy_writes(l, r)) {
+                w[r] = 1;
+                if (own[r])
+                    order[r] = 1;
+            } else if (own[r] && xy_indexes(l, r))
+                order[r] = 1;   /* an index read after the colour changed it */
+        }
+        if (xy_bad_y(l))
+            bady = 1;
+    }
+    for (k = 0; k < xy_n; k++) {
+        int t = xy_tmp[k], rg = xy_reg[k];
+        int inl, inu, ind;
+        if (!rg)
+            continue;
+        inl = bshas(live, t);
+        inu = bshas(use, t);
+        ind = bshas(def, t);
+        if (w[rg] && ((inl && !ind) || inu))
+            xy_fail[k] |= 2, xy_why[k] |= 32;
+        /* the colour's own write of this register while another value of
+         * it lives on: the interference the colouring trusted is wrong */
+        if (own[rg] && inl && !ind)
+            xy_fail[k] |= 1, xy_why[k] |= 16;
+        if (order[rg] && ind)
+            xy_fail[k] |= 2, xy_why[k] |= 64;
+        if (bady && rg == 2 && inu)
+            xy_fail[k] |= 2, xy_why[k] |= 128;
+    }
+}
+
+/* Read the attempt back and refuse what its text does not prove. */
+static void
+xy_check(Fn *fn, FILE *att)
+{
+    long size, *lpos;
+    char *buf, *p, **ln;
+    int nl = 0, cap = 1024, c, l0, l1, k, d;
+    BSet live[1], use[1], def[1];
+
+    fflush(att);
+    size = ftell(att);
+    rewind(att);
+    buf = emalloc(size + 1);
+    if (fread(buf, 1, size, att) != (size_t)size)
+        die("G1 probe: cannot read the attempt back");
+    buf[size] = 0;
+    fseek(att, 0, SEEK_END);
+    ln = emalloc(cap * sizeof *ln);
+    lpos = emalloc(cap * sizeof *lpos);
+    for (p = buf; *p; ) {
+        char *e;
+        if (nl == cap) {
+            char **l2 = emalloc(2 * cap * sizeof *ln);
+            long *p2 = emalloc(2 * cap * sizeof *lpos);
+            memcpy(l2, ln, nl * sizeof *ln);
+            memcpy(p2, lpos, nl * sizeof *lpos);
+            free(ln);
+            free(lpos);
+            ln = l2;
+            lpos = p2;
+            cap *= 2;
+        }
+        ln[nl] = p;
+        lpos[nl++] = p - buf;
+        e = strchr(p, '\n');
+        if (!e)
+            break;
+        *e = 0;
+        p = e + 1;
+    }
+    bsinit(live, fn->ntmp);
+    bsinit(use, fn->ntmp);
+    bsinit(def, fn->ntmp);
+
+    /* the chunks of each block, last first, walking liveness backward */
+    for (c = xy_nch - 1; c >= 0; ) {
+        Blk *b = xy_ch[c].b;
+        int first = c, end = b->nins, cc;
+        Ins *i;
+
+        while (first > 0 && xy_ch[first - 1].b == b)
+            first--;
+        bscopy(live, b->out);
+        if (rtype(b->jmp.arg) == RTmp)
+            xy_use(live, b->jmp.arg);
+        for (cc = c; cc >= first; cc--) {
+            long p0 = xy_ch[cc].pos, p1 = cc + 1 < xy_nch ? xy_ch[cc + 1].pos : size;
+            int a = xy_ch[cc].idx;
+
+            for (l0 = 0; l0 < nl && lpos[l0] < p0; l0++)
+                ;
+            for (l1 = l0; l1 < nl && lpos[l1] < p1; l1++)
+                ;
+            bszero(use);
+            bszero(def);
+            if (a < 0) {
+                /* the way out: the branch's operand, a compare fused into
+                 * it, the phi moves of each edge */
+                Blk *s[2];
+                Phi *ph;
+                int e2, n;
+                s[0] = b->s1;
+                s[1] = b->s2;
+                if (rtype(b->jmp.arg) == RTmp)
+                    xy_use(use, b->jmp.arg);
+                if (b->nins) {
+                    xy_use(use, b->ins[b->nins - 1].arg[0]);
+                    xy_use(use, b->ins[b->nins - 1].arg[1]);
+                }
+                for (e2 = 0; e2 < 2; e2++)
+                    if (s[e2])
+                        for (ph = s[e2]->phi; ph; ph = ph->link)
+                            for (n = 0; n < (int)ph->narg; n++)
+                                if (ph->blk[n] == b) {
+                                    xy_use(use, ph->arg[n]);
+                                    if (rtype(ph->to) == RTmp)
+                                        bsset(def, ph->to.val);
+                                }
+                xy_check_chunk(ln, lpos, l0, l1, live, use, def);
+                continue;
+            }
+            for (i = &b->ins[a]; i < &b->ins[end]; i++) {
+                xy_use(use, i->arg[0]);
+                xy_use(use, i->arg[1]);
+                if (rtype(i->to) == RTmp)
+                    bsset(def, i->to.val);
+            }
+            xy_check_chunk(ln, lpos, l0, l1, live, use, def);
+            for (i = &b->ins[end]; i != &b->ins[a]; ) {
+                i--;
+                if (rtype(i->to) == RTmp)
+                    bsclr(live, i->to.val);
+                xy_use(live, i->arg[0]);
+                xy_use(live, i->arg[1]);
+            }
+            end = a;
+        }
+        c = first - 1;
+    }
+
+    /* a `tax` / `tay` stands where a store set no flag */
+    for (d = 0; d < xy_ndef; d++) {
+        int j;
+        for (j = 0; j < nl && lpos[j] != xy_defpos[d]; j++)
+            ;
+        k = xy_defk[d];
+        if (j == nl || !xy_nz_dead(ln, nl, j))
+            xy_fail[k] |= 1, xy_why[k] |= 4;
+    }
+    free(ln);
+    free(lpos);
+    free(buf);
+}
+
+/* Give the webs their registers again, costliest first: each the first
+ * register it was not refused and that no candidate it interferes with
+ * holds already. From scratch each time, so that a web refused one
+ * register can take the other from a cheaper one. */
+static void
+xy_assign(void)
+{
+    int k, m, r, ok;
+
+    memset(xy_reg, 0, sizeof xy_reg);
+    for (k = 0; k < xy_n; k++) {
+        if (k > 0 && xy_web[k - 1] == xy_web[k])
+            continue;               /* the web's first member decides */
+        for (r = 1; r <= 2; r++) {
+            int rr = xy_pref[k] == 2 ? 3 - r : r;
+            if (xy_tried[k] & rr)
+                continue;
+            ok = 1;
+            for (m = k; ok && m < xy_n && xy_web[m] == xy_web[k]; m++) {
+                int o;
+                for (o = 0; o < xy_n; o++)
+                    if (xy_reg[o] == rr && xy_adj[m][o])
+                        ok = 0;
+            }
+            if (ok)
+                break;
+        }
+        if (r > 2)
+            continue;
+        r = xy_pref[k] == 2 ? 3 - r : r;
+        for (m = k; m < xy_n && xy_web[m] == xy_web[k]; m++)
+            xy_reg[m] = r;
+    }
+}
+
+static void
+xy_reset_state(int sv_scmp, int sv_vsh, int sv_jt, FILE *to)
+{
+    scmp_seq = sv_scmp;
+    var_shift_seq = sv_vsh;
+    jt_seq = sv_jt;
+    outf = to;
+    memset(temp_high_written, 0, sizeof(temp_high_written));
+    slot_owner_reset();
+    r9_invalidate();
+    argbytes = 0;
+}
+
+/* Emit fn with the colour until its text proves every coloured value. */
+static void
+xy_emit(Fn *fn, FILE *staged)
+{
+    int it, k, m, any, nreg, sv_scmp = scmp_seq, sv_vsh = var_shift_seq, sv_jt = jt_seq;
+    FILE *att;
+    char cp[4096];
+    size_t n;
+
+    xy_trace = getenv("QBE_XY_TRACE") != 0;
+    for (k = 0; k < xy_n; k++) {
+        xy_reg[k] = 0;
+        xy_tried[k] = xy_ban0[k];
+    }
+    xy_assign();
+    for (it = 0; ; it++) {
+        for (nreg = k = 0; k < xy_n; k++)
+            nreg += xy_reg[k] != 0;
+        if (!nreg || it > 2 * xy_n + 2) {
+            /* nothing left (or no fixed point): the plain emission */
+            for (k = 0; k < xy_n; k++) {
+                xy_reg[k] = 0;
+                fn->tmp[xy_tmp[k]].slot = xy_orig[k];
+            }
+            xy_fn_regs = 0;
+            xy_reset_state(sv_scmp, sv_vsh, sv_jt, staged);
+            emitfn_body(fn, staged);
+            break;
+        }
+        att = tmpfile();
+        if (!att)
+            die("G1 probe: no temporary file");
+        for (k = 0; k < xy_n; k++) {
+            xy_fail[k] = 0, xy_why[k] = 0;
+            fn->tmp[xy_tmp[k]].slot = xy_reg[k] ? XYSLOT + k : xy_orig[k];
+        }
+        xy_nown = xy_ndef = xy_nch = 0;
+        xy_reset_state(sv_scmp, sv_vsh, sv_jt, att);
+        xy_rec = 1;
+        xy_att = att;
+        emitfn_body(fn, att);
+        xy_rec = 0;
+        xy_att = 0;
+        xy_check(fn, att);
+        any = 0;
+        for (k = 0; k < xy_n; k++) {
+            if (!xy_reg[k] || !xy_fail[k])
+                continue;
+            any = 1;
+            if (xy_trace)
+                fprintf(stderr, "xy: %s: %%%s %s refused (%s, why %d, cost %u)\n", fn->name,
+                        fn->tmp[xy_tmp[k]].name, xy_reg[k] == 1 ? "X" : "Y",
+                        xy_fail[k] & 1 ? "any register" : "this register", xy_why[k],
+                        fn->tmp[xy_tmp[k]].cost);
+            /* the web is refused that register; a reason that holds for
+             * any register refuses it both */
+            for (m = 0; m < xy_n; m++)
+                if (xy_web[m] == xy_web[k])
+                    xy_tried[m] |= xy_fail[k] & 1 ? 3 : xy_reg[k];
+        }
+        if (!any) {
+            /* proven: the attempt is the function */
+            xy_fn_regs = 0;
+            for (k = 0; k < xy_n; k++) {
+                xy_fn_regs |= xy_reg[k];
+                if (xy_trace && xy_reg[k])
+                    fprintf(stderr, "xy: %s: %%%s in %s (cost %u)\n", fn->name,
+                            fn->tmp[xy_tmp[k]].name, xy_reg[k] == 1 ? "X" : "Y",
+                            fn->tmp[xy_tmp[k]].cost);
+            }
+            rewind(att);
+            while ((n = fread(cp, 1, sizeof cp, att)) > 0)
+                fwrite(cp, 1, n, staged);
+            fclose(att);
+            outf = staged;
+            break;
+        }
+        fclose(att);
+        xy_assign();
+    }
+    for (k = 0; k < xy_n; k++)
+        fn->tmp[xy_tmp[k]].slot = xy_orig[k];
+}
+void
+w65816_emitfn(Fn *fn, FILE *f)
+{
+    int slot;
+
+    FILE *real = f, *staged = getenv("QBE_NO_SHORT_BRANCH") ? 0 : tmpfile();
+
+    outf = staged ? staged : f;
+
+    /* 2-pass parse mode: every fn's abi0 has already run during pass 1,
+     * so the w65816_alloc_size[] / w65816_alloc_slots globals hold the
+     * LAST function's data. Restore this fn's snapshot before we read. */
+    w65816_restore_alloc_state(fn);
+    w65816_check_temps(fn);   /* later passes add temps */
+
+    /* S5 (2026-10-08): abi0 photographed the size of every alloc before
+     * the optimizer ran. A local or a parameter that `promote` then turned
+     * into temps has no alloc instruction left, and still got its words
+     * of frame: 2 to 4 bytes per promoted variable in every call. Keep
+     * only the allocs that are still defined. */
+    if (!getenv("QBE_KEEP_DEAD_ALLOCS")) {
+        static unsigned char live_alloc[MAX_ALLOC_TEMPS];
+        Blk *ab;
+        Ins *ai;
+        memset(live_alloc, 0, sizeof(live_alloc));
+        for (ab = fn->start; ab; ab = ab->link)
+            for (ai = ab->ins; ai < &ab->ins[ab->nins]; ai++)
+                if ((ai->op == Oalloc4 || ai->op == Oalloc8
+                     || ai->op == Oalloc16)
+                    && rtype(ai->to) == RTmp && ai->to.val >= Tmp0
+                    && ai->to.val - Tmp0 < MAX_ALLOC_TEMPS)
+                    live_alloc[ai->to.val - Tmp0] = 1;
+        for (int j = 0; j < MAX_ALLOC_TEMPS; j++)
+            if (w65816_alloc_size[j] > 0 && !live_alloc[j]) {
+                w65816_alloc_slots -= w65816_alloc_size[j];
+                w65816_alloc_size[j] = 0;
+            }
+    }
+
+    /* No FPU and no soft-float library. Only conversions and compares
+     * stopped the build until 2026-10-08: `a * 2.5f` was emitted as a
+     * 16-bit integer multiply of the low word, `a + b` as an integer add.
+     * Whatever floating-point value is still here after constant folding
+     * is refused; `(int)(1.5 * 256)` was folded and is not. */
+    {
+        Blk *fb;
+        Ins *fi;
+        Phi *fp;
+        int isflt = 0;
+        for (fb = fn->start; fb && !isflt; fb = fb->link) {
+            for (fp = fb->phi; fp; fp = fp->link)
+                isflt |= KBASE(fp->cls) == 1;
+            for (fi = fb->ins; fi < &fb->ins[fb->nins]; fi++)
+                isflt |= KBASE(fi->cls) == 1
+                      || fi->op == Ostores || fi->op == Ostored;
+        }
+        if (isflt)
+            err("function %s uses floating-point arithmetic, which this target "
+                "does not have (no FPU, no soft-float library): use the "
+                "fixed-point types, fixed in <snes/math.h> or fixed32 in "
+                "<snes/fixed32.h>. A floating constant is "
+                "fine where the compiler can fold it, e.g. (int)(1.5 * 256)",
+                fn->name);
+    }
+
+    /*
+     * Compute allocslot[] offsets from w65816_alloc_size[] (set by abi0)
+     * Alloc temps get stack slots first (lowest offsets from SP)
+     */
+    slot = 0;
+    for (int j = 0; j < MAX_ALLOC_TEMPS; j++) {
+        if (w65816_alloc_size[j] > 0) {
+            allocslot[j] = slot;
+            slot += w65816_alloc_size[j];
+        } else {
+            allocslot[j] = -1;
+        }
+    }
+
+    /* Reserve slots for allocs in fn->slot so assignslots starts after them */
+    fn->slot = slot;
+
+    /* S5 (2026-10-08): which temps never touch their slot is decided
+     * BEFORE the slots are assigned, so that they get none: a temp that is
+     * a parameter read in place, or one whose store is skipped because
+     * its only use takes it from A. They used to be coloured like the
+     * others and the frame carried their words. None of these analyses
+     * reads a slot number or the frame size. */
+    leaf_opt = (fn->leaf || all_calls_are_tail(fn)) && !fn->dynalloc;
+    alias_opt = leaf_opt || (!fn->dynalloc && !getenv("QBE_NO_NONLEAF_ALIAS"));
+    count_temp_uses(fn);
+    mark_near_indexed(fn);      /* S4: is_far() reads it, so first */
+    build_alias_table(fn);
+    mark_dead_stores(fn);
+    mark_high_zero(fn);
+    mark_far_decomp(fn);        /* B2: before addr_only (feeds it) */
+    mark_addr_only_kl(fn);
+    /* S5 (2026-10-09): a 32-bit temp of which only the low half is ever
+     * read — an address, an index — is one word wide on the stack. Its
+     * high half is neither computed (the skip_high paths) nor stored
+     * (emit_store_high returns at once), and a read of it is the
+     * high-half invariant's internal error. Not for a phi result: the
+     * edge moves write both halves of their destination directly. */
+    memset(temp_narrow, 0, sizeof(temp_narrow));
+    if (!getenv("QBE_NO_NARROW_KL")) {
+        Blk *nb; Ins *ni;
+        for (nb = fn->start; nb; nb = nb->link)
+            for (ni = nb->ins; ni < &nb->ins[nb->nins]; ni++)
+                if (rtype(ni->to) == RTmp && ni->to.val >= Tmp0
+                    && ni->to.val - Tmp0 < MAX_ALLOC_TEMPS
+                    && fn->tmp[ni->to.val].cls == Kl
+                    && ref_to_is_addr_only(ni->to)
+                    && narrow_ok(ni->op))
+                    temp_narrow[ni->to.val - Tmp0] = 1;
+    }
+    memset(temp_noslot, 0, sizeof(temp_noslot));
+    if (!getenv("QBE_SLOT_FOR_ALL"))
+        for (int t = Tmp0; t < fn->ntmp && t - Tmp0 < MAX_ALIAS_TEMPS; t++)
+            if (fn->tmp[t].cls != Kl
+                && ((alias_opt && temp_alias[t - Tmp0] != 0)
+                    || temp_is_dead_store[t - Tmp0]))
+                temp_noslot[t - Tmp0] = 1;
+
+    /* Assign slots to any unassigned temps (when skiprega is set) */
+    leaf_split = 0;
+    xy_n = 0;                   /* G1 probe: color_slots names the candidates */
+    free(xy_k_of);
+    xy_k_of = 0;
+    xy_ntmp = 0;
+    memset(xy_reg, 0, sizeof xy_reg);
+    {
+        int base0 = fn->slot, t;
+        int *slot0 = malloc((size_t)fn->ntmp * sizeof *slot0);
+
+        if (!slot0)
+            die("out of memory");
+        for (t = 0; t < fn->ntmp; t++)
+            slot0[t] = fn->tmp[t].slot;
+        fn->slot = assignslots(fn);
+        /* A leaf one word too big for the direct page: colour it again,
+         * the costliest temps in tcc__lf and the rest on the stack (see
+         * leaf_split), from the state the first colouring started from. */
+        if (fn->leaf && !fn->dynalloc && w65816_alloc_slots == 0
+            && fn->slot > dpf_words()
+            && !getenv("QBE_NO_DP_FRAME") && !getenv("QBE_NO_LEAF_SPLIT")
+            && !getenv("QBE_NO_SLOT_COLOR")) {
+            for (t = 0; t < fn->ntmp; t++)
+                fn->tmp[t].slot = slot0[t];
+            fn->slot = base0;
+            leaf_split = 1;
+            fn->slot = assignslots(fn);
+        }
+        free(slot0);
+    }
+
+    /* Total frame size: alloc slots + temp slots + 1 for alignment */
+    framesize = (fn->slot + 1) * 2;
+    dp_frame = 0;
+    if (fn->leaf && !leaf_split && !fn->dynalloc && w65816_alloc_slots == 0
+        && fn->slot >= 1 && fn->slot <= dpf_words()
+        && !getenv("QBE_NO_DP_FRAME")) {
+        dp_frame = 1;       /* SOFF() now names tcc__lf */
+        framesize = 0;      /* nothing on the stack: parameters at 4,s */
+    }
+    /* No slot at all: no frame, and the frame size is 0, not the 2 bytes
+     * of alignment. The prologue already allocates nothing below 4 bytes
+     * (`framesize > 2`), but a parameter is read at framesize +
+     * PARAM_OFFSET + n: with 2 left here, a function that has parameters,
+     * makes calls and keeps nothing on the stack read every parameter 2
+     * bytes too high. It could not exist while each parameter was copied
+     * into a slot; textInit() became one the day they stopped being
+     * (S5, 2026-10-08: 25 examples lost their text). */
+    if (fn->slot == 0)
+        framesize = 0;
+    argbytes = 0;  /* Reset argument tracking for this function */
+
+    /* Leaf function optimization: enabled for true leaf functions (no calls)
+     * AND for "tail-only" non-leaf functions where every Ocall is in tail
+     * position (last insn of a return block, returning the call's result).
+     *
+     * Why this is safe for tail-only non-leaf:
+     *   - Before reaching any Ocall in this function, no JSL has fired
+     *     yet, so caller's parameter area is still intact and any temp
+     *     aliased to a negative caller slot reads valid data.
+     *   - Each Ocall in tail position will be emitted as `jml` (no return
+     *     PC pushed, no own frame teardown needed) per the existing TCO
+     *     path in detect_block_tail_call + the Ocall handler. Because
+     *     no return ever lands here, post-call temp state is irrelevant.
+     *
+     * Why it would NOT be safe for a non-tail call: a JSL pushes a 3-byte
+     * return address onto the stack mid-function, and any SSA temp that
+     * needs to live across that point would be clobbered if it had no
+     * frame slot. The original "Non-leaf functions MUST have a frame"
+     * comment is correct for that case — we're only relaxing it for the
+     * sub-case where there IS no across-call live range because the
+     * function never executes past the call. */
+    /* leaf_opt, alias_opt and the analyses that say which temps never
+     * touch their slot are computed above, before the slots are assigned
+     * (S5, 2026-10-08). */
+    skip_dead_retstore_temp = -1;
+    memset(temp_high_written, 0, sizeof(temp_high_written));
+    slot_fn = fn;
+    slot_owner_reset();
+    r9_invalidate();
+    caller_param_bytes = count_fn_param_bytes(fn);
+
+    /* Frame elimination: if all temps are aliased or dead-retval, go frameless */
+    if (leaf_opt && can_be_frameless(fn))
+        framesize = 0;
+
+    /* Large-frame mode (chantier A6.8): if the function's frame plus
+     * worst-case param-access offset can exceed 255 bytes, switch to
+     * indirect addressing via tcc__fp. Threshold leaves headroom for
+     * argbytes growth during call setup. The threshold sits below 256
+     * so even with a few PHA pushes during arg setup the direct mode
+     * stays valid, and we only flip to indirect for genuinely large
+     * frames where the assembler would otherwise reject the emission. */
+    large_frame_mode = (framesize >= LARGE_FRAME_THRESHOLD);
+
+    /* NOTE: temp_alias is NOT reset here. build_alias_table() already computed
+     * correct aliases. The emission pass uses these aliases via emitload_adj()
+     * and emitstore() to redirect param accesses to the caller's frame.
+     * Resetting here caused a mismatch: can_be_frameless() saw aliases,
+     * set framesize=0, but the emission lost the aliases and wrote to
+     * non-existent local slots, corrupting the caller's stack. */
+
+    if (staged && xy_n > 0)
+        xy_emit(fn, staged);
+    else {
+        xy_n = 0;
+        xy_fn_regs = 0;
+        emitfn_body(fn, staged);
+    }
     if (staged) {
         relax_branches(staged, real);
         fclose(staged);
         outf = real;
     }
     sframe_dump(fn, real);
+    /* G1 probe: nothing of this function's colour survives it */
+    memset(xy_reg, 0, sizeof xy_reg);
+    xy_n = 0;
+    xy_fn_regs = 0;
 }
 
 void
