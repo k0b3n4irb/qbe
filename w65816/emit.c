@@ -71,7 +71,7 @@ static int large_frame_mode;       /* 1 = use indirect via tcc__fp */
  * touched via PHA from accumulator only). */
 /* S5 (2026-10-09): the frame of a leaf function in the direct page.
  * A function that calls nothing, has no stack-allocated object and needs
- * at most DPF_WORDS words keeps its temps at tcc__lf..tcc__lf+31 instead
+ * at most DPF_WORDS words keeps its temps at tcc__lf..tcc__lf+39 instead
  * of in a stack frame: no prologue, no epilogue, `lda.b` (3 cycles) for
  * `lda n,s` (4), and nothing on the stack below the return address.
  * Safe because a leaf cannot be re-entered: it calls nothing, the NMI
@@ -80,8 +80,27 @@ static int large_frame_mode;       /* 1 = use indirect via tcc__fp */
  * The runtime helpers (tcc_mul32, __div16...) use tcc__r0..r3, r9, r10 —
  * not this block. SOFF() turns a slot index into either a stack offset or
  * a marked direct-page offset; the three helpers below are the only
- * places that print an operand. */
-#define DPF_WORDS 16
+ * places that print an operand. Twenty words since 2026-11-13 (sixteen
+ * before): measured on two games, four more words moved the temps of the
+ * functions one to eight words short off the stack; the block and the
+ * NMI mirror (templates/crt0.asm) grew by eight bytes. */
+#define DPF_WORDS 20
+/* The words the compiler uses, DPF_WORDS unless QBE_LF_WORDS asks for fewer
+ * (a measurement of what the four words added on 2026-11-13 give: 16 is the
+ * block as it was; the block itself stays DPF_WORDS words). */
+static int
+dpf_words(void)
+{
+    static int n = -1;
+
+    if (n < 0) {
+        const char *e = getenv("QBE_LF_WORDS");
+        n = e ? atoi(e) : DPF_WORDS;
+        if (n < 0 || n > DPF_WORDS)
+            n = DPF_WORDS;
+    }
+    return n;
+}
 #define DPF_BASE 0x4000
 static int dp_frame;
 /* 2026-10-10 (issue #166): in a function that CALLS, a temp that is not
@@ -99,7 +118,7 @@ static int dp_frame;
  * emitfn now colours such a leaf a second time with this flag set, and
  * color_slots() treats it as it treats a function that calls: every temp
  * is "not cross" (there is no call), so the costliest ones take the
- * sixteen words of tcc__lf (DPSLOT + n) and only the overflow keeps a
+ * DPF_WORDS words of tcc__lf (DPSLOT + n) and only the overflow keeps a
  * stack slot. Safe for the reason the all-in leaf frame is (see dp_frame
  * below). Not for a leaf with an object on the stack or a dynamic alloc:
  * those keep the stack frame they had. QBE_NO_LEAF_SPLIT=1 turns it off. */
@@ -3147,7 +3166,7 @@ color_slots(Fn *fn, int base)
 #undef NOTE
 
     /* Costliest first: QBE's use count weighted by loop depth (fillcost).
-     * First fit in definition order gave the sixteen direct-page words to
+     * First fit in definition order gave the direct-page words to
      * whatever a function computes first — its setup — and left the
      * temporaries of a loop further down on the stack. Stable, so that
      * equal costs keep the definition order. QBE_SLOT_ORDER=def restores
@@ -3375,7 +3394,7 @@ color_slots(Fn *fn, int base)
                 continue;
             su = fn->tmp[u].slot;
             if (su >= DPSLOT) {
-                if (!mixed || cross[t] || su - DPSLOT + w > DPF_WORDS)
+                if (!mixed || cross[t] || su - DPSLOT + w > dpf_words())
                     continue;
                 for (a = 0; a < w && !dpocc[su - DPSLOT + a]; a++)
                     ;
@@ -3437,10 +3456,10 @@ color_slots(Fn *fn, int base)
         }
         if (mixed && !cross[t]) {
             /* first fit in the direct-page block; the stack when it is full */
-            for (s = 0; s + w <= DPF_WORDS; s++)
+            for (s = 0; s + w <= dpf_words(); s++)
                 if (!dpocc[s] && (w == 1 || !dpocc[s + 1]))
                     break;
-            if (s + w <= DPF_WORDS) {
+            if (s + w <= dpf_words()) {
                 fn->tmp[t].slot = DPSLOT + s;
                 continue;
             }
@@ -8048,7 +8067,7 @@ peephole_wide(char **ln, int nl)
  * one per iteration of a 16,384-turn loop that an example's boot ran 5 %
  * slower for once it was inlined into main.
  *
- * Liveness of the sixteen words of tcc__lf over the function's text, one
+ * Liveness of the DPF_WORDS words of tcc__lf over the function's text, one
  * bit a word: a line's successors are the next line, and the target of its
  * branch (`@name`, or the next line that starts with the same run of `+`).
  * Nothing is live at a return: the block is scratch, by the ABI. A call
@@ -10091,6 +10110,31 @@ peephole_dec_loop(char **ln, int nl)
     return found;
 }
 
+/* A source the load of peephole_fuse_indexed may hand to the operation
+ * instead of an X-indexed symbol (2026-11-13): an immediate, a frame slot
+ * (`tcc__lf+N`, `N,s`) or a named symbol read without index. Nothing between
+ * the load and the operation writes memory or moves the stack (only ldx /
+ * ldy, one lda, clc / sec), so SRC holds the same value at the operation.
+ * A numeric address (`$2137`, `$004210`) is refused: an I/O register may
+ * have a read side effect, and the read would move after another load. */
+static int
+fuse_plain_src(const char *op)
+{
+    const char *p;
+
+    if (op[0] == '#')
+        return op[1] != 0;
+    if (pp_slot(op))
+        return 1;
+    if (!((op[0] >= 'a' && op[0] <= 'z') || (op[0] >= 'A' && op[0] <= 'Z') || op[0] == '_'))
+        return 0;
+    for (p = op; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9')
+              || *p == '_' || *p == '.' || *p == '+'))
+            return 0;
+    return 1;
+}
+
 /* An indexed load that only feeds the next operation becomes its operand
  * (2026-10-13):
  *
@@ -10109,19 +10153,24 @@ static int
 peephole_fuse_indexed(char **ln, int nl)
 {
     static const char *ops[] = { "cmp", "adc", "sbc", "and", "ora", "eor", 0 };
-    int i, j, k, m, n, o, xs, removed = 0;
+    int i, j, k, m, n, o, xs, plain, nosrc, removed = 0;
     const char *op1, *t, *y;
     char t1[64], *nl2;
 
     if (getenv("QBE_NO_PEEP_FUSE"))
         return 0;
+    nosrc = getenv("QBE_NO_PEEP_FUSE_SRC") != 0;
     for (i = 0; i < nl; i++) {
-        if (!ln[i] || !pp_is(ln[i], "lda") || ln[i][4] != '.')
+        if (!ln[i] || !pp_is(ln[i], "lda"))
             continue;
         op1 = pp_operand(ln[i]);
+        if (!op1)
+            continue;
         k = (int)strlen(op1);
-        if (k < 3 || strcmp(op1 + k - 2, ",x") != 0 || strchr(op1, '[') || strchr(op1, '(')
-            || op1[0] == '$' || (ln[i][5] != 'w' && ln[i][5] != 'l'))
+        plain = !nosrc && fuse_plain_src(op1);
+        if (!plain && (ln[i][4] != '.' || k < 3 || strcmp(op1 + k - 2, ",x") != 0
+                       || strchr(op1, '[') || strchr(op1, '(')
+                       || op1[0] == '$' || (ln[i][5] != 'w' && ln[i][5] != 'l')))
             continue;                   /* a named symbol, indexed by X */
         j = pp_next(ln, nl, i);
         if (j >= nl || strncmp(ln[j], "\tsta.b tcc__lf+", 15) != 0)
@@ -10129,6 +10178,8 @@ peephole_fuse_indexed(char **ln, int nl)
         t = pp_operand(ln[j]);
         if (!pp_slot(t) || strlen(t) > 40)
             continue;
+        if (plain && strncmp(op1, "tcc__lf+", 8) == 0 && abs(atoi(op1 + 8) - atoi(t + 8)) <= 1)
+            continue;                   /* the store to T would change SRC */
         /* the index registers may be loaded between (2026-10-15): an ldy
          * keeps X, an ldx moves it and is undone before the operation */
         xs = 0;
@@ -10161,6 +10212,19 @@ peephole_fuse_indexed(char **ln, int nl)
         snprintf(t1, sizeof t1, "tcc__lf+%d", atoi(t + 8) + 1);
         if (pp_slot_live_at(ln, nl, t, t1, pp_next(ln, nl, o)) != 0)
             continue;
+        if (plain) {
+            /* the load's own text, its mnemonic replaced: the suffix and
+             * the operand are SRC's, the width of A the same (no rep / sep
+             * between); the ldx / ldy between stay where they are */
+            nl2 = emalloc(strlen(ln[i]) + 1);
+            strcpy(nl2, ln[i]);
+            memcpy(nl2 + 1, ops[k], 3);
+            ln[o] = nl2;
+            ln[i] = 0;
+            ln[j] = 0;
+            removed += 2;
+            continue;
+        }
         nl2 = emalloc(strlen(op1) + 8);
         sprintf(nl2, "\t%s.%c %s", ops[k], ln[i][5], op1);
         if (xs) {
@@ -10993,7 +11057,7 @@ w65816_emitfn(Fn *fn, FILE *f)
          * the costliest temps in tcc__lf and the rest on the stack (see
          * leaf_split), from the state the first colouring started from. */
         if (fn->leaf && !fn->dynalloc && w65816_alloc_slots == 0
-            && fn->slot > DPF_WORDS
+            && fn->slot > dpf_words()
             && !getenv("QBE_NO_DP_FRAME") && !getenv("QBE_NO_LEAF_SPLIT")
             && !getenv("QBE_NO_SLOT_COLOR")) {
             for (t = 0; t < fn->ntmp; t++)
@@ -11009,7 +11073,7 @@ w65816_emitfn(Fn *fn, FILE *f)
     framesize = (fn->slot + 1) * 2;
     dp_frame = 0;
     if (fn->leaf && !leaf_split && !fn->dynalloc && w65816_alloc_slots == 0
-        && fn->slot >= 1 && fn->slot <= DPF_WORDS
+        && fn->slot >= 1 && fn->slot <= dpf_words()
         && !getenv("QBE_NO_DP_FRAME")) {
         dp_frame = 1;       /* SOFF() now names tcc__lf */
         framesize = 0;      /* nothing on the stack: parameters at 4,s */
