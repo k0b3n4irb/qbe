@@ -435,6 +435,40 @@ splice_at(Fn *caller, Blk *blk, int call_idx, InlBody *body)
 
 static int inl_seq;
 
+/* The label of a copied block (blk) or of the continuation (blk == 0).
+ * The block name is cut (%.40s), a static's name is `name.unit` and a nested
+ * copy puts a whole label in its block name, so the cut can end in a dot and
+ * one of b, w, l, which WLA-DX reads as a size suffix (wla_size_suffix,
+ * emit.c): three levels of copies met it on a game. Such a cut gets `_`
+ * after it (the last letter becomes `_` when the buffer is full); every
+ * other label is the one the splicer always made, so nothing that assembled
+ * before changes. QBE_INLINE_FAULT=label skips the repair (the provoked
+ * fault; the emitter's guard then refuses the label). */
+static void
+inl_label(char *dst, int seq, const char *fn, int idx, const char *blk)
+{
+    static int fault = -1;
+    size_t n;
+
+    if (fault < 0) {
+        char *e = getenv("QBE_INLINE_FAULT");
+        fault = e && strcmp(e, "label") == 0;
+    }
+    if (!blk) {
+        snprintf(dst, NString, "inl%d_%.22s.ret", seq, fn);
+        return;
+    }
+    snprintf(dst, NString, "inl%d_%.22s.%d.%.40s", seq, fn, idx, blk);
+    if (fault || !wla_size_suffix(dst))
+        return;
+    n = strlen(dst);
+    if (n + 1 < NString) {
+        dst[n] = '_';
+        dst[n+1] = 0;
+    } else
+        dst[n-1] = '_';
+}
+
 static int
 inline_leaf_max(void)
 {
@@ -621,12 +655,13 @@ splice_fn(Fn *caller, Blk *blk, int call_idx, Fn *callee)
          * not only its number. What makes the label unique is at its head, the
          * splice's number and the block's index in the callee, where a long
          * chain of nested names is never cut; the front end's own numbering
-         * (if_false.7), at the tail, is cut first and not relied upon. */
-        snprintf(c->name, NString, "inl%d_%.22s.%d.%.40s", seq, callee->name, b->visit, b->name);
+         * (if_false.7), at the tail, is cut first and not relied upon; a cut
+         * that ends in a size suffix is repaired (inl_label). */
+        inl_label(c->name, seq, callee->name, b->visit, b->name);
         bmap[b->visit] = c;
     }
     cont = newblk();
-    snprintf(cont->name, NString, "inl%d_%.22s.ret", seq, callee->name);
+    inl_label(cont->name, seq, callee->name, 0, 0);
 
     retval = emalloc(nb * sizeof retval[0]);
     retblk = emalloc(nb * sizeof retblk[0]);

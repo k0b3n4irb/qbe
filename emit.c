@@ -166,6 +166,49 @@ string_length(char *str)
 
 static void wla_emitdat(Dat *d, FILE *f);
 
+/* OpenSNES: WLA-DX reads a trailing `.b`, `.w` or `.l` (either case) of a
+ * label operand as a size suffix: `jmp @x.l` names `x`, `jsl g.b` calls `g`.
+ * No label may end that way, or it either fails the link ("unknown label")
+ * or, when the shorter name exists, binds silently to it. */
+int
+wla_size_suffix(const char *s)
+{
+	size_t n = strlen(s);
+
+	return n >= 2 && s[n-2] == '.' && strchr("bBwWlL", s[n-1]);
+}
+
+/* Every label the backend defines goes through here: the function's name,
+ * each block's name, each datum's name. A symbol (function or datum) of
+ * that shape is a file-scope static of a source named b.c, w.c or l.c
+ * (cproc names a static `name.<stem>`): the user renames the file. A block
+ * label of that shape is the compiler's own fault. QBE_LABEL_FAULT=noguard
+ * skips the guard (the provoked fault, to show what the assembler does). */
+void
+wla_label_guard(const char *name, const char *what, const char *fn)
+{
+	static int off = -1;
+	const char *dot;
+
+	if (off < 0) {
+		char *e = getenv("QBE_LABEL_FAULT");
+		off = e && strcmp(e, "noguard") == 0;
+	}
+	if (off || !wla_size_suffix(name))
+		return;
+	if (strcmp(what, "block") != 0) {
+		dot = strrchr(name, '.');
+		err("%s `%s` ends in `%s`, which the assembler reads as a size "
+		    "suffix (it would call or read `%.*s`): a file-scope static of a "
+		    "source named %s.c is misread by the assembler; rename the file",
+		    what, name, dot, (int)(dot - name), name, dot + 1);
+	}
+	die("internal compiler error: block label `%s` of function %s ends in "
+	    "`%s`, which the assembler reads as a size suffix "
+	    "(compiler/qbe/emit.c, wla_label_guard)",
+	    name, fn ? fn : "?", strrchr(name, '.'));
+}
+
 static void
 wla_emitlnk(char *n, Lnk *l, int s, FILE *f)
 {
@@ -469,6 +512,7 @@ wla_emitdat(Dat *d, FILE *f)
 		break;
 
 	case DEnd:
+		wla_label_guard(cur_data_name, "datum", 0);
 		if (d->lnk->common) {
 			/* Common data - not supported for now */
 			if (has_nonzero_data)

@@ -660,6 +660,8 @@ void emitfnlnk(char *, Lnk *, FILE *);
 void emitdat(Dat *, FILE *);
 void emitdbgfile(char *, FILE *);
 void emitdbgloc(uint, uint, FILE *);
+int wla_size_suffix(const char *);
+void wla_label_guard(const char *, const char *, const char *);
 int stashbits(bits, int);
 void elf_emitfnfin(char *, FILE *);
 void elf_emitfin(FILE *);

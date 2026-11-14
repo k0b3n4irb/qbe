@@ -13096,6 +13096,12 @@ w65816_emitfn(Fn *fn, FILE *f)
     w65816_restore_alloc_state(fn);
     w65816_check_temps(fn);   /* later passes add temps */
 
+    /* No label this function defines may end in `.b`, `.w` or `.l`: the
+     * assembler would read a size suffix (wla_label_guard, ../emit.c). */
+    wla_label_guard(fn->name, "function", 0);
+    for (Blk *gb = fn->start; gb; gb = gb->link)
+        wla_label_guard(gb->name, "block", fn->name);
+
     /* S5 (2026-10-08): abi0 photographed the size of every alloc before
      * the optimizer ran. A local or a parameter that `promote` then turned
      * into temps has no alloc instruction left, and still got its words
