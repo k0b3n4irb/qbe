@@ -13,6 +13,7 @@
  */
 
 #include "all.h"
+#include <time.h>
 
 /* Strip .L prefix from symbol names for WLA-DX compatibility.
  * WLA-DX doesn't support labels starting with '.'
@@ -155,9 +156,76 @@ static unsigned char xy_why[XY_MAX];
 static int xy_tried[XY_MAX];        /* registers refused (bit 0 X, bit 1 Y) */
 static int xy_pref[XY_MAX];         /* the register to try first */
 static int xy_ban0[XY_MAX];         /* registers not tried at all */
+/* The loop rule's counters in the plain emission of the function (its
+ * direct-page slot, the register it gave): a web on such a slot is given a
+ * register first, preferring the rule's; if the colour cannot hold it, no
+ * web that lives beside it takes that register, which the rule keeps */
+static int xy_lr_off[XY_MAX], xy_lr_reg[XY_MAX], xy_nlr;
+static int xy_rule_probe;           /* relax_branches stops after the loop rule */
+static unsigned char xy_lrreg[XY_MAX];
+static unsigned xy_wcost[XY_MAX];   /* the cost of candidate k's whole web */
+static unsigned char xy_ubits[XY_MAX]; /* why its web is a candidate: 16 the merge
+                                      * of an `if`, 32 an index, 64 a loop phi */
 static int *xy_k_of;                /* temp -> candidate, -1 */
 static int xy_ntmp;
 static int xy_fn_regs;              /* registers the colour uses in this function */
+/* where the colour's values live in the function's text, by register: byte
+ * ranges of the accepted attempt (= the staged text the passes read), so
+ * that the loop rule keeps X or Y wherever no coloured value of it lives */
+static long *xy_occ[3];
+static int xy_nocc[3], xy_capocc[3];
+static const char *xy_text_base;
+static long xy_text_size;
+
+static void
+xy_occ_add(int reg, long from, long to)
+{
+    if (xy_nocc[reg]) {
+        long *last = &xy_occ[reg][2 * xy_nocc[reg] - 2];
+        if (from <= last[1] && to >= last[0]) {
+            /* touching the last range (the chunks come in either order):
+             * one range */
+            if (from < last[0])
+                last[0] = from;
+            if (to > last[1])
+                last[1] = to;
+            return;
+        }
+    }
+    if (xy_nocc[reg] == xy_capocc[reg]) {
+        xy_capocc[reg] = xy_capocc[reg] ? 2 * xy_capocc[reg] : 32;
+        xy_occ[reg] = realloc(xy_occ[reg], 2 * xy_capocc[reg] * sizeof **xy_occ);
+        if (!xy_occ[reg])
+            die("out of memory");
+    }
+    xy_occ[reg][2 * xy_nocc[reg]] = from;
+    xy_occ[reg][2 * xy_nocc[reg] + 1] = to;
+    xy_nocc[reg]++;
+}
+
+/* Does a coloured value of reg (1 X, 2 Y) live on any of lines a..b? A
+ * line a pass wrote anew (not in the staged text) is judged by the lines
+ * around it, which are in the range too. */
+static int
+xy_region_busy(char **ln, int a, int b, int reg)
+{
+    int t, k;
+
+    if (!xy_nocc[reg] || !xy_text_base)
+        return 0;
+    if (getenv("QBE_XY_FAULT") && atoi(getenv("QBE_XY_FAULT")) == 3)
+        return 0;                   /* negative control: the loop rule blind */
+    for (t = a; t <= b; t++) {
+        long off;
+        if (!ln[t] || ln[t] < xy_text_base || ln[t] >= xy_text_base + xy_text_size)
+            continue;
+        off = ln[t] - xy_text_base;
+        for (k = 0; k < xy_nocc[reg]; k++)
+            if (off >= xy_occ[reg][2 * k] && off < xy_occ[reg][2 * k + 1])
+                return 1;
+    }
+    return 0;
+}
 static long *xy_own;                /* file positions of the colour's own writes */
 static int xy_nown, xy_capown;
 static long *xy_defpos;             /* positions of the definitions (flags check) */
@@ -239,6 +307,58 @@ xy_note_def(Ref r)
     xy_defk[xy_ndef++] = xy_k_of[r.val];
 }
 
+/* QBE_XY_ASSERT=1: the check of the colour that does not rest on the
+ * interference graph. Every coloured value is also stored in its own slot
+ * (its shadow) where it is defined, and the register is compared with the
+ * shadow wherever the value is used: `stp` on a difference, so a value the
+ * emitted text lets another write overwrite stops the program, whatever
+ * the proof believed. A value whose slot is on the stack is not coloured
+ * in this mode (`stx` has no stack-relative form). */
+static int xy_assert_on = -1;
+
+static int
+xy_asserting(void)
+{
+    if (xy_assert_on < 0)
+        xy_assert_on = getenv("QBE_XY_ASSERT") != 0;
+    return xy_assert_on;
+}
+
+static int
+xy_shadow(Ref r, char *buf)
+{
+    int k = xy_k_of[r.val], sl = xy_orig[k];
+    int off = dp_frame ? sl * 2 : sl >= DPSLOT ? (sl - DPSLOT) * 2 : -1;
+
+    if (off < 0) {
+        xy_fail[k] |= 1, xy_why[k] |= 1;
+        return 0;
+    }
+    sprintf(buf, "tcc__lf+%d", off);
+    return 1;
+}
+
+static void
+xy_shadow_store(Ref r)
+{
+    char b[32];
+
+    if (xy_asserting() && xy_of(r) && xy_shadow(r, b))
+        fprintf(outf, "\tst%c.b %s\n", xy_of(r) == 1 ? 'x' : 'y', b);
+}
+
+static void
+xy_assert_use(Ref r)
+{
+    char b[32];
+    static int seq;     /* a named label: an anonymous `+` would capture the
+                         * `bxx +` of a branch whose phi moves the check sits among */
+
+    if (xy_asserting() && xy_of(r) && xy_shadow(r, b))
+        seq++, fprintf(outf, "\tphp\n\tcp%c.b %s\n\tbeq @xya.%d\n\tstp\n@xya.%d:\n\tplp\n",
+                xy_of(r) == 1 ? 'x' : 'y', b, seq, seq);
+}
+
 /* G1 probe: `%t = add %u, k` (k = +-1, +-2), %t and %u in one register:
  * `inx` / `iny` / `dex` / `dey`, the N and Z of the result as `tax` would
  * leave them. */
@@ -267,13 +387,15 @@ xy_step(Ins *i, Fn *fn)
         n = v - 0x10000;
     else
         return 0;
+    xy_assert_use(u);
     for (; n; n += n > 0 ? -1 : 1) {
         if (n == 1 || n == -1)
             xy_note_def(i->to);
         else
             xy_note_own();
-        fprintf(outf, "	%s%c\n", n > 0 ? "in" : "de", rg == 1 ? 'x' : 'y');
+        fprintf(outf, "\t%s%c\n", n > 0 ? "in" : "de", rg == 1 ? 'x' : 'y');
     }
+    xy_shadow_store(i->to);
     if (rg == 1)
         x_invalidate();
     return 1;
@@ -286,7 +408,8 @@ xy_cmp_imm(Ref r, Ref k, Fn *fn)
 {
     if (!xy_of(r) || rtype(k) != RCon || fn->con[k.val].type != CBits)
         return 0;
-    fprintf(outf, "	cp%c.w #%d\n", xy_of(r) == 1 ? 'x' : 'y',
+    xy_assert_use(r);
+    fprintf(outf, "\tcp%c.w #%d\n", xy_of(r) == 1 ? 'x' : 'y',
             (int)(fn->con[k.val].bits.i & 0xFFFF));
     return 1;
 }
@@ -1930,9 +2053,10 @@ x_load(Ref r, Fn *fn)
     emit_rep20();
     if (xy_of(r)) {
         /* G1 probe: X holds it, or Y does (`tyx` leaves A alone) */
-        if (xy_of(r) == 2)
+        if (xy_of(r) == 2) {
+            xy_assert_use(r);
             fprintf(outf, "\ttyx\n");
-        else if (getenv("QBE_XY_FAULT")) {
+        } else if (getenv("QBE_XY_FAULT")) {
             /* negative control: a `tax` too many overwrites the value X
              * holds. FAULT=1 declares it the colour's own (a proof that
              * trusts it: the differential tests must fail); FAULT=2 does
@@ -1940,7 +2064,9 @@ x_load(Ref r, Fn *fn)
             if (atoi(getenv("QBE_XY_FAULT")) == 1)
                 xy_note_own();
             fprintf(outf, "\ttax\n");
-        }
+            xy_assert_use(r);
+        } else
+            xy_assert_use(r);
         x_ref = r;
         x_valid = 1;
         return;
@@ -2023,7 +2149,9 @@ emit_far_decomp_operand(Ref a, Fn *fn, char *buf, size_t n)
     case FAR_BASE_IDX:
         emit_cst_ptr_setup(far_decomp_base[idx], fn);
         emit_rep20();
-        if (xy_of(far_decomp_idx[idx]) != 2) {  /* G1 probe: Y holds it */
+        if (xy_of(far_decomp_idx[idx]) == 2)
+            xy_assert_use(far_decomp_idx[idx]);
+        else {                                  /* G1 probe: Y holds it */
             emitload(far_decomp_idx[idx], fn);  /* low 16 bits of the index */
             fprintf(outf, "\ttay\n");
             acache_invalidate();
@@ -2094,6 +2222,7 @@ emit_far_operand(Ins *ins, Ref a, Fn *fn, char *buf, size_t n, const char **sfx)
             snprintf(buf, n, "%s,y", stripsym(str(c->sym.id)));
         far_y_index = 1;
         *sfx = ".w";
+        xy_assert_use(far_decomp_idx[far_addr_idx(a)]);
         return k;
     }
     if (k != FAR_NONE) {
@@ -3273,7 +3402,7 @@ color_slots(Fn *fn, int base)
     int phi_share = !getenv("QBE_NO_PHI_SHARE");
     int opnd_share = phi_share && !getenv("QBE_NO_OPND_SHARE");
     int *pref;                  /* an argument's phi result */
-    struct { int to, arg; } *pa;
+    struct { int to, arg, hdr; } *pa;   /* hdr: the phi is a loop header's */
     /* A 32-bit add, sub, and, or, xor or copy and an operand of it: the
      * same slot or apart, never half over each other (see below) */
     int kl_share = phi_share && !getenv("QBE_NO_KL_SHARE");
@@ -3337,11 +3466,17 @@ color_slots(Fn *fn, int base)
     }
     for (b = fn->start; b; b = b->link)
         for (p = b->phi; p; p = p->link) {
+            int hdr = 0;
+            uint q;
             if (rtype(p->to) != RTmp || p->to.val < Tmp0)
                 continue;
+            for (q = 0; q < b->npred; q++)
+                if (b->pred[q]->id >= b->id)
+                    hdr = 1;            /* a way in from below: a loop */
             for (n = 0; n < (int)p->narg; n++)
                 if (rtype(p->arg[n]) == RTmp && p->arg[n].val >= Tmp0) {
                     pa[npa].to = p->to.val;
+                    pa[npa].hdr = hdr;
                     pa[npa++].arg = p->arg[n].val;
                     if (!pref[p->arg[n].val])
                         pref[p->arg[n].val] = p->to.val;
@@ -3684,17 +3819,21 @@ color_slots(Fn *fn, int base)
     xy_ntmp = 0;
     if (!getenv("QBE_NO_XY_COLOUR")) {
         int *web = calloc(nt, sizeof *web), *ok = calloc(nt, 1 + sizeof *ok);
+        int *nxt = calloc(nt, sizeof *nxt), *tail = calloc(nt, sizeof *tail);
+        int *roots = calloc(nt, sizeof *roots), nroots = 0;
         unsigned *wcost = calloc(nt, sizeof *wcost);
         int x, y, r;
         unsigned char *useful;
 
         xy_k_of = malloc(nt * sizeof *xy_k_of);
-        if (!web || !ok || !wcost || !xy_k_of)
+        if (!web || !ok || !wcost || !xy_k_of || !nxt || !tail || !roots)
             die("out of memory");
         xy_ntmp = nt;
         for (t = 0; t < nt; t++) {
             xy_k_of[t] = -1;
             web[t] = t;
+            nxt[t] = -1;            /* a web's members, a list from its root */
+            tail[t] = t;
             ok[t] = t >= Tmp0 && fn->tmp[t].slot >= 0 && !cross[t]
                     && (fn->tmp[t].cls == Kw
                         || (fn->tmp[t].cls == Kl && t - Tmp0 < MAX_ALLOC_TEMPS
@@ -3702,17 +3841,37 @@ color_slots(Fn *fn, int base)
                     && !(t - Tmp0 < MAX_ALLOC_TEMPS && temp_noslot[t - Tmp0]);
         }
 #define XY_FIND(v) xy_find(web, (v))
-        for (a = 0; a < npa; a++) {
-            x = XY_FIND(pa[a].to); y = XY_FIND(pa[a].arg);
-            if (x != y)
-                web[y] = x;
-        }
-        for (t = Tmp0; t < nt; t++)
-            if (copyof[t]) {
-                x = XY_FIND(t); y = XY_FIND(copyof[t]);
-                if (x != y)
-                    web[y] = x;
+        /* join a phi and its argument, a copy and its source, unless the
+         * two sets would then hold values live together: one temp that is
+         * the argument of two phis (`i + 1` feeding both `i` and the inner
+         * `j = i + 1`) must not make the two counters one web; the pair
+         * left apart is an ordinary move (emit_one_phimove) */
+        for (a = 0; a < npa + nt; a++) {
+            int pt, pg, ok2 = 1;
+            if (a < npa) {
+                pt = pa[a].to;
+                pg = pa[a].arg;
+            } else {
+                pt = a - npa;
+                if (pt < Tmp0 || !copyof[pt])
+                    continue;
+                pg = copyof[pt];
             }
+            x = XY_FIND(pt); y = XY_FIND(pg);
+            if (x == y)
+                continue;
+            for (t = x; ok2 && t >= 0; t = nxt[t])
+                for (u = y; u >= 0; u = nxt[u])
+                    if (adj[(size_t)t * words + u / 64] >> (u % 64) & 1) {
+                        ok2 = 0;
+                        break;
+                    }
+            if (ok2) {
+                web[y] = x;
+                nxt[tail[x]] = y;
+                tail[x] = tail[y];
+            }
+        }
         /* a web is a candidate when every member is, no two interfere,
          * and one of them is what a register is for: carried round a loop
          * (a phi), or the index of an access (a value read once, right
@@ -3720,8 +3879,14 @@ color_slots(Fn *fn, int base)
         useful = calloc(nt, 1);
         if (!useful)
             die("out of memory");
+        /* a phi its web holds whole (no move); 16 when it is not a loop
+         * header's (the merge of an `if`, `d = d < 0 ? -d : d`): in X it
+         * would evict the index the text rules keep there (below) */
         for (a = 0; a < npa; a++)
-            useful[pa[a].to] = useful[pa[a].arg] = 1;
+            if (XY_FIND(pa[a].to) == XY_FIND(pa[a].arg)) {
+                useful[pa[a].to] |= 1 | (pa[a].hdr ? 64 : 16);
+                useful[pa[a].arg] |= 1 | (pa[a].hdr ? 64 : 16);
+            }
         for (x = 0; x < nt - Tmp0 && x < MAX_ALIAS_TEMPS; x++) {
             Ref ri = far_decomp_idx[x];
             if (far_decomp_kind[x] == FAR_NONE)
@@ -3731,9 +3896,9 @@ color_slots(Fn *fn, int base)
             if (far_decomp_kind[x] == FAR_NEAR_DEREF)
                 useful[x + Tmp0] |= 1 | 4;
             if (rtype(ri) == RTmp && ri.val >= Tmp0 && (int)ri.val < nt)
-                useful[ri.val] |= 1 | (far_decomp_kind[x] == FAR_BASE_IDX ? 8
-                                       : far_decomp_kind[x] == FAR_SYM_IDX
-                                         && near_indexed[x] != NEAR_SYM ? 4 : 0);
+                useful[ri.val] |= 1 | 32 | (far_decomp_kind[x] == FAR_BASE_IDX ? 8
+                                            : far_decomp_kind[x] == FAR_SYM_IDX
+                                              && near_indexed[x] != NEAR_SYM ? 4 : 0);
         }
         /* an access to a FAR or const object through `sym + index` is long
          * even when the address is a plain symbol's form (emit_far_operand) */
@@ -3761,36 +3926,28 @@ color_slots(Fn *fn, int base)
             if (!ok[t])
                 ok[r] = 0;
             if (useful[t])
-                useful[r] |= 2 | (useful[t] & 12);
+                useful[r] |= 2 | (useful[t] & (12 | 16 | 32 | 64));
             wcost[r] += fn->tmp[t].cost;
         }
         for (t = Tmp0; t < nt; t++)
-            if (XY_FIND(t) == t && !(useful[t] & 2))
-                ok[t] = 0;
-        for (t = Tmp0; t < nt; t++) {
-            r = XY_FIND(t);
-            if (!ok[r])
-                continue;
-            for (u = Tmp0; u < t; u++)
-                if (XY_FIND(u) == r && (adj[(size_t)t * words + u / 64] >> (u % 64) & 1))
-                    ok[r] = 0;
+            if (XY_FIND(t) == t && ok[t] && (useful[t] & 2) && wcost[t] > 0)
+                roots[nroots++] = t;
+        /* costliest webs first (stable: equal costs in temp order), while
+         * XY_MAX members fit; the members of a web never interfere (the
+         * joins above refuse it) */
+        for (x = 1; x < nroots; x++) {
+            int v = roots[x];
+            for (y = x; y > 0 && wcost[roots[y - 1]] < wcost[v]; y--)
+                roots[y] = roots[y - 1];
+            roots[y] = v;
         }
-        /* costliest webs first, while XY_MAX members fit */
-        for (;;) {
-            int best = -1, cnt = 0;
-            for (t = Tmp0; t < nt; t++)
-                if (XY_FIND(t) == t && ok[t] && wcost[t] > 0
-                    && (best < 0 || wcost[t] > wcost[best]))
-                    best = t;
-            if (best < 0)
-                break;
-            ok[best] = 0;
-            for (t = Tmp0; t < nt; t++)
-                cnt += XY_FIND(t) == best;
+        for (r = 0; r < nroots; r++) {
+            int best = roots[r], cnt = 0;
+            for (t = best; t >= 0; t = nxt[t])
+                cnt++;
             if (xy_n + cnt > XY_MAX)
                 continue;
-            for (t = Tmp0; t < nt; t++)
-                if (XY_FIND(t) == best) {
+            for (t = best; t >= 0; t = nxt[t]) {
                     xy_tmp[xy_n] = t;
                     xy_web[xy_n] = best;
                     xy_orig[xy_n] = fn->tmp[t].slot;
@@ -3803,6 +3960,7 @@ color_slots(Fn *fn, int base)
                      * text rules already keep in X or Y: not tried */
                     xy_ban0[xy_n] = (useful[best] & 4 ? 2 : 0)
                                     | ((useful[best] & 12) == 8 ? 1 : 0);
+                    xy_ubits[xy_n] = useful[best];
                     xy_k_of[t] = xy_n++;
                 }
         }
@@ -3816,6 +3974,9 @@ color_slots(Fn *fn, int base)
         free(ok);
         free(wcost);
         free(useful);
+        free(nxt);
+        free(tail);
+        free(roots);
     }
     free(occ);
     free(pref);
@@ -3899,6 +4060,7 @@ emitload_adj(Ref r, Fn *fn, int sp_adjust)
     if (xy_of(r)) {
         /* G1 probe: N and Z of the value, as the load gave them; with an
          * 8-bit accumulator the low byte, as `lda` would */
+        xy_assert_use(r);
         fprintf(outf, xy_of(r) == 1 ? "\ttxa\n" : "\ttya\n");
         last_load_emitted = 1;
         acache_invalidate();
@@ -4006,6 +4168,7 @@ emitstore(Ref r, Fn *fn)
             xy_fail[k] |= 1, xy_why[k] |= 2;
         xy_note_def(r);
         fprintf(outf, xy_of(r) == 1 ? "\ttax\n" : "\ttay\n");
+        xy_shadow_store(r);
         if (xy_of(r) == 1)
             x_invalidate();
         acache_set(r);
@@ -6923,9 +7086,12 @@ emit_one_phimove(Phi *p, Ref arg, int parked, Fn *fn)
 
     /* G1 probe: a phi coloured X or Y, or an argument that is */
     if (rd) {
-        if (ra == rd)
-            return;                     /* the register holds it already */
+        if (ra == rd) {
+            xy_shadow_store(p->to);     /* the register holds it already */
+            return;
+        }
         if (ra) {
+            xy_assert_use(arg);
             xy_note_def(p->to);
             fprintf(outf, rd == 1 ? "\ttyx\n" : "\ttxy\n");
         } else if (rtype(arg) == RCon && fn->con[arg.val].type == CBits) {
@@ -6941,6 +7107,7 @@ emit_one_phimove(Phi *p, Ref arg, int parked, Fn *fn)
             fprintf(outf, rd == 1 ? "\ttax\n" : "\ttay\n");
             acache_invalidate();
         }
+        xy_shadow_store(p->to);
         if (rd == 1)
             x_invalidate();
         return;
@@ -6953,6 +7120,7 @@ emit_one_phimove(Phi *p, Ref arg, int parked, Fn *fn)
             xy_fail[xy_k_of[arg.val]] |= 1, xy_why[xy_k_of[arg.val]] |= 1;
             return;
         }
+        xy_assert_use(arg);
         fprintf(outf, ra == 1 ? "\ttxa\n" : "\ttya\n");
         emit_stack_store(SOFF(dstslot), 0);
         slot_wrote(p->to, 0);
@@ -9594,8 +9762,10 @@ peephole_loop_x(char **ln, int nl)
                 break;
             /* G1 probe: a register the X/Y colour holds values in is not
              * free at the loop's edges */
-            if (xy_fn_regs & (yreg ? 2 : 1))
+            if (xy_region_busy(ln, i, e, yreg ? 2 : 1)) {
+                WHY(yreg ? "a coloured value lives in Y here" : "a coloured value lives in X here");
                 continue;
+            }
             for (t = 0; t < nconv; t++)
                 if (conv_r[t] == yreg && !(e < conv_b[t] || conv_e[t] < b))
                     bad = 1;
@@ -9811,6 +9981,10 @@ peephole_loop_x(char **ln, int nl)
             conv_e[nconv] = e;
             conv_r[nconv] = yreg;
             nconv++;
+            if (xy_nlr < XY_MAX) {      /* G1 probe: what the rule took, for the colour */
+                xy_lr_off[xy_nlr] = atoi(s + 8);
+                xy_lr_reg[xy_nlr++] = yreg ? 2 : 1;
+            }
             found++;
 
             /* The body's one `lda #imm`, when it is the body's first line
@@ -11212,6 +11386,8 @@ relax_branches(FILE *in, FILE *out)
     if (fread(buf, 1, size, in) != (size_t)size)
         die("short branches: cannot read the function back");
     buf[size] = 0;
+    xy_text_base = buf;     /* G1 probe: offsets into the staged text */
+    xy_text_size = size;
     ln = 0;
     for (p = buf; *p; ) {
         if (nl == cap) {
@@ -11241,6 +11417,13 @@ relax_branches(FILE *in, FILE *out)
             if (ln[i])
                 ln[k++] = ln[i];
         nl = k;
+    }
+    if (xy_rule_probe) {
+        /* G1 probe: only what the loop rule takes was asked (xy_lr_*) */
+        free(ln);
+        free(buf);
+        xy_text_base = 0;
+        return;
     }
     if (!getenv("QBE_NO_PEEPHOLE") && (peephole_fuse_indexed(ln, nl) + peephole_forward_store(ln, nl)
                                        + peephole_xflow(ln, nl))) {
@@ -11356,6 +11539,7 @@ relax_branches(FILE *in, FILE *out)
         }
         fprintf(out, "%s\n", ln[i]);
     }
+    xy_text_base = 0;
     free(ln);
     free(buf);
 }
@@ -11562,8 +11746,10 @@ emitfn_body(Fn *fn, FILE *staged)
             /* G1 probe: a one-word copy whose source and result share a
              * register is nothing */
             if (xy_of(i->to) && xy_of(i->to) == xy_of(i->arg[0])
-                && (i->op == Ocopy || word_copy(i, fn)))
+                && (i->op == Ocopy || word_copy(i, fn))) {
+                xy_shadow_store(i->to);     /* the assertion build's shadow */
                 continue;
+            }
             /* ...and a step of 1 or 2 in place is `inx` / `dex` */
             if (xy_step(i, fn))
                 continue;
@@ -11794,6 +11980,13 @@ xy_nz_dead(char **ln, int nl, int i)
         const char *lj = ln[j];
         if (!*lj || lj[0] == ';')
             continue;
+        if (xy_asserting() && strcmp(lj, "\tphp") == 0) {
+            /* an assertion keeps the flags it found: walk past it */
+            while (j + 1 < nl && strcmp(ln[j + 1], "\tplp") != 0)
+                j++;
+            j++;
+            continue;
+        }
         if (lj[0] == '@' && lj[strlen(lj) - 1] == ':')
             continue;
         if (lj[0] != '\t')
@@ -11861,9 +12054,11 @@ xy_use(BSet *s, Ref r)
 /* Check one piece of text: lines [l0, l1) of the attempt, `live` what is
  * live after it, `use` / `def` the temps its instructions read and write. */
 static void
-xy_check_chunk(char **ln, long *lpos, int l0, int l1, BSet *live, BSet *use, BSet *def)
+xy_check_chunk(char **ln, long *lpos, int l0, int l1, BSet *live, BSet *use, BSet *def,
+               long p0, long p1)
 {
     int w[3] = { 0, 0, 0 }, own[3] = { 0, 0, 0 }, order[3] = { 0, 0, 0 }, bady = 0;
+    int present[3] = { 0, 0, 0 };
     int j, r, k;
 
     for (j = l0; j < l1; j++) {
@@ -11874,6 +12069,8 @@ xy_check_chunk(char **ln, long *lpos, int l0, int l1, BSet *live, BSet *use, BSe
             own[xy_writes(l, 1) ? 1 : 2] = 1;
             continue;
         }
+        if (xy_asserting() && strcmp(l, "\tplp") == 0)
+            continue;               /* the assertion's own php / plp pair */
         for (r = 1; r <= 2; r++) {
             if (xy_writes(l, r)) {
                 w[r] = 1;
@@ -11893,6 +12090,8 @@ xy_check_chunk(char **ln, long *lpos, int l0, int l1, BSet *live, BSet *use, BSe
         inl = bshas(live, t);
         inu = bshas(use, t);
         ind = bshas(def, t);
+        if (inl || inu || ind)
+            present[rg] = 1;
         if (w[rg] && ((inl && !ind) || inu))
             xy_fail[k] |= 2, xy_why[k] |= 32;
         /* the colour's own write of this register while another value of
@@ -11904,6 +12103,25 @@ xy_check_chunk(char **ln, long *lpos, int l0, int l1, BSet *live, BSet *use, BSe
         if (bady && rg == 2 && inu)
             xy_fail[k] |= 2, xy_why[k] |= 128;
     }
+    for (r = 1; r <= 2; r++)
+        if (present[r])
+            xy_occ_add(r, p0, p1);
+}
+
+/* The first line that starts at or after byte pos (lines in order). */
+static int
+xy_first_line(long *lpos, int nl, long pos)
+{
+    int lo = 0, hi = nl;
+
+    while (lo < hi) {
+        int m = (lo + hi) / 2;
+        if (lpos[m] < pos)
+            lo = m + 1;
+        else
+            hi = m;
+    }
+    return lo;
 }
 
 /* Read the attempt back and refuse what its text does not prove. */
@@ -11949,6 +12167,7 @@ xy_check(Fn *fn, FILE *att)
     bsinit(live, fn->ntmp);
     bsinit(use, fn->ntmp);
     bsinit(def, fn->ntmp);
+    xy_nocc[1] = xy_nocc[2] = 0;
 
     /* the chunks of each block, last first, walking liveness backward */
     for (c = xy_nch - 1; c >= 0; ) {
@@ -11965,10 +12184,8 @@ xy_check(Fn *fn, FILE *att)
             long p0 = xy_ch[cc].pos, p1 = cc + 1 < xy_nch ? xy_ch[cc + 1].pos : size;
             int a = xy_ch[cc].idx;
 
-            for (l0 = 0; l0 < nl && lpos[l0] < p0; l0++)
-                ;
-            for (l1 = l0; l1 < nl && lpos[l1] < p1; l1++)
-                ;
+            l0 = xy_first_line(lpos, nl, p0);
+            l1 = xy_first_line(lpos, nl, p1);
             bszero(use);
             bszero(def);
             if (a < 0) {
@@ -11994,7 +12211,7 @@ xy_check(Fn *fn, FILE *att)
                                     if (rtype(ph->to) == RTmp)
                                         bsset(def, ph->to.val);
                                 }
-                xy_check_chunk(ln, lpos, l0, l1, live, use, def);
+                xy_check_chunk(ln, lpos, l0, l1, live, use, def, p0, p1);
                 continue;
             }
             for (i = &b->ins[a]; i < &b->ins[end]; i++) {
@@ -12003,7 +12220,7 @@ xy_check(Fn *fn, FILE *att)
                 if (rtype(i->to) == RTmp)
                     bsset(def, i->to.val);
             }
-            xy_check_chunk(ln, lpos, l0, l1, live, use, def);
+            xy_check_chunk(ln, lpos, l0, l1, live, use, def, p0, p1);
             for (i = &b->ins[end]; i != &b->ins[a]; ) {
                 i--;
                 if (rtype(i->to) == RTmp)
@@ -12018,11 +12235,9 @@ xy_check(Fn *fn, FILE *att)
 
     /* a `tax` / `tay` stands where a store set no flag */
     for (d = 0; d < xy_ndef; d++) {
-        int j;
-        for (j = 0; j < nl && lpos[j] != xy_defpos[d]; j++)
-            ;
+        int j = xy_first_line(lpos, nl, xy_defpos[d]);
         k = xy_defk[d];
-        if (j == nl || !xy_nz_dead(ln, nl, j))
+        if (j == nl || lpos[j] != xy_defpos[d] || !xy_nz_dead(ln, nl, j))
             xy_fail[k] |= 1, xy_why[k] |= 4;
     }
     free(ln);
@@ -12030,39 +12245,66 @@ xy_check(Fn *fn, FILE *att)
     free(buf);
 }
 
-/* Give the webs their registers again, costliest first: each the first
- * register it was not refused and that no candidate it interferes with
- * holds already. From scratch each time, so that a web refused one
- * register can take the other from a cheaper one. */
+/* Give the webs their registers again, from scratch each time so that a
+ * web refused one register can take the other from a cheaper one: first
+ * the webs on a counter of the loop rule (xy_lrreg), in the rule's register
+ * only; then every web still without one, costliest first. A web takes the first register
+ * it was not refused, that no candidate it interferes with holds, and that
+ * is not the register of a loop-rule counter it interferes with and the
+ * colour left in memory (the rule keeps that counter there). */
 static void
 xy_assign(void)
 {
-    int k, m, r, ok;
+    int k, m, r, ok, pass;
 
     memset(xy_reg, 0, sizeof xy_reg);
-    for (k = 0; k < xy_n; k++) {
-        if (k > 0 && xy_web[k - 1] == xy_web[k])
-            continue;               /* the web's first member decides */
-        for (r = 1; r <= 2; r++) {
-            int rr = xy_pref[k] == 2 ? 3 - r : r;
-            if (xy_tried[k] & rr)
+    for (pass = 0; pass < 2; pass++)
+        for (k = 0; k < xy_n; k++) {
+            int first;
+            if (k > 0 && xy_web[k - 1] == xy_web[k])
+                continue;               /* the web's first member decides */
+            if (pass == 0 ? !xy_lrreg[k] : xy_reg[k] != 0)
                 continue;
-            ok = 1;
-            for (m = k; ok && m < xy_n && xy_web[m] == xy_web[k]; m++) {
-                int o;
-                for (o = 0; o < xy_n; o++)
-                    if (xy_reg[o] == rr && xy_adj[m][o])
-                        ok = 0;
+            if (pass == 1) {
+                /* a lighter web that lives beside a counter of the loop
+                 * rule the colour refused in both registers (an operand
+                 * of an ALU operation) takes none: in X or Y it would stop
+                 * the rule from rewriting that counter's loop (`tya / ora
+                 * S` has no form with S in X), and the hotter loop wins */
+                int o, yield = 0;
+                for (m = k; !yield && m < xy_n && xy_web[m] == xy_web[k]; m++)
+                    for (o = 0; o < xy_n; o++)
+                        if (xy_lrreg[o] && !xy_reg[o] && xy_tried[o] == 3
+                            && xy_web[o] != xy_web[k] && xy_adj[m][o]
+                            && xy_wcost[o] > xy_wcost[k])
+                            yield = 1;
+                if (yield)
+                    continue;
             }
-            if (ok)
-                break;
+            first = xy_lrreg[k] ? xy_lrreg[k] : xy_pref[k];
+            for (r = 1; r <= 2; r++) {
+                int rr = first == 2 ? 3 - r : r;
+                if (xy_tried[k] & rr)
+                    continue;
+                if (pass == 0 && rr != xy_lrreg[k])
+                    continue;       /* the rule's register only, before the others */
+                ok = 1;
+                for (m = k; ok && m < xy_n && xy_web[m] == xy_web[k]; m++) {
+                    int o;
+                    for (o = 0; o < xy_n; o++)
+                        if (xy_adj[m][o] && (xy_reg[o] == rr
+                                             || (pass == 1 && !xy_reg[o] && xy_lrreg[o] == rr)))
+                            ok = 0;
+                }
+                if (ok)
+                    break;
+            }
+            if (r > 2)
+                continue;
+            r = first == 2 ? 3 - r : r;
+            for (m = k; m < xy_n && xy_web[m] == xy_web[k]; m++)
+                xy_reg[m] = r;
         }
-        if (r > 2)
-            continue;
-        r = xy_pref[k] == 2 ? 3 - r : r;
-        for (m = k; m < xy_n && xy_web[m] == xy_web[k]; m++)
-            xy_reg[m] = r;
-    }
 }
 
 static void
@@ -12091,7 +12333,31 @@ xy_emit(Fn *fn, FILE *staged)
     for (k = 0; k < xy_n; k++) {
         xy_reg[k] = 0;
         xy_tried[k] = xy_ban0[k];
+        xy_lrreg[k] = 0;
     }
+    for (k = 0; k < xy_n; k++) {
+        xy_wcost[k] = 0;
+        for (m = 0; m < xy_n; m++)
+            if (xy_web[m] == xy_web[k])
+                xy_wcost[k] += fn->tmp[xy_tmp[m]].cost;
+    }
+    /* the loop rule's counters (xy_nlr, from the plain emission) */
+    for (k = 0; k < xy_n; k++)
+        for (m = 0; m < xy_nlr; m++) {
+            int sl = xy_orig[k];
+            int off = dp_frame ? sl * 2 : sl >= DPSLOT ? (sl - DPSLOT) * 2 : -1;
+            if (off == xy_lr_off[m]) {
+                int o;
+                for (o = 0; o < xy_n; o++)
+                    if (xy_web[o] == xy_web[k])
+                        xy_lrreg[o] = xy_lr_reg[m];
+            }
+        }
+    if (xy_trace)
+        for (k = 0; k < xy_n; k++)
+            fprintf(stderr, "xy: %s: candidate %%%s web %d cost %u slot %d loop rule %d\n",
+                    fn->name, fn->tmp[xy_tmp[k]].name, xy_web[k], fn->tmp[xy_tmp[k]].cost,
+                    xy_orig[k], xy_lrreg[k]);
     xy_assign();
     for (it = 0; ; it++) {
         for (nreg = k = 0; k < xy_n; k++)
@@ -12103,11 +12369,14 @@ xy_emit(Fn *fn, FILE *staged)
                 fn->tmp[xy_tmp[k]].slot = xy_orig[k];
             }
             xy_fn_regs = 0;
+            xy_nocc[1] = xy_nocc[2] = 0;
             xy_reset_state(sv_scmp, sv_vsh, sv_jt, staged);
             emitfn_body(fn, staged);
             break;
         }
         att = tmpfile();
+        if (xy_trace)
+            fprintf(stderr, "xy: %s: attempt %d\n", fn->name, it);
         if (!att)
             die("G1 probe: no temporary file");
         for (k = 0; k < xy_n; k++) {
@@ -12137,6 +12406,26 @@ xy_emit(Fn *fn, FILE *staged)
             for (m = 0; m < xy_n; m++)
                 if (xy_web[m] == xy_web[k])
                     xy_tried[m] |= xy_fail[k] & 1 ? 3 : xy_reg[k];
+        }
+        if (!any) {
+            /* the merge of an `if` in X beside an index the colour left in
+             * memory: the text rules would have kept that index in X
+             * (peephole_xflow); the merge gives X back (a `tax` / `txa`
+             * pair against an `ldx` at each access) */
+            for (k = 0; k < xy_n; k++) {
+                int o;
+                if (xy_reg[k] != 1 || (xy_ubits[k] & (16 | 32 | 64)) != 16)
+                    continue;
+                for (o = 0; o < xy_n; o++)
+                    if (!xy_reg[o] && (xy_ubits[o] & 32) && xy_adj[k][o])
+                        break;
+                if (o == xy_n)
+                    continue;
+                any = 1;
+                for (m = 0; m < xy_n; m++)
+                    if (xy_web[m] == xy_web[k])
+                        xy_tried[m] |= 1;
+            }
         }
         if (!any) {
             /* proven: the attempt is the function */
@@ -12387,15 +12676,40 @@ w65816_emitfn(Fn *fn, FILE *f)
      * set framesize=0, but the emission lost the aliases and wrote to
      * non-existent local slots, corrupting the caller's stack. */
 
-    if (staged && xy_n > 0)
-        xy_emit(fn, staged);
-    else {
+    if (staged && xy_n > 0) {
+        /* G1 probe: the plain emission first, through the text passes, to
+         * learn which counters the loop rule keeps in X or Y (xy_lr_*);
+         * then the colour, which leaves the rule those registers where it
+         * cannot do better. When the colour holds nothing, the plain text
+         * is the function, as it would be without the colour. */
+        int sv_scmp = scmp_seq, sv_vsh = var_shift_seq, sv_jt = jt_seq, k;
+        FILE *st0 = tmpfile();
+
+        if (!st0)
+            die("G1 probe: no temporary file");
+        for (k = 0; k < xy_n; k++)
+            xy_reg[k] = 0;
+        xy_fn_regs = 0;
+        xy_nocc[1] = xy_nocc[2] = 0;
+        xy_nlr = 0;
+        xy_reset_state(sv_scmp, sv_vsh, sv_jt, st0);
+        emitfn_body(fn, st0);
+        xy_rule_probe = 1;          /* the text passes up to the loop rule */
+        relax_branches(st0, 0);
+        xy_rule_probe = 0;
+        fclose(st0);
+        xy_reset_state(sv_scmp, sv_vsh, sv_jt, staged);
+        xy_emit(fn, staged);        /* the colour, or the plain text again */
+    } else {
         xy_n = 0;
         xy_fn_regs = 0;
         emitfn_body(fn, staged);
     }
     if (staged) {
+        clock_t c4 = clock();
         relax_branches(staged, real);
+        if (getenv("QBE_XY_TIME"))
+            fprintf(stderr, "xytime %s final-relax %ld\n", fn->name, (long)(clock() - c4));
         fclose(staged);
         outf = real;
     }
@@ -12404,6 +12718,7 @@ w65816_emitfn(Fn *fn, FILE *f)
     memset(xy_reg, 0, sizeof xy_reg);
     xy_n = 0;
     xy_fn_regs = 0;
+    xy_nocc[1] = xy_nocc[2] = 0;
 }
 
 void
