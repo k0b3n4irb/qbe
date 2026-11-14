@@ -593,6 +593,7 @@ void coalesce(Fn *);
 int addrtaken(const char *);
 int addrtaken_count(void);
 const char *addrtaken_name(int);
+int datdef_has(uint32_t);
 void inline_record(Fn *);
 void inline_check(Fn *);
 void inline_record_dat_ref(const char *name);

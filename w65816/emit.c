@@ -2019,6 +2019,304 @@ emit_sta_conaddr(Fn *fn, Ref r, int far)
     }
 }
 
+/* Lot E1 (2026-11-14): a pointer stepped on its low 16 bits.
+ *
+ * A data object this unit DEFINES is in a section of its own that the
+ * linker never lets cross a bank (`.far.N` BANK $7E SLOT 2, `.bss.N` /
+ * `.data.N` BANK 0 SLOT 1, `.rodata.N` in one ROM bank; wlalink refuses an
+ * object that does not fit). A pointer computed from such an object alone,
+ * by C's pointer arithmetic, points into it wherever C allows a dereference
+ * — and so into its bank. Its value can therefore be kept as (the address
+ * modulo 2^16, the root's bank): an `add` / `sub` of an integer computes the
+ * low word only and the bank word is the operand's (nothing at all when the
+ * two share a slot, as a loop's walked pointer and its step do).
+ *
+ * The one value this gets wrong is a pointer that leaves the bank: past the
+ * end of an object that ends at $xx:FFFF (one past the end is valid C, and
+ * an object can end there: measured, `$7E:FFF0-$FFFF`), or out of the object
+ * (undefined). Dereferencing either is undefined; comparing, storing,
+ * passing or converting the first is not. So a member is used ONLY as the
+ * address of a load or a store, or as the pointer operand of another
+ * member's definition, and the set is the greatest fixed point of:
+ *
+ *   root    $sym or $sym+k, sym a data object defined in this unit
+ *           (datdef_has; an extern may be assembly's, across a bank)
+ *   member  a Kl temp defined by copy or phi of members and roots, or by
+ *           add / sub of exactly one member or root (sub: the first) and an
+ *           integer (a constant, a 16-bit temp, an extension, a load of a
+ *           byte or a half, a product or shift of one by a constant)
+ *   uses    every use of a member is an access's address or the pointer
+ *           operand of a member's definition (a compare, a call argument,
+ *           a stored pointer, a return, a truncation: removed)
+ *
+ * Refused, therefore: a pointer from a parameter, a call, memory, an
+ * extern object or a function; a pointer compared, tested, stored, passed or
+ * returned. QBE_NO_FARPTR_DP=1 turns the step and the text rule
+ * (peephole_dp_ptr) off; QBE_FARPTR_TRACE=1 names the members;
+ * QBE_FARPTR_FAULT=1 accepts any symbol as a root, =2 skips the use rule
+ * (the provoked faults: fixture farptr_dp must fail under each); =3 and =4
+ * blind the text rule (tcc__r9 live after the line; the pointer's slot
+ * written on it), which the differential tests must see. */
+static unsigned char fp_mem[MAX_ALLOC_TEMPS];
+static Ins **fp_def;
+static int fp_ndef;
+
+static int
+fp_off(void)
+{
+    static int off = -1;
+
+    if (off < 0)
+        off = getenv("QBE_NO_FARPTR_DP") != 0;
+    return off;
+}
+
+static int
+fp_fault(void)
+{
+    static int f = -1;
+
+    if (f < 0)
+        f = getenv("QBE_FARPTR_FAULT") ? atoi(getenv("QBE_FARPTR_FAULT")) : 0;
+    return f;
+}
+
+/* QBE_FARPTR_ASSERT=1: the text rule keeps every staging and checks, before
+ * each access it rewrote, that the slot still holds the three bytes staged
+ * (`stp` otherwise): the claim "nothing on the line moved the pointer"
+ * checked on every access a program executes, not by the rule's reading. */
+static int
+fp_assert(void)
+{
+    static int a = -1;
+
+    if (a < 0)
+        a = getenv("QBE_FARPTR_ASSERT") != 0;
+    return a;
+}
+
+static int
+fp_is_mem(Ref r)
+{
+    return rtype(r) == RTmp && r.val >= Tmp0 && r.val - Tmp0 < MAX_ALLOC_TEMPS
+        && fp_mem[r.val - Tmp0];
+}
+
+static int
+fp_root(Fn *fn, Ref r)
+{
+    Con *c;
+
+    if (rtype(r) != RCon)
+        return 0;
+    c = &fn->con[r.val];
+    if (c->type != CAddr || c->sym.type != SGlo)
+        return 0;
+    return fp_fault() == 1 || datdef_has(c->sym.id);
+}
+
+static int
+fp_int(Fn *fn, Ref r, int depth)
+{
+    Ins *d;
+
+    if (rtype(r) == RCon)
+        return fn->con[r.val].type == CBits;
+    if (rtype(r) != RTmp || r.val < Tmp0 || depth > 4)
+        return 0;
+    if (fp_is_mem(r))
+        return 0;
+    if (fn->tmp[r.val].cls == Kw)
+        return 1;
+    if (fn->tmp[r.val].cls != Kl || (int)r.val >= fp_ndef || !(d = fp_def[r.val]))
+        return 0;
+    switch (d->op) {
+    case Oextsb: case Oextub: case Oextsh: case Oextuh: case Oextsw: case Oextuw:
+    case Oloadsb: case Oloadub: case Oloadsh: case Oloaduh:
+        return 1;
+    case Omul: case Oshl:
+        return (rtype(d->arg[1]) == RCon && fn->con[d->arg[1].val].type == CBits
+                && fp_int(fn, d->arg[0], depth + 1))
+            || (d->op == Omul && rtype(d->arg[0]) == RCon
+                && fn->con[d->arg[0].val].type == CBits
+                && fp_int(fn, d->arg[1], depth + 1));
+    default:
+        return 0;
+    }
+}
+
+static int
+fp_ptr(Fn *fn, Ref r)
+{
+    return fp_is_mem(r) || fp_root(fn, r);
+}
+
+/* Is the definition of member t still one? */
+static int
+fp_def_ok(Fn *fn, Ins *i)
+{
+    switch (i->op) {
+    case Ocopy:
+        return fp_ptr(fn, i->arg[0]);
+    case Oadd:
+        if (fp_ptr(fn, i->arg[0]) && !fp_ptr(fn, i->arg[1]))
+            return fp_int(fn, i->arg[1], 0);
+        if (fp_ptr(fn, i->arg[1]) && !fp_ptr(fn, i->arg[0]))
+            return fp_int(fn, i->arg[0], 0);
+        return 0;
+    case Osub:
+        return fp_ptr(fn, i->arg[0]) && !fp_ptr(fn, i->arg[1])
+            && fp_int(fn, i->arg[1], 0);
+    default:
+        return 0;
+    }
+}
+
+/* May member r be the n-th argument of i? */
+static int
+fp_use_ok(Ins *i, int n)
+{
+    if (fp_fault() == 2)
+        return 1;
+    if (isload(i->op) && n == 0)
+        return 1;
+    if (isstore(i->op) && n == 1)
+        return 1;
+    if (fp_is_mem(i->to) && (i->op == Ocopy || i->op == Oadd || (i->op == Osub && n == 0)))
+        return 1;
+    return 0;
+}
+
+static void
+farptr_web(Fn *fn)
+{
+    Blk *b;
+    Ins *i;
+    Phi *p;
+    int t, n, changed, k;
+
+    memset(fp_mem, 0, sizeof fp_mem);
+    free(fp_def);
+    fp_ndef = fn->ntmp;
+    fp_def = calloc((size_t)fp_ndef + 1, sizeof *fp_def);
+    if (!fp_def)
+        die("out of memory");
+    if (fp_off())
+        return;
+    for (b = fn->start; b; b = b->link) {
+        for (p = b->phi; p; p = p->link)
+            if (p->cls == Kl && rtype(p->to) == RTmp && p->to.val - Tmp0 < MAX_ALLOC_TEMPS)
+                fp_mem[p->to.val - Tmp0] = 1;
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (rtype(i->to) != RTmp || i->to.val < Tmp0)
+                continue;
+            fp_def[i->to.val] = i;
+            if (i->cls == Kl && i->to.val - Tmp0 < MAX_ALLOC_TEMPS
+                && (i->op == Ocopy || i->op == Oadd || i->op == Osub))
+                fp_mem[i->to.val - Tmp0] = 1;
+        }
+    }
+    do {
+        changed = 0;
+        for (b = fn->start; b; b = b->link) {
+            for (p = b->phi; p; p = p->link) {
+                if (fp_is_mem(p->to))
+                    for (n = 0; n < (int)p->narg; n++)
+                        if (!fp_ptr(fn, p->arg[n])) {
+                            fp_mem[p->to.val - Tmp0] = 0;
+                            changed = 1;
+                            break;
+                        }
+                if (!fp_is_mem(p->to) && fp_fault() != 2)
+                    for (n = 0; n < (int)p->narg; n++)
+                        if (fp_is_mem(p->arg[n])) {
+                            fp_mem[p->arg[n].val - Tmp0] = 0;
+                            changed = 1;
+                        }
+            }
+            for (i = b->ins; i < &b->ins[b->nins]; i++) {
+                if (fp_is_mem(i->to) && !fp_def_ok(fn, i)) {
+                    fp_mem[i->to.val - Tmp0] = 0;
+                    changed = 1;
+                }
+                for (n = 0; n < 2; n++)
+                    if (fp_is_mem(i->arg[n]) && !fp_use_ok(i, n)) {
+                        fp_mem[i->arg[n].val - Tmp0] = 0;
+                        changed = 1;
+                    }
+            }
+            if (fp_is_mem(b->jmp.arg) && fp_fault() != 2) {
+                fp_mem[b->jmp.arg.val - Tmp0] = 0;
+                changed = 1;
+            }
+        }
+    } while (changed);
+    if (getenv("QBE_FARPTR_TRACE")) {
+        fprintf(stderr, "farptr %s:", fn->name);
+        for (t = Tmp0, k = 0; t < fn->ntmp && t - Tmp0 < MAX_ALLOC_TEMPS; t++)
+            if (fp_mem[t - Tmp0])
+                fprintf(stderr, " %%%s", fn->tmp[t].name), k++;
+        fprintf(stderr, " (%d)\n", k);
+    }
+}
+
+/* Oadd / Osub of class Kl defining a member from a member TEMPORARY: the low
+ * word computed, the bank word the operand's. Returns 0 when the normal
+ * 32-bit form must be emitted. */
+static int
+farptr_step(Ins *i, Fn *fn)
+{
+    Ref pr, ri, to = i->to;
+    Con *c;
+    int v = -1, sp, st;
+
+    if (fp_off() || !fp_is_mem(to))
+        return 0;
+    if (i->op == Oadd && fp_is_mem(i->arg[0]))
+        pr = i->arg[0], ri = i->arg[1];
+    else if (i->op == Oadd && fp_is_mem(i->arg[1]))
+        pr = i->arg[1], ri = i->arg[0];
+    else if (i->op == Osub && fp_is_mem(i->arg[0]))
+        pr = i->arg[0], ri = i->arg[1];
+    else
+        return 0;
+    if (rtype(ri) == RCon) {
+        c = &fn->con[ri.val];
+        v = (int)(c->bits.i & 0xFFFF);
+        if (i->op == Osub)
+            v = (-v) & 0xFFFF;
+    }
+    emitload(pr, fn);
+    if (v == 1)
+        fprintf(outf, "\tinc a\n");
+    else if (v == 0xFFFF)
+        fprintf(outf, "\tdec a\n");
+    else if (i->op == Oadd) {
+        fprintf(outf, "\tclc\n");
+        emitop2("adc", ri, fn);
+    } else {
+        fprintf(outf, "\tsec\n");
+        emitop2("sbc", ri, fn);
+    }
+    emitstore(to, fn);
+    if (ref_to_is_addr_only(to))
+        return 1;                       /* no high half at all (narrow) */
+    sp = fn->tmp[pr.val].slot;
+    st = fn->tmp[to.val].slot;
+    if (sp >= 0 && sp == st && !temp_narrow[pr.val - Tmp0] && !temp_narrow[to.val - Tmp0]) {
+        /* one slot: the bank word is already the operand's */
+        check_high_read(pr, fn);
+        slot_read(pr, 1, fn);
+        note_high_written(to);
+        slot_wrote(to, 1);
+        return 1;
+    }
+    emit_load_high(pr, fn, 0);
+    emit_store_high(to, fn);
+    acache_invalidate();
+    return 1;
+}
+
 /* #121: load a 24-bit pointer into tcc__r9 for a bank-honouring
  * [tcc__r9] dereference. Used by cst-marked loads (the C object is
  * const-qualified = ROM whose linked bank is unknown; the plain
@@ -4483,6 +4781,8 @@ emitins(Ins *i, Fn *fn)
          * Narrowing fast path: when the result temp is addr_only (used
          * exclusively as the address operand of bank-discarding loads or
          * stores), the high half is dead at every consumer — skip it. */
+        if (i->cls == Kl && farptr_step(i, fn))
+            break;                      /* lot E1: low word only */
         if (i->cls == Kl) {
             int skip_high = ref_to_is_addr_only(i->to);
             emitload(r0, fn);
@@ -4529,6 +4829,8 @@ emitins(Ins *i, Fn *fn)
 
     case Osub:
         /* === A7.5: Kl pair sub with borrow propagation === */
+        if (i->cls == Kl && farptr_step(i, fn))
+            break;                      /* lot E1: low word only */
         if (i->cls == Kl) {
             int skip_high = ref_to_is_addr_only(i->to);
             emitload(r0, fn);
@@ -9033,7 +9335,10 @@ pp_a_dead_after(char **ln, int nl, int i)
         ;
     if (k >= nl)
         return 0;
-    if (pp_is(ln[k], "lda"))
+    /* lot E1: txa / tya write A whole too (16-bit here: the caller walks
+     * only lines of a 16-bit accumulator), the step of a walked pointer
+     * before the colour's `txa` of a counter */
+    if (pp_is(ln[k], "lda") || (!fp_off() && (pp_is(ln[k], "txa") || pp_is(ln[k], "tya"))))
         return 1;
     if (strncmp(ln[k], "\tjmp @", 6) != 0)
         return 0;
@@ -11356,6 +11661,291 @@ peephole_entry(char **ln, int nl)
     return removed;
 }
 
+/* Lot E1 (2026-11-14): a far pointer read where it lives.
+ *
+ *     lda.b tcc__lf+N              (gone)
+ *     sta.b tcc__r9
+ *     lda.b tcc__lf+N+2
+ *     sta.b tcc__r9+2
+ *     lda [tcc__r9]          ->    lda [tcc__lf+N]
+ *     ...                          ...
+ *     sta [tcc__r9],y              sta [tcc__lf+N],y
+ *
+ * The slot of a pointer in the direct page is a `[dp]` operand itself: the
+ * three bytes the staging copied are read where they are. tcc__r9 caches ONE
+ * pointer, so a loop that alternates two staged both at every access (the
+ * other compiler's `unpack` reads both pointers in place). Exact when, on
+ * the straight line after the staging (no label, branch, call, return, mvn,
+ * change of the direct page): every mention of tcc__r9 is a `[tcc__r9]` /
+ * `[tcc__r9],y` access (they are rewritten), no write touches the bytes
+ * N-1..N+3, and the line that ends it has tcc__r9 dead on entry (pp_r9_live,
+ * below: a call counts as a read, the careful side); the staging leaves A
+ * and N/Z, so the first line after it (past `ldy #k`) must write A without
+ * reading it. When the line before the staging stored A to a slot S and the
+ * line after it is `lda.b S`, that load goes too while N/Z are dead.
+ *
+ * It runs LAST of the text rules, on purpose: every rule before it takes a
+ * direct-page slot for unreachable through a pointer (pp_slot_live_at says
+ * so), and `[tcc__lf+N]` is a read of three of its bytes no other rule
+ * would see. QBE_NO_FARPTR_DP=1 turns it off with the 16-bit step. */
+static int *
+pp_r9_live(char **ln, int nl)
+{
+    static const char *cond[] = { "bcc", "bcs", "beq", "bne", "bmi", "bpl", "bvc", "bvs", 0 };
+    int *tgt, *fall, *use, *def, *in, i, k, m, a8, changed;
+    const char *l, *op;
+    size_t plus;
+
+    tgt = emalloc(5 * (nl + 1) * sizeof *tgt);
+    fall = tgt + nl + 1;
+    use = fall + nl + 1;
+    def = use + nl + 1;
+    in = def + nl + 1;
+    a8 = 0;
+    for (i = 0; i <= nl; i++) {
+        tgt[i] = -1;
+        use[i] = def[i] = in[i] = 0;
+        fall[i] = 1;
+    }
+    for (i = 0; i < nl; i++) {
+        if (!(l = ln[i]))
+            continue;
+        if (l[0] == '-' || l[0] == '+') {
+            size_t n = strspn(l, l[0] == '-' ? "-" : "+");
+            if (l[n] == 0)
+                continue;
+            if (l[n] != '\t')
+                goto bail;
+            l += n;
+        }
+        if (l[0] != '\t')
+            continue;
+        if (strncmp(l, "\tsep #$20", 9) == 0 || strncmp(l, "\tsep #$30", 9) == 0)
+            a8 = 1;
+        else if (strncmp(l, "\trep #$20", 9) == 0 || strncmp(l, "\trep #$30", 9) == 0)
+            a8 = 0;
+        op = pp_operand(l);
+        if (pp_is(l, "rtl") || pp_is(l, "rts") || pp_is(l, "rti")) {
+            fall[i] = 0;
+            continue;
+        }
+        if (pp_is(l, "jsl") || pp_is(l, "jsr") || pp_is(l, "jml")) {
+            use[i] = 3;                 /* the careful side */
+            continue;
+        }
+        m = 0;
+        for (k = 0; cond[k]; k++)
+            if (pp_is(l, cond[k]))
+                m = 1;
+        if (pp_is(l, "jmp") || pp_is(l, "bra") || pp_is(l, "brl")) {
+            m = 1;
+            fall[i] = 0;
+        }
+        if (m) {
+            size_t tl = strlen(op);
+            if (op[0] == '@') {
+                for (k = 0; k < nl; k++)
+                    if (ln[k] && strncmp(ln[k], op, tl) == 0 && strcmp(ln[k] + tl, ":") == 0)
+                        break;
+            } else if (tl && strspn(op, "+") == tl) {
+                for (k = i + 1; k < nl; k++)
+                    if (ln[k] && strspn(ln[k], "+") == tl && (ln[k][tl] == 0 || ln[k][tl] == '\t'))
+                        break;
+            } else if (tl && strspn(op, "-") == tl) {
+                for (k = i - 1; k >= 0; k--)
+                    if (ln[k] && strspn(ln[k], "-") == tl && (ln[k][tl] == 0 || ln[k][tl] == '\t'))
+                        break;
+                if (k < 0)
+                    goto bail;
+            } else
+                goto bail;
+            if (k >= nl)
+                goto bail;
+            tgt[i] = k;
+            continue;
+        }
+        if (!op || !strstr(op, "tcc__r9"))
+            continue;
+        plus = pp_is(l, "sta") || pp_is(l, "stz");
+        if (strcmp(op, "tcc__r9") == 0) {
+            if (plus)
+                def[i] = a8 ? 0 : 1;
+            else
+                use[i] = 1;
+        } else if (strcmp(op, "tcc__r9+2") == 0 || strcmp(op, "tcc__r9h") == 0) {
+            if (plus)
+                def[i] = a8 ? 0 : 2;
+            else
+                use[i] = 2;
+        } else
+            use[i] = 3;
+    }
+    do {
+        changed = 0;
+        for (i = nl - 1; i >= 0; i--) {
+            int out = 0;
+            if (fall[i])
+                out |= in[i + 1];
+            if (tgt[i] >= 0)
+                out |= in[tgt[i]];
+            m = use[i] | (out & ~def[i]);
+            if (m != in[i]) {
+                in[i] = m;
+                changed = 1;
+            }
+        }
+    } while (changed);
+    {
+        int *res = emalloc((nl + 1) * sizeof *res);
+        memcpy(res, in, (nl + 1) * sizeof *res);
+        free(tgt);
+        return res;
+    }
+bail:
+    free(tgt);
+    return 0;
+}
+
+/* N and Z dead after line i, the lines a byte store passes included */
+static int
+pp_dp_nz_dead(char **ln, int nl, int i)
+{
+    static const char *pass[] = { "sta", "stz", "stx", "sty", "clc", "sec", "nop", 0 };
+    static const char *setnz[] = { "lda", "ldx", "ldy", "and", "ora", "eor",
+        "adc", "sbc", "cmp", "cpx", "cpy", "inx", "iny", "dex", "dey",
+        "tax", "tay", "txa", "tya", "tyx", "txy", "pla", "plx", "ply",
+        "inc", "dec", "asl", "lsr", "rol", "ror", 0 };     /* set N, Z, read neither */
+    int j, n, q;
+
+    for (j = i + 1, n = 0; j < nl && n < 12; j++) {
+        const char *lj = ln[j];
+        if (!lj)
+            continue;
+        n++;
+        if (lj[0] == '@' && lj[strlen(lj) - 1] == ':')
+            continue;
+        if (lj[0] != '\t')
+            return 0;
+        if (strcmp(lj, "\tsep #$20") == 0 || strcmp(lj, "\trep #$20") == 0)
+            continue;
+        for (q = 0; setnz[q]; q++)
+            if (pp_is(lj, setnz[q]))
+                return 1;
+        for (q = 0; pass[q]; q++)
+            if (pp_is(lj, pass[q]))
+                break;
+        if (!pass[q])
+            return 0;
+    }
+    return 0;
+}
+
+static int
+peephole_dp_ptr(char **ln, int nl)
+{
+    static const char *stop[] = { "jmp", "jml", "jsl", "jsr", "rtl", "rts", "rti",
+        "brl", "bra", "bcc", "bcs", "beq", "bne", "bmi", "bpl", "bvc", "bvs",
+        "mvn", "mvp", "wai", "stp", "brk", "cop", "xce", "tcd", "pld", "plp", 0 };
+    int *live, s, k, j, n, m, e, a, done = 0, uses[64], nu, ok;
+    const char *op;
+    char q[32], q2[32];
+
+    if (fp_off() || getenv("QBE_NO_PEEPHOLE"))
+        return 0;
+    live = 0;
+    for (s = 0; s + 3 < nl; s++) {
+        if (!ln[s] || !ln[s + 1] || !ln[s + 2] || !ln[s + 3]
+            || strncmp(ln[s], "\tlda.b tcc__lf+", 15) != 0)
+            continue;
+        n = atoi(ln[s] + 15);
+        snprintf(q, sizeof q, "tcc__lf+%d", n);
+        snprintf(q2, sizeof q2, "tcc__lf+%d", n + 2);
+        if (!pp_is_staging(ln, nl, s, q, q2) || !pp_a16_at(ln, s))
+            continue;
+        if (!live && !(live = pp_r9_live(ln, nl)))
+            return 0;
+        /* the straight line after it */
+        nu = 0;
+        ok = 1;
+        for (k = s + 4; k < nl; k++) {
+            const char *l = ln[k];
+            if (!l)
+                continue;
+            if (l[0] != '\t')
+                break;                  /* a label of any kind */
+            for (m = 0; stop[m]; m++)
+                if (pp_is(l, stop[m]))
+                    break;
+            if (stop[m])
+                break;
+            op = pp_operand(l);
+            if (op && strstr(op, "tcc__r9")) {
+                if (strcmp(op, "[tcc__r9]") != 0 && strcmp(op, "[tcc__r9],y") != 0)
+                    break;              /* a new staging, a scratch use: ends it */
+                if (nu == (int)(sizeof uses / sizeof *uses)) {
+                    ok = 0;
+                    break;
+                }
+                uses[nu++] = k;
+                continue;
+            }
+            if (op && strstr(op, "tcc__lf")) {
+                if (strncmp(op, "tcc__lf+", 8) != 0 || !pp_slot(op))
+                    break;              /* a shape not read here */
+                a = atoi(op + 8);
+                if (a >= n - 1 && a <= n + 3 && pp_writes_mem(l) && fp_fault() != 4)
+                    break;              /* the pointer moves */
+            }
+        }
+        e = k;
+        if (!ok || e >= nl || (live[e] && fp_fault() != 3))
+            continue;
+        /* A and N/Z of the staging: overwritten first */
+        for (a = s + 4; a < e && (!ln[a] || (pp_is(ln[a], "ldy") && pp_operand(ln[a])[0] == '#')); a++)
+            ;
+        if (a >= e || !pp_writes_a_only(ln[a]))
+            continue;
+        for (j = 0; j < nu; j++) {
+            const char *l = ln[uses[j]];
+            size_t pre;
+            char *nw, *w;
+            static int seq;
+            op = pp_operand(l);
+            pre = (size_t)(op - l);
+            nw = w = emalloc(pre + strlen(q) + 400);
+            if (fp_assert()) {
+                /* the slot still equals the staged pointer: three bytes */
+                seq++;
+                w += sprintf(w, "\tphp\n\trep #$20\n\tpha\n\tlda.b tcc__r9\n\tcmp.b %s\n"
+                             "\tbne @fpa.%d\n\tlda.b tcc__r9+2\n\teor.b %s\n\tand.w #$00FF\n"
+                             "\tbeq @fpb.%d\n@fpa.%d:\n\tstp\n@fpb.%d:\n\tpla\n\tplp\n",
+                             q, seq, q2, seq, seq, seq);
+            }
+            memcpy(w, l, pre);
+            sprintf(w + pre, "[%s]%s", q, strcmp(op, "[tcc__r9],y") == 0 ? ",y" : "");
+            ln[uses[j]] = nw;
+        }
+        if (fp_assert()) {
+            done++;                     /* the staging and the load stay */
+            s += 3;
+            continue;
+        }
+        /* `sta.b S / (staging) / lda.b S`: A holds S already */
+        for (j = s - 1; j >= 0 && !ln[j]; j--)
+            ;
+        if (j >= 0 && a == s + 4 && strncmp(ln[j], "\tsta.b tcc__lf+", 15) == 0
+            && pp_slot(pp_operand(ln[j])) && strncmp(ln[a], "\tlda.b ", 7) == 0
+            && strcmp(pp_operand(ln[a]), pp_operand(ln[j])) == 0
+            && pp_dp_nz_dead(ln, nl, a))
+            ln[a] = 0;
+        ln[s] = ln[s + 1] = ln[s + 2] = ln[s + 3] = 0;
+        done++;
+        s += 3;
+    }
+    free(live);
+    return done;
+}
+
 /* A store gone can leave a load gone, and that a store before it. */
 static int
 slotdead_sweep(char **ln, int nl)
@@ -11483,6 +12073,40 @@ relax_branches(FILE *in, FILE *out)
                 if (ln[i])
                     ln[k++] = ln[i];
             nl = k;
+        }
+    }
+    /* lot E1: LAST of the text rules (no rule after it reads `[tcc__lf+N]`) */
+    if (!getenv("QBE_NO_PEEPHOLE")) {
+        for (i = k = 0; i < nl; i++)
+            if (ln[i])
+                ln[k++] = ln[i];
+        nl = k;
+        if (peephole_dp_ptr(ln, nl)) {
+            /* QBE_FARPTR_ASSERT=1 writes its check and the access as one
+             * entry: split it, the branch bounds below read lines */
+            int extra = 0;
+            char **wide;
+            for (i = 0; i < nl; i++)
+                if (ln[i])
+                    for (p = ln[i]; (p = strchr(p, '\n')); p++)
+                        extra++;
+            wide = emalloc((nl + extra + 1) * sizeof *wide);
+            for (i = k = 0; i < nl; i++) {
+                if (!ln[i])
+                    continue;
+                for (p = ln[i]; ; ) {
+                    char *e = strchr(p, '\n');
+                    wide[k++] = p;
+                    if (!e)
+                        break;
+                    *e = 0;
+                    p = e + 1;
+                }
+            }
+            free(ln);
+            ln = wide;
+            nl = k;
+            cap = nl + 1;
         }
     }
     /* L2: each table's group becomes its jump before any distance is
@@ -12554,6 +13178,7 @@ w65816_emitfn(Fn *fn, FILE *f)
     mark_high_zero(fn);
     mark_far_decomp(fn);        /* B2: before addr_only (feeds it) */
     mark_addr_only_kl(fn);
+    farptr_web(fn);             /* lot E1: pointers stepped on 16 bits */
     /* S5 (2026-10-09): a 32-bit temp of which only the low half is ever
      * read — an address, an index — is one word wide on the stack. Its
      * high half is neither computed (the skip_high paths) nor stored

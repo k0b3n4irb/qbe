@@ -127,6 +127,39 @@ static int dbg;
 static char **taken_name;
 static int taken_n, taken_cap;
 
+/* OpenSNES (lot E1, 2026-11-14): the data objects this translation unit
+ * DEFINES (interned names). The w65816 backend gives each its own section,
+ * which never crosses a bank (emit.c, wla_emitdat; the linker refuses an
+ * object that does not fit its bank's slot), so a pointer derived from one
+ * of them alone may step on 16 bits (w65816/emit.c, farptr_web). Every
+ * function is emitted after the whole module is parsed (emit_collected),
+ * so the set is complete when it is read. A common symbol is not one. */
+static uint32_t *datdef_id;
+static int datdef_n, datdef_cap;
+
+static void
+datdef_note(char *name)
+{
+	if (datdef_n == datdef_cap) {
+		datdef_cap = datdef_cap ? datdef_cap * 2 : 64;
+		datdef_id = realloc(datdef_id, datdef_cap * sizeof *datdef_id);
+		if (!datdef_id)
+			die("out of memory");
+	}
+	datdef_id[datdef_n++] = intern(name);
+}
+
+int
+datdef_has(uint32_t id)
+{
+	int i;
+
+	for (i = 0; i < datdef_n; i++)
+		if (datdef_id[i] == id)
+			return 1;
+	return 0;
+}
+
 static void
 addrtaken_note(const char *name)
 {
@@ -219,6 +252,8 @@ data(Dat *d)
 		addrtaken_note(d->u.ref.name);
 	}
 	emitdat(d, outf);
+	if (d->type == DEnd && d->lnk && !d->lnk->common)
+		datdef_note(d->name);
 	if (d->type == DEnd) {
 		fputs("/* end data */\n\n", outf);
 		/* NOTE: no freeall() here — collected functions need to survive
