@@ -3891,6 +3891,8 @@ color_slots(Fn *fn, int base)
             Ref ri = far_decomp_idx[x];
             if (far_decomp_kind[x] == FAR_NONE)
                 continue;
+            if (far_decomp_kind[x] != FAR_SYM_IDX && far_decomp_kind[x] != FAR_BASE_IDX)
+                ri = R;             /* the kinds that set an index temp */
             /* and which register it wants: Y for `[tcc__r9],y`, X for
              * a long-indexed or near-pointer access (no long,y) */
             if (far_decomp_kind[x] == FAR_NEAR_DEREF)
@@ -12037,18 +12039,23 @@ xy_is_own(long pos)
 static void
 xy_use(BSet *s, Ref r)
 {
-    int idx;
+    int idx, k;
 
     if (rtype(r) != RTmp || r.val < Tmp0)
         return;
     bsset(s, r.val);
     idx = far_addr_idx(r);
-    if (idx >= 0 && far_decomp_kind[idx] != FAR_NONE) {
-        if (rtype(far_decomp_base[idx]) == RTmp && far_decomp_base[idx].val >= Tmp0)
-            bsset(s, far_decomp_base[idx].val);
-        if (rtype(far_decomp_idx[idx]) == RTmp && far_decomp_idx[idx].val >= Tmp0)
-            bsset(s, far_decomp_idx[idx].val);
-    }
+    if (idx < 0)
+        return;
+    /* the kinds that set them (a near dereference is its own address:
+     * its base and index entries are a former function's) */
+    k = far_decomp_kind[idx];
+    if ((k == FAR_BASE_CON || k == FAR_BASE_IDX)
+        && rtype(far_decomp_base[idx]) == RTmp && far_decomp_base[idx].val >= Tmp0)
+        bsset(s, far_decomp_base[idx].val);
+    if ((k == FAR_SYM_IDX || k == FAR_BASE_IDX)
+        && rtype(far_decomp_idx[idx]) == RTmp && far_decomp_idx[idx].val >= Tmp0)
+        bsset(s, far_decomp_idx[idx].val);
 }
 
 /* Check one piece of text: lines [l0, l1) of the attempt, `live` what is
