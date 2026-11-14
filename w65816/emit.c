@@ -3065,7 +3065,14 @@ mark_dead_stores(Fn *fn)
                 while (next < &b->ins[b->nins] && is_nop_instruction(next))
                     next++;
 
+                /* Not for a 32-bit operation: its pair path loads r0 and
+                 * reads r1 from its slot, low half then high half (no
+                 * swap). A 16-bit compare of 0/1 xored into a 32-bit
+                 * accumulator lost its slot here and stopped the build
+                 * ("has no stack slot", difftest_stmt seed 9922, I1 S4;
+                 * the same with `static inline` on the step before). */
                 if (next < &b->ins[b->nins]
+                    && next->cls != Kl
                     && rtype(next->arg[1]) == RTmp
                     && next->arg[1].val >= Tmp0
                     && (next->arg[1].val - Tmp0) == idx
