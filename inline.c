@@ -500,6 +500,21 @@ clone_ref(Ref r, Fn *caller, Fn *callee, Ref *tmap)
     }
 }
 
+/* CC_TRACE_INLINE: why auto_inline_ok() said no (the first test that
+ * failed), and, for the trace alone, the same tests with the site count
+ * left out (what a size rule would still have to pass). Neither changes
+ * a decision: aio_skip_sites is set only around a call made for the
+ * trace, after the decision. (I1 S2, 2026-11-14) */
+static const char *aio_why;
+static int aio_skip_sites;
+
+static int
+aio_no(const char *why)
+{
+    aio_why = why;
+    return 0;
+}
+
 static int
 auto_inline_ok(Fn *caller, InlRec *rec)
 {
@@ -508,12 +523,19 @@ auto_inline_ok(Fn *caller, InlRec *rec)
     Ins *i;
     int ccalls, calls;
 
+    aio_why = 0;
     if (getenv("QBE_NO_AUTO_INLINE"))
-        return 0;
-    if (!callee || callee == caller || !rec->is_static)
-        return 0;
-    if (rec->busy || addrtaken(rec->name))
-        return 0;
+        return aio_no("off");
+    if (!callee)
+        return aio_no("no body");
+    if (callee == caller)
+        return aio_no("self");
+    if (!rec->is_static)
+        return aio_no("exported");
+    if (rec->busy)
+        return aio_no("busy");
+    if (addrtaken(rec->name))
+        return aio_no("addrtaken");
     /* A function with a section of its own stays where the source put it.
      * `RAM_CODE static void job(void)` with one call site was absorbed
      * into its caller in ROM as soon as the leaf rule below stopped
@@ -524,32 +546,33 @@ auto_inline_ok(Fn *caller, InlRec *rec)
      * ordinary function: that body then runs from RAM too.
      * (2026-10-10) */
     if (callee && callee->lnk.sec)
-        return 0;
+        return aio_no("own section");
     /* one call site: always. Several: only where the source says `inline`,
      * and under a size (the body is then copied at each site). */
     if (rec->sites != 1
-        && !(rec->hint && rec->ins_count <= inline_max_big()))
-        return 0;
+        && !(rec->hint && rec->ins_count <= inline_max_big())
+        && !aio_skip_sites)
+        return aio_no("sites");
     if (callee->vararg || callee->dynalloc)
-        return 0;
+        return aio_no("vararg");
     if (caller->ntmp + callee->ntmp >= AUTO_INLINE_TMP_ROOM)
-        return 0;
+        return aio_no("tmp room");
     for (b = callee->start; b; b = b->link) {
         for (i = b->ins; i < &b->ins[b->nins]; i++) {
             if (isalloc(i->op))
-                return 0;
+                return aio_no("alloc");
             if (i->op == Oparc || i->op == Opare || i->op == Oargc
                 || i->op == Oarge || i->op == Oargv || i->op == Ovastart
                 || i->op == Ovaarg)
-                return 0;
+                return aio_no("struct or variadic");
             if (ispar(i->op) && b != callee->start)
-                return 0;
+                return aio_no("late parameter");
         }
         if (b->jmp.type != Jjmp && b->jmp.type != Jjnz && b->jmp.type != Jhlt
             && !isret(b->jmp.type))
-            return 0;
+            return aio_no("jump kind");
         if (b->jmp.type == Jretc || b->jmp.type == Jrets || b->jmp.type == Jretd)
-            return 0;                   /* a struct or a float returned */
+            return aio_no("struct return"); /* a struct or a float returned */
     }
     /* A leaf keeps its temporaries in the direct page; a function that
      * calls keeps them on the stack, a cycle dearer at each access and out
@@ -606,7 +629,7 @@ auto_inline_ok(Fn *caller, InlRec *rec)
                 calls++;
             }
         if (calls)
-            return 0;
+            return aio_no("leaf rule");
     }
     return 1;
 }
@@ -839,6 +862,93 @@ count_indirect_refs(Fn *fn)
     }
 }
 
+/* CC_TRACE_INLINE (I1 S2): the temporaries a function still uses, defined
+ * or read by an instruction, a phi or a jump, against fn->ntmp (what the
+ * room test counts); and its IR instructions as inline_record counts them
+ * (Odbgloc left out). For the trace only. */
+static void
+trace_tmps(Fn *fn, int *used, int *nins)
+{
+    Blk *b;
+    Ins *i;
+    Phi *p;
+    char *seen;
+    uint a;
+    int n, k;
+
+    seen = emalloc(fn->ntmp ? fn->ntmp : 1);
+    n = 0;
+    k = 0;
+#define TT_SEE(r) do { if (rtype(r) == RTmp && (r).val >= Tmp0 \
+                           && (int)(r).val < fn->ntmp && !seen[(r).val]) { \
+                           seen[(r).val] = 1; n++; } } while (0)
+    for (b = fn->start; b; b = b->link) {
+        for (p = b->phi; p; p = p->link) {
+            TT_SEE(p->to);
+            for (a = 0; a < p->narg; a++)
+                TT_SEE(p->arg[a]);
+        }
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (i->op != Odbgloc)
+                k++;
+            TT_SEE(i->to);
+            TT_SEE(i->arg[0]);
+            TT_SEE(i->arg[1]);
+        }
+        TT_SEE(b->jmp.arg);
+    }
+#undef TT_SEE
+    free(seen);
+    *used = n;
+    *nins = k;
+}
+
+/* One line per call auto_inline_ok() or splice_fn() declined: the reason,
+ * the test that gave it (1: before the callee's own inlining, 2: after),
+ * the room counted and the room used. `rest` is the first reason with the
+ * site count left out: "ok" for a static of several sites that a size
+ * rule could copy. */
+static void
+trace_decline(Fn *caller, InlRec *rec, const char *why, int pass)
+{
+    const char *rest = "-";
+    int cu, ci, eu, ei;
+
+    if (why && strcmp(why, "sites") == 0) {
+        aio_skip_sites = 1;
+        rest = auto_inline_ok(caller, rec) ? "ok" : aio_why;
+        aio_skip_sites = 0;
+    }
+    trace_tmps(caller, &cu, &ci);
+    if (rec->fn)
+        trace_tmps(rec->fn, &eu, &ei);
+    else
+        eu = ei = 0;
+    fprintf(stderr,
+        "[inline] decline %s -> %s: %s (pass=%d sites=%d hint=%d own=%d "
+        "caller_sec=%d caller_ntmp=%d caller_used=%d callee_ntmp=%d "
+        "callee_used=%d callee_ins=%d room=%d rest=%s)\n",
+        caller->name, rec->name, why ? why : "?", pass, rec->sites,
+        rec->hint, rec->ins_count, caller->lnk.sec != 0, caller->ntmp, cu,
+        rec->fn ? rec->fn->ntmp : 0, eu, ei, AUTO_INLINE_TMP_ROOM, rest);
+}
+
+/* After a function's walk: its size and room once its own copies are in. */
+static void
+trace_final(Fn *fn, InlRec *self)
+{
+    int used, nins;
+
+    trace_tmps(fn, &used, &nins);
+    fprintf(stderr,
+        "[inline] final %s: ins=%d ntmp=%d used=%d own=%d sites=%d static=%d "
+        "addrtaken=%d sec=%d hint=%d absorbed=%d\n",
+        fn->name, nins, fn->ntmp, used, self ? self->ins_count : -1,
+        self ? self->sites : -1, self ? self->is_static : 0,
+        addrtaken(fn->name), fn->lnk.sec != 0, self ? self->hint : 0,
+        self ? self->absorbed : 0);
+}
+
 void
 inline_check(Fn *fn)
 {
@@ -872,11 +982,19 @@ restart:
             if (c->type != CAddr) continue;
             target = str(c->sym.id);
             rec = inline_lookup(target);
-            if (rec && !rec->eligible && auto_inline_ok(fn, rec)) {
+            if (rec && !rec->eligible && !auto_inline_ok(fn, rec)) {
+                if (trace)
+                    trace_decline(fn, rec, aio_why, 1);
+            } else if (rec && !rec->eligible) {
                 /* its own calls first: the body cloned is the final one */
                 inline_check(rec->fn);
-                if (auto_inline_ok(fn, rec)
-                    && (cont = splice_fn(fn, b, idx, rec->fn)) != 0) {
+                if (!auto_inline_ok(fn, rec)) {
+                    if (trace)
+                        trace_decline(fn, rec, aio_why, 2);
+                } else if ((cont = splice_fn(fn, b, idx, rec->fn)) == 0) {
+                    if (trace)
+                        trace_decline(fn, rec, "args", 2);
+                } else {
                     if (rec->hint) {
                         /* inline_fully_consumed() decides on these */
                         rec->n_direct++;
@@ -951,6 +1069,8 @@ restart:
         self->busy = 0;
         self->checked = 1;
     }
+    if (trace)
+        trace_final(fn, self);
 }
 
 /* Before any inlining: how many direct calls each function has in the
