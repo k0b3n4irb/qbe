@@ -57,6 +57,7 @@ struct InlBody {
 struct InlRec {
     char name[NString];
     char hint;            /* function had `inline` keyword */
+    char noinline;        /* __attribute__((noinline)): no inliner takes it */
     char eligible;        /* 1 if passes heuristic */
     char has_calls;
     char has_allocs;
@@ -94,6 +95,23 @@ static InlBody *save_body(Fn *fn, int cls);
 static int      splice_at(Fn *caller, Blk *blk, int call_idx, InlBody *body);
 static InlRec  *inline_lookup(char *name);
 
+/* __attribute__((noinline)) (I1 S3, 2026-11-14): the source says the
+ * function stays a function, so neither the small inliner, nor the
+ * one-site rule, nor `static inline` copying takes it (GCC's meaning).
+ * QBE_INLINE_FAULT=noinline forgets the keyword (the provoked fault: the
+ * check `noinline` then sees the function absorbed). */
+static int
+inline_fault_noinline(void)
+{
+    static int fault = -1;
+
+    if (fault < 0) {
+        char *e = getenv("QBE_INLINE_FAULT");
+        fault = e && strcmp(e, "noinline") == 0;
+    }
+    return fault;
+}
+
 static int
 inline_max_instr(void)
 {
@@ -126,6 +144,7 @@ inline_record(Fn *fn)
     strncpy(r->name, fn->name, NString-1);
     r->name[NString-1] = 0;
     r->hint = fn->lnk.inline_hint;
+    r->noinline = fn->lnk.noinline && !inline_fault_noinline();
     r->ins_count = 0;
     r->blk_count = 0;
     r->has_calls = 0;
@@ -173,6 +192,7 @@ inline_record(Fn *fn)
      * never copied into a caller: its body would run from wherever the
      * caller is. See auto_inline_ok(). */
     r->eligible = r->hint
+        && !r->noinline
         && !fn->lnk.sec
         && !r->has_phis
         && !r->has_cond
@@ -188,10 +208,11 @@ inline_record(Fn *fn)
         char *trace = getenv("CC_TRACE_INLINE");
         fprintf(stderr,
             "[inline] record %s: hint=%d blk=%d ins=%d phis=%d cond=%d "
-            "calls=%d allocs=%d (max=%d) -> %s\n",
+            "calls=%d allocs=%d (max=%d) -> %s%s\n",
             r->name, r->hint, r->blk_count, r->ins_count,
             r->has_phis, r->has_cond, r->has_calls, r->has_allocs, max,
-            r->eligible ? "ELIGIBLE" : "rejected");
+            r->eligible ? "ELIGIBLE" : "rejected",
+            r->noinline ? " (noinline)" : "");
         if (r->eligible && atoi(trace) >= 2) {
             fprintf(stderr, "[inline] body of %s:\n", r->name);
             printfn(fn, stderr);
@@ -530,6 +551,8 @@ auto_inline_ok(Fn *caller, InlRec *rec)
         return aio_no("no body");
     if (callee == caller)
         return aio_no("self");
+    if (rec->noinline)
+        return aio_no("noinline");
     if (!rec->is_static)
         return aio_no("exported");
     if (rec->busy)
@@ -622,6 +645,7 @@ auto_inline_ok(Fn *caller, InlRec *rec)
                 if (o && o->eligible)
                     continue;           /* the small inliner takes it */
                 if (o && o->fn && o->fn != caller && o->is_static && !o->busy
+                    && !o->noinline
                     && !addrtaken(o->name)
                     && (o->sites == 1
                         || (o->hint && o->ins_count <= inline_max_big())))

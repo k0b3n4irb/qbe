@@ -62,6 +62,7 @@ enum Token {
 	Tthread,
 	Tcommon,
 	Tinline,
+	Tnoinline,  /* OpenSNES I1 S3: never copied into a caller */
 	Tfunc,
 	Ttype,
 	Tdata,
@@ -129,6 +130,7 @@ static char *kwmap[Ntok] = {
 	[Tthread] = "thread",
 	[Tcommon] = "common",
 	[Tinline] = "inline",
+	[Tnoinline] = "noinline",
 	[Tfunc] = "function",
 	[Ttype] = "type",
 	[Tdata] = "data",
@@ -1239,6 +1241,11 @@ parselnk(Lnk *lnk)
 			/* OpenSNES function inlining chantier: hint only — actual
 			 * inlining gated by qbe/inline.c heuristic. */
 			lnk->inline_hint = 1;
+			break;
+		case Tnoinline:
+			/* OpenSNES I1 S3: __attribute__((noinline)); every
+			 * inliner refuses the function (inline.c) */
+			lnk->noinline = 1;
 			break;
 		case Tsection:
 			if (lnk->sec)

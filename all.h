@@ -410,6 +410,8 @@ struct Lnk {
 	                    * carries `inline` keyword; eligible for inlining
 	                    * if heuristic permits (single-block, ≤ N instr,
 	                    * no calls, no allocs). */
+	char noinline;     /* OpenSNES I1 S3: __attribute__((noinline)); no
+	                    * inliner copies it (inline.c) */
 	char *sec;
 	char *secf;
 };
