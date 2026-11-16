@@ -572,6 +572,9 @@ Blk *newblk(void);
 void fillpreds(Fn *);
 void fillcfg(Fn *);
 int threadjnz(Fn *);
+
+/* idiom.c */
+void g1idioms(Fn *);
 void simpljnz(Fn *);
 void cmplast(Fn *);
 void filldom(Fn *);
