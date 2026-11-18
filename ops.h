@@ -157,6 +157,9 @@ O(acmn,    T(w,l,e,e, w,l,e,e), F(0,0,0,0,0,0,0,0,0,0)) X(0,0,0) V(0)
 O(afcmp,   T(e,e,s,d, e,e,s,d), F(0,0,0,0,0,0,0,0,0,0)) X(0,0,0) V(0)
 O(reqz,    T(w,l,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,0)) X(0,0,0) V(0)
 O(rnez,    T(w,l,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,0)) X(0,0,0) V(0)
+/* w65816: the two bytes of a 16-bit word exchanged (`xba`); made by its
+ * emitter alone, from `or (shl x, 8), (shr x, 8)` (mark_bswap) */
+O(bswap,   T(w,e,e,e, x,e,e,e), F(0,0,0,0,0,0,0,0,0,0)) X(0,0,0) V(0)
 
 /* Arguments, Parameters, and Calls */
 O(par,     T(x,x,x,x, x,x,x,x), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)

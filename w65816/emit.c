@@ -2777,6 +2777,128 @@ try_fuse_kl_load_add(Ins *i, Blk *b, Fn *fn)
     return 1;
 }
 
+/* The byte swap of a 16-bit word is one `xba` (2026-11-18). The C of
+ * `(u16)((w << 8) | (w >> 8))`, in either order, reaches the emitter as
+ *     %a =w shl %x, 8
+ *     %b =w shr %x, 8
+ *     %t =w or %a, %b
+ * and was emitted as two `xba` with a mask each and an `ora`. The three
+ * instructions compute, on 16 bits and for every x, the exchange of the
+ * two bytes of x, which is what `xba` does to a 16-bit accumulator: `or`
+ * becomes `%t =w bswap %x` (an op of this emitter alone), and a shift
+ * read by nothing else becomes a nop. No range fact is used. Refused:
+ * `sar` (a signed `w >> 8` fills the high byte with the sign: not a
+ * swap), any 32-bit operand or result (Kl: the shifts move bits across
+ * the halves), a count other than 8. x keeps its own definition, which
+ * dominates the shifts and so the `or` (SSA). Runs before every analysis
+ * of the emitter (they see a unary op that reads x). xba sets N and Z
+ * from the low byte only; no rule reads them from it (pp_sets_nz_of_a
+ * does not list it, and the A-cache hit of a following compare keeps its
+ * `cmp`, last_load_emitted).
+ * QBE_NO_BSWAP=1 turns it off (the output is the one without the rule);
+ * QBE_BSWAP_FAULT=1 also takes a `sar` (wrong for a negative s16): the
+ * provoked fault fixture compiler/bswap must catch. */
+static int
+bswap_shift(Fn *fn, Ins *d, int op, int fault)
+{
+    Con *c;
+
+    if (!d || !(d->op == op || (op == Oshr && fault == 1 && d->op == Osar)))
+        return 0;
+    if (d->cls != Kw || rtype(d->arg[0]) != RTmp || d->arg[0].val < Tmp0
+        || fn->tmp[d->arg[0].val].cls != Kw)
+        return 0;
+    if (rtype(d->arg[1]) != RCon)
+        return 0;
+    c = &fn->con[d->arg[1].val];
+    return c->type == CBits && c->bits.i == 8;
+}
+
+static void
+mark_bswap(Fn *fn)
+{
+    Blk *b;
+    Ins *i, **def;
+    Phi *p;
+    int *use, a, n, t, fault, nnop = 0;
+    const char *fe;
+
+    if (getenv("QBE_NO_BSWAP"))
+        return;
+    fe = getenv("QBE_BSWAP_FAULT");
+    fault = fe ? atoi(fe) : 0;
+    def = calloc((size_t)fn->ntmp, sizeof *def);
+    use = calloc((size_t)fn->ntmp, sizeof *use);
+    if (!def || !use)
+        die("out of memory");
+    for (b = fn->start; b; b = b->link) {
+        for (p = b->phi; p; p = p->link)
+            for (n = 0; n < (int)p->narg; n++)
+                if (rtype(p->arg[n]) == RTmp)
+                    use[p->arg[n].val]++;
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (rtype(i->to) == RTmp)
+                def[i->to.val] = i;
+            for (a = 0; a < 2; a++)
+                if (rtype(i->arg[a]) == RTmp)
+                    use[i->arg[a].val]++;
+        }
+        if (rtype(b->jmp.arg) == RTmp)
+            use[b->jmp.arg.val]++;
+    }
+    for (b = fn->start; b; b = b->link)
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            Ins *dl, *dr;
+            Ref x;
+
+            if (i->op != Oor || i->cls != Kw
+                || rtype(i->arg[0]) != RTmp || rtype(i->arg[1]) != RTmp
+                || i->arg[0].val < Tmp0 || i->arg[1].val < Tmp0)
+                continue;
+            dl = def[i->arg[0].val];
+            dr = def[i->arg[1].val];
+            if (bswap_shift(fn, dl, Oshr, fault)
+                && bswap_shift(fn, dr, Oshl, fault)) {
+                Ins *s = dl;
+                dl = dr;
+                dr = s;
+            }
+            if (!bswap_shift(fn, dl, Oshl, fault)
+                || !bswap_shift(fn, dr, Oshr, fault)
+                || !req(dl->arg[0], dr->arg[0]))
+                continue;
+            x = dl->arg[0];
+            if (getenv("QBE_DBG_BSWAP"))
+                fprintf(stderr, "BSWAP %s: %%%s = bswap %%%s\n", fn->name,
+                        fn->tmp[i->to.val].name, fn->tmp[x.val].name);
+            for (a = 0; a < 2; a++) {
+                t = i->arg[a].val;
+                if (--use[t] == 0) {
+                    Ins *d = def[t];
+                    use[d->arg[0].val]--;
+                    *d = (Ins){.op = Onop};
+                    def[t] = 0;
+                }
+            }
+            i->op = Obswap;
+            i->arg[0] = x;
+            i->arg[1] = R;
+            use[x.val]++;
+            nnop++;
+        }
+    /* the emitter lowers no nop: the dead shifts leave their block */
+    if (nnop)
+        for (b = fn->start; b; b = b->link) {
+            Ins *w = b->ins;
+            for (i = b->ins; i < &b->ins[b->nins]; i++)
+                if (i->op != Onop)
+                    *w++ = *i;
+            b->nins = (uint)(w - b->ins);
+        }
+    free(def);
+    free(use);
+}
+
 /* Byte-pair store fusion (C1 audit, 2026-07-19). The C idiom for a
  * 16-bit value written to 8-bit MMIO as two bytes —
  *     storeb %v, [constA]
@@ -4866,6 +4988,14 @@ emitins(Ins *i, Fn *fn)
             fprintf(outf, "\tsec\n");
             emitop2("sbc", r1, fn);
         }
+        emitstore(i->to, fn);
+        break;
+
+    case Obswap:
+        /* mark_bswap: the two bytes of a 16-bit word exchanged */
+        emitload(r0, fn);
+        fprintf(outf, "\txba\n");
+        acache_invalidate();
         emitstore(i->to, fn);
         break;
 
@@ -13184,6 +13314,7 @@ w65816_emitfn(Fn *fn, FILE *f)
      * reads a slot number or the frame size. */
     leaf_opt = (fn->leaf || all_calls_are_tail(fn)) && !fn->dynalloc;
     alias_opt = leaf_opt || (!fn->dynalloc && !getenv("QBE_NO_NONLEAF_ALIAS"));
+    mark_bswap(fn);             /* before every analysis: an IR rewrite */
     count_temp_uses(fn);
     mark_near_indexed(fn);      /* S4: is_far() reads it, so first */
     build_alias_table(fn);
