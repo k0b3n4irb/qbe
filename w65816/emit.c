@@ -715,6 +715,78 @@ static void acache_set(Ref r) { acache_valid = 1; acache_ref = r; }
 static void acache_invalidate(void) { acache_valid = 0; }
 static int acache_has(Ref r) { return acache_valid && req(acache_ref, r); }
 
+/* An equality compares its operands either way round (2026-11-18). The
+ * compare of `a == b` was emitted `lda a / cmp b` whatever A held, so
+ * when the instruction just before had left b in A (the second operand
+ * computed last, `lda.w g / and.w #$00FF / sta T0`), A was saved, a
+ * reloaded, and b compared from its slot:
+ *     sta T0 / lda T4 / cmp T0       instead of       cmp T4
+ * None of the text rules can take that pair: `peephole` removes
+ * `sta S / lda S` for one slot S only, and `fuse_indexed` keeps the
+ * place of a compare's operands (an ordered compare is not reversed) and
+ * wants `lda SYM,x / sta T` adjacent, which the mask of a byte read
+ * (`and.w #$00FF`) breaks. The A-cache knows at emission, so the swap is
+ * made there, as `and` / `or` already do: for `ceqw` / `cnew` only, when
+ * A holds b and not a, `cmp a` (the load of b is the cache hit). Z is the
+ * same either way; C and N differ only when the operands differ, where
+ * nothing could know them (equal: C = 1, N = 0 in both orders), and the
+ * branch of an equality reads Z alone. Not when either operand lives in
+ * X or Y (`xy_cmp_imm` keeps its `cpx #k`). Then T0 is read by nothing
+ * and `peephole_slotdead` drops its store.
+ * Not either when b is a 16-bit load (or a copy or one-word extension of
+ * one): it is emitted `lda SRC / sta T1`, and the fuse rules already make
+ * `lda SRC / sta T1 / lda a / cmp T1` into `lda a / cmp SRC`, the reload
+ * of a then going too (`sta a / lda a`) — one `cmp` where the swap would
+ * leave `lda SRC / cmp a` (measured on the corpus: aim_target,
+ * rooftop_run, the audio module). A byte load is not refused: its mask
+ * stands between the `lda` and the `sta`, and nothing fuses it.
+ * QBE_NO_EQ_SWAP=1 turns it off (the output is the one without the
+ * rule); QBE_EQ_SWAP_FAULT=1 also swaps an unsigned `<` / `>=` (wrong:
+ * the provoked fault fixture compiler/eq_swap must catch). */
+static int eq_swap_mode = -1;   /* -1 unread, 0 off, 1 on, 2 fault */
+
+static Fn *eq_swap_fn;          /* the function being emitted (emitfn) */
+
+static int
+eq_word_load(Ref r, int depth)
+{
+    Blk *b;
+    Ins *i;
+
+    if (!eq_swap_fn || rtype(r) != RTmp || r.val < Tmp0)
+        return 0;
+    for (b = eq_swap_fn->start; b; b = b->link)
+        for (i = b->ins; i < &b->ins[b->nins]; i++) {
+            if (!req(i->to, r))
+                continue;
+            switch (i->op) {
+            case Oloadsh: case Oloaduh: case Oloadsw: case Oloaduw: case Oload:
+                return 1;
+            case Ocopy: case Oextsh: case Oextuh: case Oextsw: case Oextuw:
+                return depth < 4 && eq_word_load(i->arg[0], depth + 1);
+            default:
+                return 0;
+            }
+        }
+    return 0;
+}
+
+static int
+eq_swap(int op, Ref r0, Ref r1)
+{
+    if (eq_swap_mode < 0) {
+        const char *f = getenv("QBE_EQ_SWAP_FAULT");
+        eq_swap_mode = getenv("QBE_NO_EQ_SWAP") ? 0 : (f && atoi(f) == 1) ? 2 : 1;
+    }
+    if (!eq_swap_mode)
+        return 0;
+    if (op != Oceqw && op != Ocnew
+        && !(eq_swap_mode == 2 && (op == Ocultw || op == Ocugew)))
+        return 0;
+    return acache_has(r1) && !acache_has(r0) && !xy_of(r0) && !xy_of(r1)
+           && !eq_word_load(r1, 0);
+}
+
 /* 8/16-bit A-mode tracking: avoid redundant sep #$20 / rep #$20 */
 static int amode_8bit;  /* 0 = 16-bit (default), 1 = 8-bit */
 
@@ -6338,8 +6410,13 @@ emitins(Ins *i, Fn *fn)
      *   ++++  "end"
      */
     case Oceqw:
-        emitload(r0, fn);
-        emitop2("cmp", r1, fn);
+        if (eq_swap(i->op, r0, r1)) {
+            emitload(r1, fn);
+            emitop2("cmp", r0, fn);
+        } else {
+            emitload(r0, fn);
+            emitop2("cmp", r1, fn);
+        }
         fprintf(outf, "\tbeq +\n");
         fprintf(outf, "\tlda.w #0\n");
         fprintf(outf, "\tbra ++\n");
@@ -6363,8 +6440,13 @@ emitins(Ins *i, Fn *fn)
         break;
 
     case Ocnew:
-        emitload(r0, fn);
-        emitop2("cmp", r1, fn);
+        if (eq_swap(i->op, r0, r1)) {
+            emitload(r1, fn);
+            emitop2("cmp", r0, fn);
+        } else {
+            emitload(r0, fn);
+            emitop2("cmp", r1, fn);
+        }
         fprintf(outf, "\tbne +\n");
         fprintf(outf, "\tlda.w #0\n");
         fprintf(outf, "\tbra ++\n");
@@ -8611,7 +8693,7 @@ emitjmp(Blk *b, Fn *fn)
                     emit_scmp_w(fused_cmp_r1, fused_cmp_r0, fn);
                 else
                     emit_scmp_w(fused_cmp_r0, fused_cmp_r1, fn);
-            } else if (swap) {
+            } else if (swap || eq_swap(fused_cmp_op, fused_cmp_r0, fused_cmp_r1)) {
                 if (!xy_cmp_imm(fused_cmp_r1, fused_cmp_r0, fn)) {
                     emitload(fused_cmp_r1, fn);
                     emitop2("cmp", fused_cmp_r0, fn);
@@ -13315,6 +13397,7 @@ w65816_emitfn(Fn *fn, FILE *f)
     leaf_opt = (fn->leaf || all_calls_are_tail(fn)) && !fn->dynalloc;
     alias_opt = leaf_opt || (!fn->dynalloc && !getenv("QBE_NO_NONLEAF_ALIAS"));
     mark_bswap(fn);             /* before every analysis: an IR rewrite */
+    eq_swap_fn = fn;            /* eq_word_load reads its definitions */
     count_temp_uses(fn);
     mark_near_indexed(fn);      /* S4: is_far() reads it, so first */
     build_alias_table(fn);
