@@ -1,4 +1,4 @@
-/* OpenSNES: the exact IR idioms of the G1 lot (I1, I2).
+/* OpenSNES: the exact IR idioms of the G1 lot (I1, I2, I3).
  *
  * Switch: OPENSNES_G1_IDIOMS=1 turns the pass on; it is OFF by default,
  * and off it does not touch the function (the output is byte for byte
@@ -9,7 +9,9 @@
  * idiom: =1 (I1) the rewritten value takes a logical shift (`shr`), so
  * its high word is 0 where it should be the sign mask $FFFF; =2 (I2) the
  * entry value is scaled at 16 bits (`extuh (v0 + v0)` in w), the range
- * assumption the rule refuses: bit 16 of 2*v0 is lost when v0 >= $8000.
+ * assumption the rule refuses: bit 16 of 2*v0 is lost when v0 >= $8000;
+ * =3 (I3) the trip count is not looked at, so a loop that never runs is
+ * rotated and its body runs once.
  *
  * I1, narrow sign-extension chain. The IR of `(s32)(s >> k)` with s a
  * 16-bit signed value is
@@ -475,6 +477,413 @@ g1_i2(Fn *fn, int fault)
 		fprintf(stderr, "g1idioms: %s: I2 rewrote %d\n", fn->name, nrw);
 }
 
+/* The loops of I3 (and I4): a header hd with one latch (a block that hd
+ * dominates and that jumps back to it), one entry edge from pre, the
+ * natural loop in g1loop. Requires rpo, pred, dom. */
+static int
+g1_loop(Blk *hd, Blk **ppre, Blk **platch)
+{
+	Blk *latch, *pre, *b, **stk;
+	uint k, q, nlatch, npre, nstk;
+
+	latch = 0;
+	nlatch = 0;
+	for (k=0; k<hd->npred; k++)
+		if (hd->pred[k]->id >= hd->id) {
+			latch = hd->pred[k];
+			nlatch++;
+		}
+	if (nlatch != 1 || !dom(hd, latch))
+		return 0;
+	bszero(g1loop);
+	bsset(g1loop, hd->id);
+	stk = vnew(1, sizeof stk[0], PFn);
+	nstk = 0;
+	if (latch != hd) {
+		bsset(g1loop, latch->id);
+		stk[nstk++] = latch;
+	}
+	while (nstk) {
+		b = stk[--nstk];
+		for (q=0; q<b->npred; q++) {
+			if (bshas(g1loop, b->pred[q]->id))
+				continue;
+			bsset(g1loop, b->pred[q]->id);
+			vgrow(&stk, nstk + 1);
+			stk[nstk++] = b->pred[q];
+		}
+	}
+	pre = 0;
+	npre = 0;
+	for (k=0; k<hd->npred; k++)
+		if (!bshas(g1loop, hd->pred[k]->id)) {
+			pre = hd->pred[k];
+			npre++;
+		}
+	if (npre != 1)
+		return 0;
+	*ppre = pre;
+	*platch = latch;
+	return 1;
+}
+
+/* r is a constant mod 2^16 (no folding runs before this pass): a number,
+ * through w copies, `neg` and the extensions of a number, folded at 16
+ * bits (an extension to w of a 16- or 32-bit number keeps its low 16
+ * bits; of a byte, the byte's rule) */
+static int
+g1_kon(Fn *fn, Ref r, int64_t *pc)
+{
+	Ins *d;
+	int64_t c;
+
+	r = g1_wsrc(fn, r);
+	if (rtype(r) == RCon) {
+		if (!isconbits(fn, r, &c))
+			return 0;
+		*pc = c & 0xFFFF;
+		return 1;
+	}
+	if (rtype(r) != RTmp)
+		return 0;
+	d = fn->tmp[r.val].def;
+	if (!d || d->cls != Kw || rtype(d->arg[0]) == RTmp
+	|| !isconbits(fn, d->arg[0], &c))
+		return 0;
+	switch (d->op) {
+	case Oneg: c = -c; break;
+	case Oextsh: case Oextuh: case Oextsw: case Oextuw: break;
+	case Oextsb: c = (int64_t)(int8_t)(c & 0xFF); break;
+	case Oextub: c &= 0xFF; break;
+	default: return 0;
+	}
+	*pc = c & 0xFFFF;
+	return 1;
+}
+
+/* p, a w phi of hd with two arguments, is a counter: entry a constant
+ * c0, latch value (through w copies) `add p, c`, `add c, p` or
+ * `sub p, c`, c a constant. Gives the step instruction, the edge
+ * indices, c0 and the step st, both mod 2^16 (sub: st = -c). */
+static Ins *
+g1_ctr(Fn *fn, Phi *p, Blk *pre, Blk *latch, uint *ipre, uint *ilat,
+	int64_t *c0, int64_t *st)
+{
+	Ref r;
+	Ins *a;
+	int64_t c;
+
+	if (p->narg != 2 || p->cls != Kw)
+		return 0;
+	if (p->blk[0] == pre && p->blk[1] == latch)
+		*ipre = 0, *ilat = 1;
+	else if (p->blk[1] == pre && p->blk[0] == latch)
+		*ipre = 1, *ilat = 0;
+	else
+		return 0;
+	if (!g1_kon(fn, p->arg[*ipre], c0))
+		return 0;
+	r = g1_wsrc(fn, p->arg[*ilat]);
+	if (rtype(r) != RTmp)
+		return 0;
+	a = fn->tmp[r.val].def;
+	if (!a || a->cls != Kw)
+		return 0;
+	if (a->op == Oadd) {
+		if (req(g1_wsrc(fn, a->arg[0]), p->to)
+		&& g1_kon(fn, a->arg[1], &c))
+			;
+		else if (req(g1_wsrc(fn, a->arg[1]), p->to)
+		&& g1_kon(fn, a->arg[0], &c))
+			;
+		else
+			return 0;
+	} else if (a->op == Osub) {
+		if (!req(g1_wsrc(fn, a->arg[0]), p->to)
+		|| !g1_kon(fn, a->arg[1], &c))
+			return 0;
+		c = -c;
+	} else
+		return 0;
+	*st = c & 0xFFFF;
+	return a;
+}
+
+/* The test of hd: its jnz reads either a w compare made in hd of a
+ * counter phi with a constant (`cultw %n, 64`, either side), or a
+ * counter phi itself (nonzero). Gives the phi, the compare instruction
+ * (0 for the bare jnz), the comparison (Ci*), the constant and whether
+ * it is the left operand. */
+static Phi *
+g1_test(Fn *fn, Blk *hd, Ins **pcmp, int *pop, int64_t *pk, int *pswap)
+{
+	Ref r, x;
+	Ins *d;
+	Phi *p;
+	int k, op;
+	int64_t c;
+
+	if (hd->jmp.type != Jjnz || rtype(hd->jmp.arg) != RTmp)
+		return 0;
+	r = hd->jmp.arg;
+	d = fn->tmp[r.val].def;
+	*pcmp = 0;
+	if (d && fn->tmp[r.val].bid == hd->id && iscmp(d->op, &k, &op)) {
+		if (k != Kw || d->cls != Kw)
+			return 0;
+		if (g1_kon(fn, d->arg[1], &c)) {
+			x = g1_wsrc(fn, d->arg[0]);
+			*pswap = 0;
+		} else if (g1_kon(fn, d->arg[0], &c)) {
+			x = g1_wsrc(fn, d->arg[1]);
+			*pswap = 1;
+		} else
+			return 0;
+		*pcmp = d;
+		*pop = op;
+		*pk = c & 0xFFFF;
+	} else {
+		x = g1_wsrc(fn, r);
+		*pop = Cine;
+		*pk = 0;
+		*pswap = 0;
+	}
+	for (p=hd->phi; p; p=p->link)
+		if (req(p->to, x))
+			return p;
+	return 0;
+}
+
+/* the comparison op of a and b, 16-bit words (fault: signed as unsigned) */
+static int
+g1_cmp(int op, int64_t a, int64_t b, int fault)
+{
+	int64_t sa, sb;
+
+	a &= 0xFFFF;
+	b &= 0xFFFF;
+	sa = fault ? a : (a ^ 0x8000) - 0x8000;
+	sb = fault ? b : (b ^ 0x8000) - 0x8000;
+	switch (op) {
+	case Cieq: return a == b;
+	case Cine: return a != b;
+	case Cisge: return sa >= sb;
+	case Cisgt: return sa > sb;
+	case Cisle: return sa <= sb;
+	case Cislt: return sa < sb;
+	case Ciuge: return a >= b;
+	case Ciugt: return a > b;
+	case Ciule: return a <= b;
+	case Ciult: return a < b;
+	}
+	die("unreachable");
+}
+
+/* The trip count: the number of times the test of hd sends the
+ * counter (c0, c0 + st, ... mod 2^16) into the loop (in1: on true)
+ * before it leaves; -1 if it never leaves. Exact: the counter takes at
+ * most 2^16 values, so a test that holds for the first 2^16 of them
+ * holds forever. */
+static int64_t
+g1_trip(int op, int64_t k, int swap, int in1, int64_t c0, int64_t st,
+	int fault)
+{
+	int64_t t, v;
+	int c;
+
+	for (t=0; t<0x10000; t++) {
+		v = (c0 + t*st) & 0xFFFF;
+		c = swap ? g1_cmp(op, k, v, fault) : g1_cmp(op, v, k, fault);
+		if (c != in1)
+			return t;
+	}
+	return -1;
+}
+
+/* the instructions a header may hold for I3: no memory, no call, no
+ * side effect (they run once less, on entry, after the rotation) */
+static int
+g1_pure(Ins *i)
+{
+	int k, c;
+
+	switch (i->op) {
+	case Onop: case Ocopy:
+	case Oadd: case Osub: case Oneg: case Omul:
+	case Oand: case Oor: case Oxor:
+	case Osar: case Oshr: case Oshl:
+	case Oextsb: case Oextub: case Oextsh: case Oextuh:
+	case Oextsw: case Oextuw:
+		return 1;
+	}
+	return iscmp(i->op, &k, &c) && k != Ks && k != Kd;
+}
+
+static void
+g1_ren(Ref *r, Ref from, Ref to)
+{
+	if (req(*r, from))
+		*r = to;
+}
+
+/* I3, loop rotation. A loop (one latch, one entry edge from pre) whose
+ * header hd ends with `jnz` on a test of a counter (g1_test, g1_ctr),
+ * with a constant trip count of at least 1 (g1_trip), whose only exit
+ * is hd's other edge, to a block X that only hd reaches, and whose
+ * in-loop successor B of hd has hd as its only predecessor and no phi,
+ * is entered at B (the test at the bottom):
+ *     pre -> B; hd's phis p become, in B, p' = phi [pre: entry, hd: p],
+ *     and in hd `p = copy latch value` (a phi of hd named there is p');
+ *     every use of p in a loop block other than hd reads p'.
+ * The first test holds (trip count >= 1), so skipping it on entry is
+ * exact; hd's other instructions (g1_pure, no side effect) only feed hd
+ * itself and what follows the loop, so they need not run on entry. On
+ * every later pass the values are the same as before: along latch->hd,
+ * p is the latch value; along hd->B, p' is p. X is still reached from
+ * hd only, which every path out of the loop crosses, so a value of hd
+ * read after the loop still dominates its use. OPENSNES_G1_FAULT=3 is
+ * the provoked fault: the trip count is not looked at (a loop that
+ * never runs is rotated, its body runs once). Requires rpo, pred, dom,
+ * use; maintains them. */
+static int
+g1_i3one(Fn *fn, Blk *hd, Blk *pre, Blk *latch, int fault)
+{
+	Blk *b, *bb, *x, *s;
+	Phi *pv, *p, *q, *np;
+	Ins *cmp, *i, *nv;
+	Use *u;
+	Tmp *t;
+	Ref *map;
+	int op, swap, in1;
+	int64_t k, c0, st, tc;
+	uint ipre, ilat, n, nphi;
+
+	pv = g1_test(fn, hd, &cmp, &op, &k, &swap);
+	if (!pv || !g1_ctr(fn, pv, pre, latch, &ipre, &ilat, &c0, &st))
+		return 0;
+	in1 = bshas(g1loop, hd->s1->id);
+	if (in1 == bshas(g1loop, hd->s2->id))
+		return 0;
+	bb = in1 ? hd->s1 : hd->s2;
+	x = in1 ? hd->s2 : hd->s1;
+	if (bb == hd || bb->npred != 1 || bb->phi || x->npred != 1)
+		return 0;
+	tc = g1_trip(op, k, swap, in1, c0, st, 0);
+	if (!fault && tc < 1)
+		return 0;
+	/* the only exit is hd -> x */
+	for (b=fn->start; b; b=b->link) {
+		if (!bshas(g1loop, b->id) || b == hd)
+			continue;
+		if ((b->s1 && !bshas(g1loop, b->s1->id))
+		|| (b->s2 && !bshas(g1loop, b->s2->id)))
+			return 0;
+	}
+	/* hd's instructions: pure, read in hd or after the loop only */
+	for (i=hd->ins; i<&hd->ins[hd->nins]; i++) {
+		if (!g1_pure(i))
+			return 0;
+		if (rtype(i->to) != RTmp)
+			continue;
+		t = &fn->tmp[i->to.val];
+		for (u=t->use; u<&t->use[t->nuse]; u++)
+			if (bshas(g1loop, u->bid)
+			&& (u->bid != hd->id || u->type == UPhi))
+				return 0;
+	}
+
+	/* the rewrite */
+	nphi = 0;
+	for (p=hd->phi; p; p=p->link)
+		nphi++;
+	map = vnew(nphi, sizeof map[0], PFn);
+	n = 0;
+	for (p=hd->phi; p; p=p->link)
+		map[n++] = newtmp("g1", p->cls, fn);
+	/* uses of p in the loop below hd read p' */
+	n = 0;
+	for (p=hd->phi; p; p=p->link, n++) {
+		t = &fn->tmp[p->to.val];
+		for (u=t->use; u<&t->use[t->nuse]; u++) {
+			if (!bshas(g1loop, u->bid) || u->bid == hd->id)
+				continue;
+			if (u->type == UIns) {
+				g1_ren(&u->u.ins->arg[0], p->to, map[n]);
+				g1_ren(&u->u.ins->arg[1], p->to, map[n]);
+			} else if (u->type == UJmp) {
+				g1_ren(&fn->rpo[u->bid]->jmp.arg, p->to, map[n]);
+			} else if (u->type == UPhi) {
+				for (q=u->u.phi, ipre=0; ipre<q->narg; ipre++)
+					g1_ren(&q->arg[ipre], p->to, map[n]);
+			}
+		}
+	}
+	/* hd: p = copy (latch value, a phi of hd read as p'); B: p' */
+	nv = vnew(nphi + hd->nins, sizeof nv[0], PFn);
+	n = 0;
+	for (p=hd->phi; p; p=p->link, n++) {
+		ilat = p->blk[0] == latch ? 0 : 1;
+		ipre = 1 - ilat;
+		assert(p->narg == 2 && p->blk[ilat] == latch
+			&& p->blk[ipre] == pre);
+		nv[n] = (Ins){.op = Ocopy, .cls = p->cls, .to = p->to,
+			.arg = {p->arg[ilat], R}};
+		for (q=hd->phi, nphi=0; q; q=q->link, nphi++)
+			g1_ren(&nv[n].arg[0], q->to, map[nphi]);
+		np = alloc(sizeof *np);
+		np->cls = p->cls;
+		np->to = map[n];
+		np->narg = 2;
+		np->arg = vnew(2, sizeof np->arg[0], PFn);
+		np->blk = vnew(2, sizeof np->blk[0], PFn);
+		np->arg[0] = p->arg[ipre];
+		np->blk[0] = pre;
+		np->arg[1] = p->to;
+		np->blk[1] = hd;
+		np->link = bb->phi;
+		bb->phi = np;
+	}
+	icpy(&nv[n], hd->ins, hd->nins);
+	idup(hd, nv, n + hd->nins);
+	hd->phi = 0;
+	/* enter at B */
+	s = pre;
+	if (s->s1 == hd)
+		s->s1 = bb;
+	if (s->s2 == hd)
+		s->s2 = bb;
+	return 1;
+}
+
+static void
+g1_i3(Fn *fn, int fault)
+{
+	Blk *hd, *pre, *latch;
+	uint n;
+	int again, nrw;
+
+	nrw = 0;
+	filluse(fn);
+	do {
+		again = 0;
+		bsinit(g1loop, fn->nblk);
+		for (n=0; n<fn->nblk && !again; n++) {
+			hd = fn->rpo[n];
+			if (!g1_loop(hd, &pre, &latch))
+				continue;
+			if (g1_i3one(fn, hd, pre, latch, fault)) {
+				fillcfg(fn);
+				filldom(fn);
+				filluse(fn);
+				nrw++;
+				again = 1;
+			}
+		}
+	} while (again);
+	if (nrw && getenv("OPENSNES_G1_TRACE"))
+		fprintf(stderr, "g1idioms: %s: I3 rewrote %d\n", fn->name, nrw);
+}
+
 void
 g1idioms(Fn *fn)
 {
@@ -490,4 +899,5 @@ g1idioms(Fn *fn)
 		return;
 	g1_i1(fn, fault == 1);
 	g1_i2(fn, fault == 2);
+	g1_i3(fn, fault == 3);
 }
