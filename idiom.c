@@ -1,4 +1,4 @@
-/* OpenSNES: the exact IR idioms of the G1 lot (I1, I2, I3, I4).
+/* OpenSNES: the exact IR idioms of the G1 lot (I1, I2, I3).
  *
  * Switch: OPENSNES_G1_IDIOMS=1 turns the pass on; it is OFF by default,
  * and off it does not touch the function (the output is byte for byte
@@ -11,9 +11,7 @@
  * entry value is scaled at 16 bits (`extuh (v0 + v0)` in w), the range
  * assumption the rule refuses: bit 16 of 2*v0 is lost when v0 >= $8000;
  * =3 (I3) the trip count is not looked at, so a loop that never runs is
- * rotated and its body runs once; =4 (I4) the trip count of a reversed
- * counter is computed with signed compares read as unsigned. I4 runs
- * before I3, so a counter reversed by I4 is the bare `jnz n` I3 rotates.
+ * rotated and its body runs once.
  *
  * I1, narrow sign-extension chain. The IR of `(s32)(s >> k)` with s a
  * 16-bit signed value is
@@ -886,144 +884,6 @@ g1_i3(Fn *fn, int fault)
 		fprintf(stderr, "g1idioms: %s: I3 rewrote %d\n", fn->name, nrw);
 }
 
-/* I4, induction reversal. A counter n of a loop (one latch, one entry
- * edge; g1_test, g1_ctr: entry c0, step st, the header's test against a
- * constant, one of the header's edges in the loop and one out of it)
- * whose only uses, through w copies, are its own step (whose result,
- * through single-use copies, feeds the latch edge of n's phi and nothing
- * else) and the header's test (a compare read by the jnz alone, or the
- * jnz itself), with a trip count T (g1_trip: 0 to 65535, the loop
- * leaving), is counted down to zero:
- *     n = phi [pre: T, latch: n'],  n' = sub n, 1,  jnz n (true: the loop)
- * Exact: on the k-th arrival at the header (k = 0, 1, ...) the old test
- * holds for k < T and fails at k = T, the new n is T - k, nonzero for
- * k < T and zero at k = T; nothing else read n, so nothing else sees the
- * change (other exits of the loop leave it as before). OPENSNES_G1_FAULT=4
- * is the provoked fault: the trip count computed with the signed
- * compares read as unsigned (a counter from -5 to 5 counts 0 trips).
- * Requires rpo, pred, dom, use; maintains them. */
-static int
-g1_i4one(Fn *fn, Blk *hd, Blk *pre, Blk *latch, int fault)
-{
-	Phi *pv;
-	Ins *cmp, *a, *i, **cp;
-	Use *u;
-	Tmp *te;
-	Blk *t;
-	Ref r;
-	int op, swap, in1, *mem, sawa, sawt;
-	int64_t k, c0, st, tc;
-	uint ipre, ilat, ncp, nm, m, q;
-
-	pv = g1_test(fn, hd, &cmp, &op, &k, &swap);
-	if (!pv)
-		return 0;
-	a = g1_ctr(fn, pv, pre, latch, &ipre, &ilat, &c0, &st);
-	if (!a)
-		return 0;
-	in1 = bshas(g1loop, hd->s1->id);
-	if (in1 == bshas(g1loop, hd->s2->id))
-		return 0;
-	if (!cmp && in1 && st == 0xFFFF)
-		return 0;       /* counted down to zero already */
-	if (cmp && fn->tmp[cmp->to.val].nuse != 1)
-		return 0;
-	/* the step feeds the latch edge alone */
-	cp = vnew(0, sizeof cp[0], PFn);
-	ncp = 0;
-	r = g1_chain(fn, pv->arg[ilat], &cp, &ncp);
-	if (!req(r, a->to) || fn->tmp[a->to.val].nuse != 1)
-		return 0;
-	/* n and its copies: read by copies, the step and the test only */
-	mem = vnew(1, sizeof mem[0], PFn);
-	mem[0] = pv->to.val;
-	nm = 1;
-	sawa = sawt = 0;
-	for (m=0; m<nm; m++) {
-		te = &fn->tmp[mem[m]];
-		for (u=te->use; u<&te->use[te->nuse]; u++) {
-			if (u->type == UJmp) {
-				if (cmp || u->bid != hd->id)
-					return 0;
-				sawt = 1;
-				continue;
-			}
-			if (u->type != UIns)
-				return 0;
-			i = u->u.ins;
-			if (i == a) {
-				sawa = 1;
-				continue;
-			}
-			if (i == cmp) {
-				sawt = 1;
-				continue;
-			}
-			if (i->op != Ocopy || i->cls != Kw
-			|| rtype(i->to) != RTmp)
-				return 0;
-			for (q=0; q<nm; q++)
-				if (mem[q] == i->to.val)
-					break;
-			if (q == nm) {
-				vgrow(&mem, ++nm);
-				mem[nm-1] = i->to.val;
-			}
-		}
-	}
-	if (!sawa || !sawt)
-		return 0;
-	tc = g1_trip(op, k, swap, in1, c0, st, fault);
-	if (tc < 0)
-		return 0;
-
-	/* the rewrite */
-	for (q=0; q<ncp; q++)
-		*cp[q] = (Ins){.op = Onop};
-	*a = (Ins){.op = Osub, .cls = Kw, .to = a->to,
-		.arg = {pv->to, getcon(1, fn)}};
-	pv->arg[ipre] = getcon(tc, fn);
-	pv->arg[ilat] = a->to;
-	if (cmp)
-		*cmp = (Ins){.op = Onop};
-	hd->jmp.arg = pv->to;
-	if (!in1) {
-		t = hd->s1;
-		hd->s1 = hd->s2;
-		hd->s2 = t;
-	}
-	return 1;
-}
-
-static void
-g1_i4(Fn *fn, int fault)
-{
-	Blk *hd, *pre, *latch;
-	uint n;
-	int again, nrw;
-
-	nrw = 0;
-	filluse(fn);
-	do {
-		again = 0;
-		bsinit(g1loop, fn->nblk);
-		for (n=0; n<fn->nblk && !again; n++) {
-			hd = fn->rpo[n];
-			if (!g1_loop(hd, &pre, &latch))
-				continue;
-			if (g1_i4one(fn, hd, pre, latch, fault)) {
-				fillcfg(fn);
-				filldom(fn);
-				filluse(fn);
-				nrw++;
-				again = 1;
-			}
-		}
-	} while (again);
-	if (nrw && getenv("OPENSNES_G1_TRACE"))
-		fprintf(stderr, "g1idioms: %s: I4 rewrote %d\n", fn->name, nrw);
-}
-
 void
 g1idioms(Fn *fn)
 {
@@ -1039,6 +899,5 @@ g1idioms(Fn *fn)
 		return;
 	g1_i1(fn, fault == 1);
 	g1_i2(fn, fault == 2);
-	g1_i4(fn, fault == 4);
 	g1_i3(fn, fault == 3);
 }
