@@ -207,7 +207,16 @@ assoccon(Fn *fn, Blk *b, Ins *i1)
 	c2 = fn->con[i2->arg[1].val];
 
 	assert(KBASE(i2->cls) == 0);
-	assert(KWIDE(i2->cls) >= KWIDE(i1->cls));
+	/* OpenSNES (2026-11-22): a `w` operand of an `l` instruction is
+	 * legal IR on w65816 (usecheck in parse.c; it reads zero-extended)
+	 * and gvn makes some — phicopyref puts a dominating `w` jnz
+	 * argument for an `l` 0/1 phi. Upstream refuses that IR and asserts
+	 * the widths here. Combining the constants across the widening is
+	 * wrong for add, sub and mul (`(x +w 1) +l 1` is not `x +l 2` for
+	 * x = 0xFFFF), so the pair is left as it is (difftest_stmt --batch
+	 * idiom, seed 62339485). */
+	if (KWIDE(i2->cls) < KWIDE(i1->cls))
+		return;
 
 	if (i1->op == Osub && negcon(i1->cls, &c1))
 		return;
